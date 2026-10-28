@@ -1,0 +1,400 @@
+{
+  "schema_version": "1.0",
+  "kind": "hitman-public-semantic-index",
+  "visibility": "public-safe",
+  "generated_from": "live runtime roster; metadata only",
+  "purpose": "Help a public GBrain instance understand names, roles, skills and response conventions without receiving private source data.",
+  "identity": {
+    "assistant_display_name": "HiTMAN",
+    "runtime_profile": "default",
+    "signature": "┳━┳   xAI",
+    "language": "ru",
+    "name_convention": "Latin display names; uppercase except the literal lowercase i where specified."
+  },
+  "response_contract": {
+    "owner_facing": "Russian, concise, evidence-based.",
+    "last_line": "┳━┳   xAI",
+    "do_not_infer": "credentials, private memory, personal facts, file contents, or permissions from this index."
+  },
+  "indexing_model": {
+    "entities": [
+      "assistant",
+      "container",
+      "cell",
+      "profile",
+      "role",
+      "skill",
+      "capability",
+      "public_artifact"
+    ],
+    "relations": [
+      "contains",
+      "architect_of",
+      "has_profile",
+      "uses_skill",
+      "implements_convention",
+      "publishes"
+    ],
+    "source_policy": "Index metadata and public documentation only; never ingest private bodies.",
+    "privacy_classes": {
+      "public-safe": [
+        "names",
+        "roles",
+        "skill names",
+        "capability summaries",
+        "response conventions"
+      ],
+      "private-excluded": [
+        "memory",
+        "tasks",
+        "sessions",
+        "transcripts",
+        "emails",
+        "documents",
+        "logs",
+        "credentials",
+        "tokens",
+        "local paths",
+        "runtime databases"
+      ]
+    }
+  },
+  "fleet": {
+    "container_count": 8,
+    "containers": [
+      {
+        "display_name": "CiTADEL",
+        "parent_cell": "SECURE-DEV",
+        "role": "architect",
+        "profiles": [
+          {
+            "display_name": "CiTADEL",
+            "profile_id": "default",
+            "is_architect": true
+          },
+          {
+            "display_name": "BASTiON",
+            "profile_id": "bastion",
+            "is_architect": false
+          },
+          {
+            "display_name": "CRYPTiX",
+            "profile_id": "cryptix",
+            "is_architect": false
+          },
+          {
+            "display_name": "ENiGMA",
+            "profile_id": "enigma",
+            "is_architect": false
+          },
+          {
+            "display_name": "SPECTRE",
+            "profile_id": "spectre",
+            "is_architect": false
+          },
+          {
+            "display_name": "WARDEN",
+            "profile_id": "warden",
+            "is_architect": false
+          }
+        ]
+      },
+      {
+        "display_name": "MACiNTOSH",
+        "parent_cell": "WIBE-DEV",
+        "role": "architect",
+        "profiles": [
+          {
+            "display_name": "MACiNTOSH",
+            "profile_id": "default",
+            "is_architect": true
+          },
+          {
+            "display_name": "AiGATOR",
+            "profile_id": "aigator",
+            "is_architect": false
+          },
+          {
+            "display_name": "BANDOS",
+            "profile_id": "bandos",
+            "is_architect": false
+          },
+          {
+            "display_name": "DOMiNiON",
+            "profile_id": "dominion",
+            "is_architect": false
+          },
+          {
+            "display_name": "SENTiNEL",
+            "profile_id": "sentinel",
+            "is_architect": false
+          },
+          {
+            "display_name": "VANGUARD",
+            "profile_id": "vanguard",
+            "is_architect": false
+          }
+        ]
+      },
+      {
+        "display_name": "BUTLER",
+        "parent_cell": "FAMiLY-HQ",
+        "role": "architect",
+        "profiles": [
+          {
+            "display_name": "BUTLER",
+            "profile_id": "default",
+            "is_architect": true
+          },
+          {
+            "display_name": "CONCiERGE",
+            "profile_id": "concierge",
+            "is_architect": false
+          },
+          {
+            "display_name": "DRAGON",
+            "profile_id": "dragon",
+            "is_architect": false
+          },
+          {
+            "display_name": "LADY",
+            "profile_id": "lady",
+            "is_architect": false
+          },
+          {
+            "display_name": "MEDiC",
+            "profile_id": "medic",
+            "is_architect": false
+          },
+          {
+            "display_name": "WALLET",
+            "profile_id": "wallet",
+            "is_architect": false
+          }
+        ]
+      },
+      {
+        "display_name": "CALiBER",
+        "parent_cell": "DRG-TEAM",
+        "role": "architect",
+        "profiles": [
+          {
+            "display_name": "CALiBER",
+            "profile_id": "default",
+            "is_architect": true
+          },
+          {
+            "display_name": "COMAN",
+            "profile_id": "coman",
+            "is_architect": false
+          },
+          {
+            "display_name": "DRiLLENG",
+            "profile_id": "drilleng",
+            "is_architect": false
+          },
+          {
+            "display_name": "GEOLOG",
+            "profile_id": "geolog",
+            "is_architect": false
+          },
+          {
+            "display_name": "GOODRiLL",
+            "profile_id": "goodrill",
+            "is_architect": false
+          },
+          {
+            "display_name": "MUDENG",
+            "profile_id": "mudeng",
+            "is_architect": false
+          },
+          {
+            "display_name": "RiGLOG",
+            "profile_id": "riglog",
+            "is_architect": false
+          }
+        ]
+      },
+      {
+        "display_name": "CYBERPUNK",
+        "parent_cell": "GROK-TEAM",
+        "role": "architect",
+        "profiles": [
+          {
+            "display_name": "CYBERPUNK",
+            "profile_id": "default",
+            "is_architect": true
+          },
+          {
+            "display_name": "FOLiO",
+            "profile_id": "folio",
+            "is_architect": false
+          },
+          {
+            "display_name": "HORIZON",
+            "profile_id": "horizon",
+            "is_architect": false
+          },
+          {
+            "display_name": "MIRROR",
+            "profile_id": "mirror",
+            "is_architect": false
+          },
+          {
+            "display_name": "PROOF",
+            "profile_id": "proof",
+            "is_architect": false
+          },
+          {
+            "display_name": "PULSE",
+            "profile_id": "pulse",
+            "is_architect": false
+          }
+        ]
+      },
+      {
+        "display_name": "ORACLE",
+        "parent_cell": "TRAiD-DEV",
+        "role": "architect",
+        "profiles": [
+          {
+            "display_name": "ORACLE",
+            "profile_id": "default",
+            "is_architect": true
+          },
+          {
+            "display_name": "GAMBLER",
+            "profile_id": "gambler",
+            "is_architect": false
+          },
+          {
+            "display_name": "SATOSHi",
+            "profile_id": "satoshi",
+            "is_architect": false
+          },
+          {
+            "display_name": "STRATEGOS",
+            "profile_id": "strategos",
+            "is_architect": false
+          },
+          {
+            "display_name": "TRAiDER",
+            "profile_id": "traider",
+            "is_architect": false
+          },
+          {
+            "display_name": "WALLSTREET",
+            "profile_id": "wallstreet",
+            "is_architect": false
+          }
+        ]
+      },
+      {
+        "display_name": "PYTHON",
+        "parent_cell": "DEV-TEAM",
+        "role": "architect",
+        "profiles": [
+          {
+            "display_name": "PYTHON",
+            "profile_id": "default",
+            "is_architect": true
+          },
+          {
+            "display_name": "BUGS",
+            "profile_id": "bugs",
+            "is_architect": false
+          },
+          {
+            "display_name": "CORE",
+            "profile_id": "core",
+            "is_architect": false
+          },
+          {
+            "display_name": "FORGE",
+            "profile_id": "forge",
+            "is_architect": false
+          },
+          {
+            "display_name": "PIPE",
+            "profile_id": "pipe",
+            "is_architect": false
+          },
+          {
+            "display_name": "RELEASE",
+            "profile_id": "release",
+            "is_architect": false
+          },
+          {
+            "display_name": "SHIELD",
+            "profile_id": "shield",
+            "is_architect": false
+          }
+        ]
+      },
+      {
+        "display_name": "GHOST",
+        "parent_cell": "HACK-DEV",
+        "role": "architect",
+        "profiles": [
+          {
+            "display_name": "GHOST",
+            "profile_id": "default",
+            "is_architect": true
+          },
+          {
+            "display_name": "CiPHER",
+            "profile_id": "cipher",
+            "is_architect": false
+          },
+          {
+            "display_name": "EXPLOiT",
+            "profile_id": "exploit",
+            "is_architect": false
+          },
+          {
+            "display_name": "FORENSiC",
+            "profile_id": "forensic",
+            "is_architect": false
+          },
+          {
+            "display_name": "KERNEL",
+            "profile_id": "kernel",
+            "is_architect": false
+          },
+          {
+            "display_name": "REAPER",
+            "profile_id": "reaper",
+            "is_architect": false
+          },
+          {
+            "display_name": "SHADOW",
+            "profile_id": "shadow",
+            "is_architect": false
+          }
+        ]
+      }
+    ]
+  },
+  "skill_catalog": {
+    "index_mode": "public names and capability summaries only",
+    "source_repositories": [
+      {"name": "diagram-design", "capability": "architecture and system diagrams"},
+      {"name": "scientific-agent-skills", "capability": "scientific research and analysis"},
+      {"name": "cybersecurity-skills", "capability": "defensive security analysis and operations"},
+      {"name": "taste-skill", "capability": "design taste and frontend direction"},
+      {"name": "hyperframes", "capability": "media and presentation generation"},
+      {"name": "agent-reach", "capability": "read-only external web and platform retrieval"},
+      {"name": "gbrain", "capability": "memory, provenance and semantic retrieval"},
+      {"name": "i-have-adhd", "capability": "action-oriented response shaping"},
+      {"name": "planning-with-files", "capability": "persistent file-based planning"},
+      {"name": "ponytail", "capability": "minimal-diff senior development mode"}
+    ],
+    "skill_bodies": "excluded from this public index"
+  },
+  "public_artifact": {
+    "repository": "KaDyRoVeZ/HiTMAN-gBrains",
+    "branch": "main",
+    "contents": "public GBrain source plus this sanitized semantic index"
+  },
+  "activation_note": "This file is an index contract, not a data dump and not authorization to read or publish private sources."
+}
