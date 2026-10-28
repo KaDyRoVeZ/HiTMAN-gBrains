@@ -1,0 +1,39 @@
+{
+  "containers": 8,
+  "profiles": 51,
+  "roster": {
+    "BUTLER": {
+      "profiles": 6,
+      "status": "PASS"
+    },
+    "CALiBER": {
+      "profiles": 7,
+      "status": "PASS"
+    },
+    "CYBERPUNK": {
+      "profiles": 6,
+      "status": "PASS"
+    },
+    "CiTADEL": {
+      "profiles": 6,
+      "status": "PASS"
+    },
+    "GHOST": {
+      "profiles": 7,
+      "status": "PASS"
+    },
+    "MACiNTOSH": {
+      "profiles": 6,
+      "status": "PASS"
+    },
+    "ORACLE": {
+      "profiles": 6,
+      "status": "PASS"
+    },
+    "PYTHON": {
+      "profiles": 7,
+      "status": "PASS"
+    }
+  },
+  "status": "PASS"
+}

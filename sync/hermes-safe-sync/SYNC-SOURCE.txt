@@ -1,4 +1,4 @@
-source=source-public
+source=https://github.com/KaDyRoVeZ/HiTMAN.git
+source_branch=hermes-safe-sync
 source_commit=263d6c692a817df557aab1a10a0f451d169254e1
-classification=public-sanitized
-encrypted-packages-preserved
+classification=sanitized-public
