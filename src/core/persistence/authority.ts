@@ -1,0 +1,286 @@
+import type { BrainEngine } from '../engine.ts';
+import type { OperationContext } from '../ops/contract.ts';
+import { opError, OperationError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
+import { slugUnderBoundPrefixes, matchesSlugAllowList, noSourceGrantError } from '../ops/context.ts';
+import { NO_SOURCES } from '../source-id.ts';
+import { hasScope } from '../scope.ts';
+import { normalizeTokenScopes } from '../legacy-token-scope.ts';
+import { authSourcesFromGrant, grantFromTokenRow } from '../grants/model.ts';
+import { readLocalWriter, currentVerifiedLocalWriter, takeRegisteredWriterRow, verifyLocalWriter, type LocalGrant } from './identity.ts';
+import type { Principal, SqlEngine, WriteAuthority, WriteRequest } from './model.ts';
+import { authorizePageVisibility, excludesPrivateWrites } from './page-visibility.ts';
+import { pipelined, transactionMemo } from '../page-state/transactions.ts';
+
+function deny(message: string): never { throw new OperationError('permission_denied', message, 'Inspect the current writer registration and source/operation grants.'); }
+function strings(value: unknown): value is string[] { return Array.isArray(value) && value.every(v => typeof v === 'string'); }
+function operationAllowed(ops: unknown, operation: string): boolean { return ops == null || strings(ops) && ops.includes(operation); }
+function prefixAllowed(prefixes: string[] | null | undefined, slug: string): boolean {
+  return prefixes == null || slugUnderBoundPrefixes(prefixes, slug);
+}
+/** A minions job id usable as a namespace key: a positive safe integer (never a string, NaN, zero or fraction). */
+function jobNamespaceKey(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : undefined;
+}
+/**
+ * Slug patterns an OAuth client's live grant delegates. A `prefixes` grant lists
+ * them; a `job` grant (prefixes stored NULL) delegates only the accepting job's
+ * own wiki/agents/<id>/ tree. Every other shape delegates nothing.
+ */
+function liveDelegation(row: Record<string, unknown>, jobId: unknown): readonly string[] {
+  const { delegated_namespace: mode, delegated_slug_prefixes: listed } = row;
+  if (mode === 'prefixes') return strings(listed) ? listed : [];
+  const key = jobNamespaceKey(jobId);
+  return mode === 'job' && listed === null && key !== undefined ? [`wiki/agents/${key}/*`] : [];
+}
+function skillWrite(operation: string): boolean {
+  return ['put_skill', 'delete_skill', 'adopt_skillpack'].includes(operation);
+}
+function assertSkillWriteScopes(scopes: readonly string[], operation: string, remote: boolean): void {
+  if (remote && skillWrite(operation) && (!hasScope(scopes, 'write') || !hasScope(scopes, 'skill_editor'))) {
+    deny('Shared skill publication requires an explicit skill_editor grant and write scope.');
+  }
+}
+export async function submissionAuthority(ctx: OperationContext, operation: string, sourceId: string, sourceIncarnation: string, slug: string): Promise<WriteAuthority> {
+  if (ctx.replayAuthority) return replayedAuthority(ctx.engine, ctx.replayAuthority, operation, sourceId, sourceIncarnation, slug);
+  if (ctx.auth?.sourceId === NO_SOURCES || sourceId === NO_SOURCES) throw noSourceGrantError(operation, ctx.auth);
+  if (ctx.auth?.fenceProjectionDegraded || ctx.auth?.grantProjectionDegraded) deny('The grant projection is incomplete.');
+  let principal: Principal;
+  let localGrant: LocalGrant | undefined;
+  if (ctx.auth?.principal) principal = { ...ctx.auth.principal };
+  else {
+    const verified = currentVerifiedLocalWriter() ?? await verifyLocalWriter(ctx.engine,
+      await readLocalWriter(ctx.engine, ctx.remote === false ? 'cli' : 'stdio'));
+    if (verified.remote !== (ctx.remote !== false)) deny('The local trust lane does not match this transport.');
+    principal = verified.principal;
+    localGrant = verified.grant;
+    if (!localGrant.sourceIds.includes('*') && !localGrant.sourceIds.includes(sourceId)) deny('The local grant excludes this source.');
+  }
+  const delegatedJobId = ctx.auth && ctx.viaSubagent ? jobNamespaceKey(ctx.subagentId) : undefined;
+  const a: WriteAuthority = {
+    version: 1, principal, remote: ctx.remote !== false, sourceId, sourceIncarnation,
+    excludePrivate: await excludesPrivateWrites(ctx.engine, ctx.remote !== false),
+    autoLinkTrusted: ctx.remote === false || ctx.viaSubagent === true && !ctx.auth && !!ctx.allowedSlugPrefixes?.length,
+    takesHolders: ctx.remote === false ? null : [...(ctx.takesHoldersAllowList ?? ['world'])],
+    scopes: [...(ctx.auth?.scopes ?? localGrant?.scopes ?? [])],
+    operations: ctx.auth?.allowedOperations ? [...ctx.auth.allowedOperations] : localGrant?.operations ?? null,
+    slugPrefixes: ctx.auth?.boundSlugPrefixes ? [...ctx.auth.boundSlugPrefixes] : localGrant?.slugPrefixes ?? null,
+    ...(ctx.viaSubagent ? { restrictedNamespace: true, delegated: !!ctx.auth,
+      ...(delegatedJobId === undefined ? {} : { delegatedJobId }),
+      delegatedPrefixes: ctx.allowedSlugPrefixes?.length ? [...ctx.allowedSlugPrefixes]
+        : typeof ctx.subagentId === 'number' ? [`wiki/agents/${ctx.subagentId}/*`] : [] } : {}),
+  };
+  if (ctx.auth?.sourceId != null && ctx.auth.sourceId !== sourceId) deny('The source is outside this writer grant.');
+  if (!prefixAllowed(a.slugPrefixes, slug)) deny('The target is outside this writer grant.');
+  await authorizeWrite(ctx.engine, a, operation, slug);
+  if (!skillWrite(operation)) await authorizePageVisibility(ctx.engine, a, slug);
+  return a;
+}
+
+/**
+ * #5984: one local-writer read per transaction; a FOR SHARE read also answers a plain one. #6712 PR 4b: the read the
+ * registration check just made answers the authorization that follows it (`withRegisteredLocalWriter`, once).
+ */
+function localWriterRow(engine: SqlEngine, id: string, lock: boolean): Promise<Array<{ lane: string; revoked_at: unknown; grant_ceiling: LocalGrant }>> {
+  const registered = lock ? undefined : takeRegisteredWriterRow(id);
+  if (registered) return Promise.resolve([registered]);
+  const key = `local-writer:${id}`;
+  return transactionMemo(engine, lock ? [`${key}:share`] : [key, `${key}:share`],
+    () => engine.executeRaw<{ lane: string; revoked_at: unknown; grant_ceiling: LocalGrant }>(
+      `SELECT lane,revoked_at,grant_ceiling FROM persistence_local_writers WHERE id=$1::uuid${lock ? ' FOR SHARE' : ''}`, [id]));
+}
+/** #5984: one membership read per source per transaction; a FOR SHARE read also answers a plain one. */
+function sourceMembership(engine: SqlEngine, sourceId: string, lock: boolean) {
+  return transactionMemo(engine, lock ? [`source-membership:${sourceId}:share`] : [`source-membership:${sourceId}`, `source-membership:${sourceId}:share`],
+    () => engine.executeRaw<{ incarnation: string; archived: boolean }>(`SELECT incarnation,archived FROM sources WHERE id=$1${lock ? ' FOR SHARE' : ''}`, [sourceId]));
+}
+/**
+ * #5984: the reads `authorizeStoredRequest` shares across the rows of one
+ * transaction (each source's membership, each local writer), as calls a
+ * caller pipelines; the rows' own checks then answer them from the memo.
+ */
+export function storedAuthorizationReads(engine: SqlEngine, rows: readonly WriteRequest[], lock = false): Array<() => Promise<unknown>> {
+  const sources = [...new Set(rows.map(row => row.source_id))];
+  const writers = [...new Set(rows.flatMap(row => ['local_cli', 'local_stdio'].includes(row.authority?.principal?.kind) ? [row.authority.principal.id] : []))];
+  return [...sources.map(id => () => sourceMembership(engine, id, lock)), ...writers.map(id => () => localWriterRow(engine, id, lock))];
+}
+/**
+ * #5994: a failed write replayed by `gbrain repair failed-writes` keeps its
+ * original authority ceiling instead of the replay context's: the same
+ * principal, delegation, scopes, holders and autoLinkTrusted, for the same
+ * source incarnation, re-authorized against the live grant (a revoked or
+ * narrowed grant refuses here and again at publication). Admission recomputes
+ * the database-only reason; published-take bookkeeping is not carried.
+ */
+async function replayedAuthority(engine: SqlEngine, stored: WriteAuthority, operation: string, sourceId: string, sourceIncarnation: string, slug: string): Promise<WriteAuthority> {
+  if (stored.sourceId !== sourceId || stored.sourceIncarnation !== sourceIncarnation) deny('The source was removed and re-added since the original write.');
+  const { databaseOnlyReason: _reason, takeHoldersUsed: _used, ...kept } = stored;
+  const a: WriteAuthority = structuredClone(kept);
+  if (!prefixAllowed(a.slugPrefixes, slug)) deny('The target is outside this writer grant.');
+  await authorizeWrite(engine, a, operation, slug);
+  if (!skillWrite(operation)) await authorizePageVisibility(engine, a, slug);
+  return a;
+}
+
+/**
+ * #6517: whether a receipt may name another page's slug to this writer: the trusted local owner always; a remote
+ * writer only when the slug is inside its prefix grant (and delegated namespace) and visible to it.
+ */
+export async function slugDisclosable(engine: SqlEngine, a: WriteAuthority, slug: string): Promise<boolean> {
+  if (!a.remote) return true;
+  if (!prefixAllowed(a.slugPrefixes, slug)) return false;
+  if ((a.delegated || a.restrictedNamespace) && !matchesSlugAllowList(slug, a.delegatedPrefixes ?? [])) return false;
+  return authorizePageVisibility(engine, a, slug).then(() => true, () => false);
+}
+/** Caller holds source guards first. FOR SHARE serializes publication against revocation. */
+export async function authorizeWrite(engine: SqlEngine, a: WriteAuthority, operation: string, slug: string, lock = false): Promise<void> {
+  if (a.version !== 1 || !a.principal || !a.sourceId || !a.sourceIncarnation) deny('Missing durable write authority.');
+  assertSkillWriteScopes(a.scopes, operation, a.remote);
+  if (!hasScope(a.scopes, a.delegated ? 'agent' : 'write') || !operationAllowed(a.operations, operation) || !prefixAllowed(a.slugPrefixes, slug)) deny('The operation exceeds its original accepted grant.');
+  if ((a.delegated || a.restrictedNamespace) && (!a.delegatedPrefixes?.length || !matchesSlugAllowList(slug, a.delegatedPrefixes))) deny('The target exceeds the accepted delegated namespace.');
+  const suffix = lock ? ' FOR SHARE' : '';
+  if (a.principal.kind === 'oauth_client') {
+    const [row] = await engine.executeRaw<Record<string, unknown>>(`SELECT deleted_at,scope,source_id,allowed_operations,
+      bound_slug_prefixes,bound_tools,delegated_namespace,delegated_slug_prefixes FROM oauth_clients WHERE client_id=$1${suffix}`, [a.principal.id]);
+    if (!row || row.deleted_at != null || row.source_id !== a.sourceId) deny('The owning OAuth client is revoked or its source changed.');
+    const scopes = typeof row.scope === 'string' ? row.scope.split(/\s+/) : [];
+    assertSkillWriteScopes(scopes, operation, a.remote);
+    if (skillWrite(operation) && (!strings(row.allowed_operations) || !row.allowed_operations.includes(operation))) deny('The current skill operation grant was removed.');
+    if (!hasScope(scopes, a.delegated ? 'agent' : 'write')) deny('The current OAuth grant no longer permits this write.');
+    if (a.delegated) {
+      if (!strings(row.bound_tools) || !row.bound_tools.some(t => t.replace(/^(?:brain_|mcp__gbrain__)/, '') === operation)) deny('The delegated tool was removed from the current grant.');
+      if (!matchesSlugAllowList(slug, liveDelegation(row, a.delegatedJobId))) deny('The delegated namespace was narrowed.');
+    } else if (!operationAllowed(row.allowed_operations, operation) ||
+      (row.bound_slug_prefixes != null && (!strings(row.bound_slug_prefixes) || !prefixAllowed(row.bound_slug_prefixes, slug)))) deny('The current operation or slug grant excludes this write.');
+    return;
+  }
+  if (a.principal.kind === 'legacy_token') {
+    const [row] = await engine.executeRaw<Record<string, unknown>>(`SELECT * FROM access_tokens WHERE id=$1${suffix}`, [a.principal.id]);
+    if (!row || row.revoked_at != null) deny('The owning token is revoked.');
+    const grant = grantFromTokenRow(row);
+    if (grant.permissionsMalformed) deny('The current legacy grant is malformed.');
+    assertSkillWriteScopes(normalizeTokenScopes(row.scopes) ?? [], operation, a.remote);
+    const liveOperations = grant.allowedOperations;
+    if (!operationAllowed(liveOperations, operation) || skillWrite(operation) && !liveOperations?.includes(operation)) deny('The current legacy operation grant excludes this write.');
+    if (!hasScope(grant.scopes, 'write') || authSourcesFromGrant(grant).sourceId !== a.sourceId) deny('The current token no longer permits this source write.');
+    return;
+  }
+  if (a.principal.kind === 'local_cli' || a.principal.kind === 'local_stdio') {
+    // #5984: one local-writer read per transaction; a FOR SHARE read also answers a plain one.
+    const [row] = await localWriterRow(engine, a.principal.id, lock);
+    const lane = a.principal.kind === 'local_cli' ? 'cli' : 'stdio';
+    if (!row || row.revoked_at != null || row.lane !== lane || a.remote !== (lane === 'stdio')) deny('The local writer is revoked or its trust lane changed.');
+    const g = row.grant_ceiling;
+    assertSkillWriteScopes(g?.scopes ?? [], operation, a.remote);
+    if (!g || !strings(g.sourceIds) || !(g.sourceIds.includes('*') || g.sourceIds.includes(a.sourceId)) ||
+      !hasScope(g.scopes, 'write') || !operationAllowed(g.operations, operation) || !prefixAllowed(g.slugPrefixes, slug)) deny('The current local writer grant excludes this request.');
+    return;
+  }
+  deny('Application authority is unavailable through submitted write requests.');
+}
+/** `pageVisibility: false` is for a caller that checks the target's visibility itself after locking the page. */
+export async function authorizeStoredRequest(engine: SqlEngine, row: WriteRequest, lock = false, opts: { pageVisibility?: boolean } = {}): Promise<void> {
+  // #5984: one membership read per source per transaction; a FOR SHARE read also answers a plain one.
+  // The source lock and the writer check are sent together in lock order; a source refusal is reported first.
+  await pipelined(engine, [
+    async () => {
+      const [source] = await sourceMembership(engine, row.source_id, lock);
+      if (!source || source.archived || source.incarnation !== row.source_incarnation) {
+        throw opError('source_changed', 'The accepted source is no longer active.',
+          `Source ${row.source_id} was archived, removed, or recreated after request ${row.request_id} was accepted, so it will not be applied. Check the source's writer status; a new write must target the current source.`,
+          { fix: readFix(`Shows source ${row.source_id}'s current registration and requests, read-only.`, { argv: ['gbrain', 'sources', 'writer', 'status', '--source', row.source_id, '--json'] }) });
+      }
+    },
+    () => authorizeWrite(engine, row.authority, row.operation, row.slug, lock),
+  ]);
+  if (skillWrite(row.operation)) {
+    const affected = (row.authority as WriteAuthority & { skillSlugsUsed?: unknown }).skillSlugsUsed;
+    if (affected !== undefined) {
+      if (!strings(affected) || affected.length === 0) deny('The skill receipt has invalid retained target authority.');
+      for (const slug of affected) await authorizeWrite(engine, row.authority, row.operation, slug, lock);
+    }
+  }
+  if (!skillWrite(row.operation) && opts.pageVisibility !== false) await authorizePageVisibility(engine, row.authority, row.slug);
+  if (row.authority.remote && ['takes_add', 'takes_update', 'takes_resolve', 'takes_supersede'].includes(row.operation)) {
+    await authorizeStoredTakeHolders(engine, row);
+  }
+  if (row.outcome?.status === 'duplicate' && typeof row.outcome.slug === 'string' && row.outcome.slug !== row.slug) {
+    await authorizeWrite(engine, row.authority, row.operation, row.outcome.slug, lock);
+    await authorizePageVisibility(engine, row.authority, row.outcome.slug);
+  }
+}
+
+/** Receipt/replay access uses the same holder intersection as publication. */
+async function authorizeStoredTakeHolders(engine: SqlEngine, row: WriteRequest): Promise<void> {
+  const retained = row.authority.takeHoldersUsed;
+  if (retained !== undefined) {
+    if (!strings(retained) || retained.length === 0) deny('The take receipt has invalid retained holder authority.');
+    for (const holder of retained) await authorizeTakeHolder(engine, row.authority, holder);
+    return;
+  }
+  // Queued requests have no publication metadata yet. Legacy terminal rows may
+  // also lack it; use retained outcome or current canonical target rows, and
+  // refuse a committed receipt whose affected holder can no longer be proven.
+  const holders = new Set<string>();
+  for (const holder of [row.intent?.holder, row.outcome?.holder]) {
+    if (typeof holder === 'string') holders.add(holder);
+  }
+  const numbers = [row.intent?.row_num, row.outcome?.row_num, row.outcome?.old_row, row.outcome?.new_row]
+    .filter((value): value is number => Number.isSafeInteger(value) && Number(value) > 0);
+  if (row.page_id !== null && numbers.length) {
+    const targets = await engine.executeRaw<{ holder: string }>(
+      'SELECT DISTINCT holder FROM takes WHERE page_id=$1 AND row_num=ANY($2::integer[])', [row.page_id, numbers]);
+    for (const target of targets) holders.add(target.holder);
+  }
+  if (row.state === 'committed' && holders.size === 0) deny('The legacy take receipt has no verifiable holder authority.');
+  for (const holder of holders) await authorizeTakeHolder(engine, row.authority, holder);
+}
+/**
+ * #6007: one access check answers identical read-only statements once (the
+ * current and the stored authority read the same writer row and visibility).
+ * The memo lives for that single check and holds no locking reads.
+ */
+function onceReads(engine: BrainEngine): BrainEngine {
+  const reads = new Map<string, Promise<unknown[]>>();
+  return new Proxy(engine, { get(target, key) {
+    if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal }) => {
+      if (/\bFOR (?:SHARE|UPDATE)\b/i.test(sql)) return target.executeRaw(sql, params, opts);
+      const id = JSON.stringify([sql, params ?? null]);
+      let read = reads.get(id);
+      if (!read) { read = target.executeRaw(sql, params, opts); reads.set(id, read); read.catch(() => reads.delete(id)); }
+      return read;
+    };
+    const value = Reflect.get(target, key, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+}
+export async function ownRequestAccessible(ctx: OperationContext, row: WriteRequest): Promise<boolean> {
+  try {
+    const engine = onceReads(ctx.engine);
+    const auth = await submissionAuthority({ ...ctx, engine }, row.operation, row.source_id, row.source_incarnation, row.slug);
+    if (auth.principal.kind !== row.principal_kind || auth.principal.id !== row.principal_id) return false;
+    await authorizeStoredRequest(engine, row);
+    return true;
+  } catch (error) {
+    if (error instanceof OperationError && ['permission_denied','source_changed','writer_registration_required','page_not_found'].includes(error.code)) return false;
+    throw error;
+  }
+}
+
+
+/** Caller holds the same principal guard as revocation/rescoping. */
+export async function authorizeTakeHolder(engine: SqlEngine, authority: WriteAuthority, holder: string): Promise<void> {
+  if (!authority.remote) return;
+  if (!(authority.takesHolders ?? ['world']).includes(holder)) deny('The take holder exceeds the original grant.');
+  let current = ['world'];
+  if (authority.principal.kind === 'legacy_token') {
+    const [row] = await engine.executeRaw<Record<string, unknown>>('SELECT * FROM access_tokens WHERE id=$1 AND revoked_at IS NULL', [authority.principal.id]);
+    if (!row) deny('The owning token is revoked.');
+    current = grantFromTokenRow(row).takesHolders ?? ['world'];
+  } else if (authority.principal.kind === 'oauth_client') {
+    const [row] = await engine.executeRaw<{ takes_holders: unknown }>('SELECT takes_holders FROM oauth_clients WHERE client_id=$1 AND deleted_at IS NULL', [authority.principal.id]);
+    if (!row) deny('The owning OAuth client is revoked.');
+    current = row.takes_holders == null ? ['world'] : strings(row.takes_holders) ? row.takes_holders : [];
+  }
+  if (!current.includes(holder)) deny('The current holder grant excludes this write.');
+}

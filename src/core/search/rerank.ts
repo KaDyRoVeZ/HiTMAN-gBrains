@@ -1,0 +1,271 @@
+import { createHash } from 'crypto';
+import type { SearchResult } from '../types.ts';
+import { rerank as gatewayRerank, RerankError, type RerankInput, type RerankMeta, type RerankResult } from '../ai/gateway.ts';
+import { BudgetExhausted } from '../budget/budget-tracker.ts';
+import { logRerankFailure, type RerankFailureReason } from '../rerank-audit.ts';
+import { estimateTokens } from '../chunkers/token-estimate.ts';
+import { truncateUtf8 } from '../text-safe.ts';
+import { warnOncePerProcess } from '../utils.ts';
+
+/** #4648: the two audited success-shaped pass-through causes. */
+export type RerankPassThroughReason = 'empty_result_set' | 'malformed_shape';
+
+export interface RerankerOpts {
+  enabled: boolean;
+  /** How many of the top results to send to the reranker (default 30). */
+  topNIn: number;
+  /** Truncate the reranked output to this many (null = no truncate). */
+  topNOut: number | null;
+  /** Provider:model override. When undefined, gateway uses configured default. */
+  model?: string;
+  /** Per-call timeout in ms (default 5000 — propagates to gateway.rerank). */
+  timeoutMs?: number;
+  /**
+   * #4648: fired when the provider answered SUCCESSFULLY but with an
+   * empty/malformed result set for a non-empty document batch, so the
+   * results passed through in raw RRF order unscored. hybridSearch uses it
+   * to stamp the response meta's degraded[] channel so callers can tell
+   * "reranker off" from "reranker died silently". Best-effort: a throwing
+   * callback never breaks search.
+   */
+  onPassThrough?: (reason: RerankPassThroughReason) => void;
+  /**
+   * Test seam — when set, applyReranker calls this instead of gateway.rerank.
+   * Production must NEVER set this.
+   */
+  rerankerFn?: (input: RerankInput) => Promise<RerankResult[]>;
+
+  onSkip?: (reason: RerankSkipReason) => void;
+  /**
+   * Fired when the reranker call failed hard (HTTP error, timeout, budget,
+   * network, …) and the results passed through in RRF order. hybridSearch
+   * stamps it as the `rerank_failed` degraded stage. Best-effort.
+   */
+  onFailure?: (reason: RerankFailedReason) => void;
+  /** System One reranker call facts (resolved model, rubric semantics). Best-effort. */
+  onMeta?: (meta: RerankMeta) => void;
+}
+
+/** The two skip classes (no HTTP call, no per-query audit row). */
+export type RerankSkipReason = 'no_key';
+
+/**
+ * A reranker call that threw (anything but a missing key), as stamped on the
+ * wire: no answer within the timeout, a spend cap, HTTP 429 (provider rate or
+ * concurrency limit), no HTTP response at all (connection refused, DNS — a
+ * wrong base URL looks like this), HTTP 401/403, or any other provider error.
+ */
+export type RerankFailedReason = 'timeout' | 'budget' | 'rate_limited' | 'unreachable' | 'auth' | 'provider_error';
+
+const FAILED_REASON: Partial<Record<RerankFailureReason, RerankFailedReason>> = {
+  timeout: 'timeout', budget: 'budget', rate_limit: 'rate_limited', unreachable: 'unreachable', auth: 'auth',
+};
+
+/** SHA-256 prefix (8 chars) of the query text for privacy-preserving audit. */
+function hashQuery(query: string): string {
+  return createHash('sha256').update(query, 'utf8').digest('hex').slice(0, 8);
+}
+
+function classifyRerankFailure(err: unknown): RerankFailureReason {
+  if (err instanceof RerankError) return err.reason;
+  if (
+    err instanceof BudgetExhausted ||
+    (err && typeof err === 'object' && (err as { tag?: unknown }).tag === 'BUDGET_EXHAUSTED')
+  ) {
+    return 'budget';
+  }
+  return 'unknown';
+}
+
+// Per-document ceiling for the reranker call. A chunk at the chunker ceiling
+// (DEFAULT_MAX_CHUNK_TOKENS=2000, sized to llama-server's 2048 ubatch) plus the
+// query plus the server-side reranker template cannot fit that same ubatch, so
+// a pooled self-hosted reranker (llama-server, TEI) 500s and applyReranker
+// fails open to raw RRF. 1400 = 2048 minus query/template headroom minus a
+// Qwen-family tokenizer margin (cl100k estimate; Qwen runs ~35% worse on
+// hex-heavy text). The cap applies to every provider, hosted included: prose
+// chunks (~300 words) are untouched; code/CJK chunks at the chunker ceiling
+// lose up to ~1/3 of their tail before scoring — the same trade
+// DEFAULT_MAX_CHUNK_TOKENS already makes on the embed side.
+const RERANK_MAX_DOC_TOKENS = 1400;
+const RERANK_MAX_DOC_CHARS = 6000;
+
+/**
+ * Trim a reranker document to ~RERANK_MAX_DOC_TOKENS (char cap first, then
+ * shrink by measured ratio). Every cut goes through `truncateUtf8` so a shrink
+ * never orphans a UTF-16 surrogate — serde/nlohmann-based servers reject a lone
+ * surrogate in the JSON body, which would trade the 500 for a 400.
+ */
+export function capRerankDoc(text: string): string {
+  // ASCII is <=1 token/char and Qwen-family ~1 token/char on CJK, so a doc
+  // under the token ceiling in chars cannot overflow it: skip the tokenizer.
+  if (text.length <= RERANK_MAX_DOC_TOKENS) return text;
+  let doc = truncateUtf8(text, RERANK_MAX_DOC_CHARS);
+  for (let i = 0; i < 4; i++) {
+    const tokens = estimateTokens(doc);
+    if (tokens <= RERANK_MAX_DOC_TOKENS) break;
+    doc = truncateUtf8(doc, Math.floor(doc.length * (RERANK_MAX_DOC_TOKENS / tokens) * 0.95));
+  }
+  return doc;
+}
+
+/**
+ * Reorder the top `topNIn` results by reranker relevance score. The
+ * un-reranked tail (any rows past topNIn) preserves its original RRF
+ * position — appended after the reordered head in the same order it had
+ * coming in.
+ *
+ * On reranker failure, logs to ~/.gbrain/audit/rerank-failures-* and
+ * returns the input array unmodified. Never throws.
+ *
+ * Empty input passes through immediately (no upstream call).
+ */
+export async function applyReranker(
+  query: string,
+  results: SearchResult[],
+  opts: RerankerOpts,
+): Promise<SearchResult[]> {
+  if (!opts.enabled || results.length === 0) return results;
+  // No documents to rerank when topNIn=0 — pass through (defensive; mode
+  // bundles never set 0 in practice).
+  if (opts.topNIn <= 0) return results;
+
+  const head = results.slice(0, opts.topNIn);
+  const tail = results.slice(opts.topNIn);
+
+  // Document text — chunk_text is the matched span. Fall back to title if
+  // empty (shouldn't happen in practice; defensive). Empty docs would
+  // confuse the reranker, but we still send them — the upstream model decides.
+  // Cap each document so a self-hosted reranker (llama-server, TEI) with a
+  // small physical batch never 500s on an oversized code/hex-heavy chunk.
+  // Token-aware, not just char-capped, because hex-dense pages tokenize at
+  // ~1 char/token. See capRerankDoc for what this costs hosted providers.
+  const documents = head.map(r => capRerankDoc(r.chunk_text || r.title || ''));
+
+  let reranked: RerankResult[];
+  let rerankMeta: RerankMeta | undefined;
+  try {
+    const rerankerFn = opts.rerankerFn ?? gatewayRerank;
+    reranked = await rerankerFn({
+      query,
+      documents,
+      timeoutMs: opts.timeoutMs,
+      ...(opts.model ? { model: opts.model } : {}),
+      onMeta: (m) => { rerankMeta = m; },
+    });
+  } catch (err) {
+    const reason = classifyRerankFailure(err);
+    if (reason === 'no_key') {
+      try { opts.onSkip?.(reason); } catch { /* caller hook must never break search */ }
+      return results;
+    }
+    const errorSummary = err instanceof Error ? err.message : String(err);
+    try {
+      logRerankFailure({
+        model: opts.model ?? 'unknown',
+        reason,
+        query_hash: hashQuery(query),
+        doc_count: documents.length,
+        error_summary: errorSummary,
+      });
+    } catch {
+      // Audit logging must never break search.
+    }
+    const failed = FAILED_REASON[reason] ?? 'provider_error';
+    try { opts.onFailure?.(failed); } catch { /* caller hook must never break search */ }
+    return results;
+  }
+
+  // Defensive: if the reranker returned a malformed shape, pass through —
+  // but never silently (#4648). A provider that answers HTTP 200 with an
+  // empty/malformed result set for a non-empty batch (verified live against
+  // an OpenAI-shaped endpoint answering `{"results":[]}`) previously took
+  // this branch with NO audit row while the throw path above was audited —
+  // so an empty failure log falsely implied every search was reranked.
+  // Same fail-open posture as the catch: audit + one stderr note per
+  // process per reason, then return the input unchanged.
+  if (!Array.isArray(reranked) || reranked.length === 0) {
+    const reason: RerankPassThroughReason = Array.isArray(reranked)
+      ? 'empty_result_set'
+      : 'malformed_shape';
+    try {
+      logRerankFailure({
+        model: opts.model ?? 'unknown',
+        reason,
+        query_hash: hashQuery(query),
+        doc_count: documents.length,
+        error_summary: reason === 'empty_result_set'
+          ? `provider answered successfully with an empty result set for ${documents.length} document(s); results passed through unreranked`
+          : 'provider answered successfully with a non-array result shape; results passed through unreranked',
+      });
+    } catch {
+      // Audit logging must never break search.
+    }
+    warnOncePerProcess(
+      `rerank-passthrough:${reason}`,
+      `[gbrain] reranker returned ${reason === 'empty_result_set' ? 'an empty result set' : 'a malformed shape'} — ` +
+        'results passed through in RRF order unscored (audited to rerank-failures; further occurrences this process are silent). ' +
+        'Check the rerank endpoint and `gbrain doctor`.',
+    );
+    try {
+      opts.onPassThrough?.(reason);
+    } catch {
+      // Meta stamping must never break search.
+    }
+    return results;
+  }
+
+  // Build the reordered head. We keep ONLY indices the reranker returned
+  // (so a top_n response with fewer items than head.length naturally
+  // drops the missing ones — but since we don't pass top_n by default,
+  // every input gets a score).
+  // #5428: exact score ties carry no cross-encoder preference, and providers
+  // emit tied rows in arbitrary (call-to-call unstable) order. Within each run
+  // of adjacent, exactly equal finite scores, keep the fused (input) order.
+  // Rows never cross a different score.
+  const ordered = [...reranked];
+  for (let start = 0; start < ordered.length; ) {
+    let end = start + 1;
+    const score = ordered[start].relevanceScore;
+    if (Number.isFinite(score)) {
+      while (end < ordered.length && ordered[end].relevanceScore === score) end++;
+      if (end - start > 1) {
+        const run = ordered.slice(start, end).sort((a, b) => a.index - b.index);
+        ordered.splice(start, run.length, ...run);
+      }
+    }
+    start = end;
+  }
+  const seen = new Set<number>();
+  const reorderedHead: SearchResult[] = [];
+  for (const r of ordered) {
+    if (r.index >= 0 && r.index < head.length && !seen.has(r.index)) {
+      seen.add(r.index);
+      const item = head[r.index]!;
+      // Stamp the reranker score onto the result so downstream callers
+      // (telemetry, debug, autocut) can see the new ordering signal. Doesn't
+      // replace `score` — that's RRF and other consumers may depend on it.
+      item.rerank_score = r.relevanceScore;
+      if (rerankMeta?.score_semantics === 'rubric') item.rerank_score_kind = 'rubric';
+      // v0.40.4 attribution stamp (D12=A) — rank delta. Positive means
+      // rank improved (moved closer to top). new_index is the next
+      // push position in reorderedHead; original index was r.index.
+      item.reranker_delta = r.index - reorderedHead.length;
+      reorderedHead.push(item);
+    }
+  }
+  // If the reranker dropped some head items (rare; usually only happens
+  // with explicit top_n), preserve their original positions at the end
+  // of the head section so we don't silently lose recall.
+  for (let i = 0; i < head.length; i++) {
+    if (!seen.has(i)) reorderedHead.push(head[i]!);
+  }
+
+  if (rerankMeta) {
+    try { opts.onMeta?.(rerankMeta); } catch { /* caller hook must never break search */ }
+  }
+  const combined = [...reorderedHead, ...tail];
+  return opts.topNOut !== null && opts.topNOut > 0
+    ? combined.slice(0, opts.topNOut)
+    : combined;
+}

@@ -1,0 +1,12 @@
+# Known-red and known-skipped nightly cells (GBRA-47 V-5). nightly-watch (scripts/nightly-issue.ts) keeps the
+# workflow's incident open with the known-red label while a row matches, and comments only when the failing set
+# changes or a review-by date passes. At most 3 rows: fix one before adding another. Docs: docs/RELEASING.md#nightly-red-issues
+#
+# Columns (tab-separated): workflow, job, signature, kind, todo, review_by
+#   workflow   the workflow name: (e.g. Scale tier)
+#   job        the job name exactly as GitHub shows it, matrix values expanded
+#   signature  known-red: text in the failing step name or one of the job's error annotations
+#              known-skipped: the name of the step that ends skipped
+#   kind       known-red | known-skipped
+#   todo       the TODOS.md entry title that owns the fix (must appear in TODOS.md)
+#   review_by  YYYY-MM-DD; after it the incident asks for a fix or a re-justified date

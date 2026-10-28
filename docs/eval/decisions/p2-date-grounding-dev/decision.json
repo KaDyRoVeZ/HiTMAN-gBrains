@@ -1,0 +1,237 @@
+{
+  "schema_version": 1,
+  "decision_id": "p2-date-grounding-dev",
+  "plan": "P2",
+  "title": "P2 date grounding (extraction.date_grounding) dev comparison",
+  "verdict_type": "quality",
+  "stage": "dev",
+  "candidate": {
+    "gbrain": "/workspace/gbrain@5d5375d43",
+    "config": {
+      "extraction.date_grounding": "true"
+    }
+  },
+  "baseline": {
+    "gbrain": "/workspace/gbrain@5bd9e84978126689b11cf65107c0a9aa0e91e11b",
+    "config": {}
+  },
+  "sources": [
+    {
+      "kind": "memory-qa",
+      "split": "dev",
+      "embed": "real",
+      "search_pins": {
+        "search.mode": "balanced",
+        "search.reranker.enabled": "false",
+        "search.autocut": "false"
+      },
+      "top_k": 10,
+      "id_field": "id",
+      "exclude_when": [
+        "abstention=true"
+      ],
+      "facts": "conversation",
+      "qa": {
+        "mode": "reader",
+        "runs": 1,
+        "sessions": 5,
+        "context": "facts"
+      },
+      "id": "locomo-dev-temporal-facts",
+      "benchmark": "locomo",
+      "limit": 150,
+      "categories": [
+        "temporal"
+      ],
+      "min_clusters": 3,
+      "comparisons": [
+        {
+          "id": "facts-unresolved-relative",
+          "metric": "facts_unresolved_share",
+          "gate": "superiority",
+          "direction": "lower",
+          "min_effect": 0,
+          "cluster_by": "conversation",
+          "description": "share of saved facts that still carry a relative time expression (yesterday, last week, 3 days ago) and no absolute date"
+        },
+        {
+          "id": "temporal-qa-from-facts",
+          "metric": "qa_score",
+          "gate": "superiority",
+          "direction": "higher",
+          "min_effect": 0,
+          "cluster_by": "conversation",
+          "description": "temporal questions answered by a fixed reader from the saved facts of the top five sessions"
+        },
+        {
+          "id": "temporal-qa-from-facts-by-question",
+          "metric": "qa_score",
+          "gate": "exploratory",
+          "direction": "higher",
+          "cluster_by": "id"
+        },
+        {
+          "id": "recall-all-5",
+          "metric": "recall_all_at_5",
+          "gate": "noninferiority",
+          "direction": "higher",
+          "tolerance": 0.01,
+          "cluster_by": "conversation",
+          "description": "guardrail: page retrieval unchanged (date grounding touches extraction only)"
+        },
+        {
+          "id": "facts-count",
+          "metric": "facts_count",
+          "gate": "exploratory",
+          "direction": "higher",
+          "cluster_by": "conversation"
+        }
+      ],
+      "estimate_usd": 8
+    },
+    {
+      "kind": "memory-qa",
+      "split": "dev",
+      "embed": "real",
+      "search_pins": {
+        "search.mode": "balanced",
+        "search.reranker.enabled": "false",
+        "search.autocut": "false"
+      },
+      "top_k": 10,
+      "id_field": "id",
+      "exclude_when": [
+        "abstention=true"
+      ],
+      "facts": "conversation",
+      "qa": {
+        "mode": "reader",
+        "runs": 1,
+        "sessions": 5,
+        "context": "facts"
+      },
+      "id": "locomo-dev-nontemporal-facts",
+      "benchmark": "locomo",
+      "limit": 150,
+      "categories": [
+        "single-hop",
+        "multi-hop",
+        "open-domain"
+      ],
+      "min_clusters": 3,
+      "comparisons": [
+        {
+          "id": "nontemporal-qa-from-facts",
+          "metric": "qa_score",
+          "gate": "noninferiority",
+          "direction": "higher",
+          "tolerance": 0.01,
+          "cluster_by": "conversation",
+          "description": "guard: non-temporal questions answered from saved facts do not drop by more than one point"
+        },
+        {
+          "id": "nontemporal-qa-by-question",
+          "metric": "qa_score",
+          "gate": "exploratory",
+          "direction": "higher",
+          "cluster_by": "id"
+        },
+        {
+          "id": "facts-count",
+          "metric": "facts_count",
+          "gate": "exploratory",
+          "direction": "higher",
+          "cluster_by": "conversation"
+        },
+        {
+          "id": "recall-all-5",
+          "metric": "recall_all_at_5",
+          "gate": "noninferiority",
+          "direction": "higher",
+          "tolerance": 0.01,
+          "cluster_by": "conversation"
+        }
+      ],
+      "estimate_usd": 8
+    },
+    {
+      "kind": "memory-qa",
+      "split": "dev",
+      "embed": "real",
+      "search_pins": {
+        "search.mode": "balanced",
+        "search.reranker.enabled": "false",
+        "search.autocut": "false"
+      },
+      "top_k": 10,
+      "id_field": "id",
+      "exclude_when": [
+        "abstention=true"
+      ],
+      "facts": "conversation",
+      "qa": {
+        "mode": "reader",
+        "runs": 1,
+        "sessions": 5,
+        "context": "facts"
+      },
+      "id": "lme-s-dev-temporal-facts",
+      "benchmark": "lme-s",
+      "limit": 12,
+      "categories": [
+        "temporal-reasoning"
+      ],
+      "min_clusters": 10,
+      "comparisons": [
+        {
+          "id": "facts-unresolved-relative",
+          "metric": "facts_unresolved_share",
+          "gate": "superiority",
+          "direction": "lower",
+          "min_effect": 0,
+          "cluster_by": "conversation",
+          "description": "share of saved facts that still carry a relative time expression (yesterday, last week, 3 days ago) and no absolute date"
+        },
+        {
+          "id": "temporal-qa-from-facts",
+          "metric": "qa_score",
+          "gate": "superiority",
+          "direction": "higher",
+          "min_effect": 0,
+          "cluster_by": "conversation",
+          "description": "temporal questions answered by a fixed reader from the saved facts of the top five sessions"
+        },
+        {
+          "id": "temporal-qa-from-facts-by-question",
+          "metric": "qa_score",
+          "gate": "exploratory",
+          "direction": "higher",
+          "cluster_by": "id"
+        },
+        {
+          "id": "recall-all-5",
+          "metric": "recall_all_at_5",
+          "gate": "noninferiority",
+          "direction": "higher",
+          "tolerance": 0.01,
+          "cluster_by": "conversation",
+          "description": "guardrail: page retrieval unchanged (date grounding touches extraction only)"
+        },
+        {
+          "id": "facts-count",
+          "metric": "facts_count",
+          "gate": "exploratory",
+          "direction": "higher",
+          "cluster_by": "conversation"
+        }
+      ],
+      "estimate_usd": 60
+    }
+  ],
+  "alpha": 0.05,
+  "seed": 42,
+  "draws": 10000,
+  "budget_usd": 76,
+  "created_at": "2026-10-04T20:31:50.737Z",
+  "notes": "Date grounding of extracted facts. Both arms run the facts lane: each conversation's sessions are imported as conversation pages with ISO session dates, gbrain's conversation-facts extractor runs on them (product default model), and the temporal questions are answered by a fixed reader from the saved facts (fact text and stored date) of the top five retrieved sessions, never the raw sessions. Primary: share of saved facts that keep an unresolved relative time expression (judge-free) and temporal QA from facts. Retrieval is a guardrail. Baseline is the candidate branch base (merge-base with master), so only the P2 diff differs."
+}

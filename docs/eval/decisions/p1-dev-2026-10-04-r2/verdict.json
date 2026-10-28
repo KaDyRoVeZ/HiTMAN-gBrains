@@ -1,0 +1,1562 @@
+{
+  "decision_id": "p1-dev-2026-10-04-r2",
+  "plan": "P1",
+  "stage": "dev",
+  "eligible_for_default": false,
+  "eligibility_note": "Dev verdicts come from development data and never set a default. A held-out verdict comes from the custodian after a committed preregistration.",
+  "verdict_type": "quality",
+  "overall": "inconclusive",
+  "decided_at": "2026-10-04T21:07:29.496Z",
+  "sources": [
+    {
+      "source": "temporal-edges-a",
+      "verdict": "pass",
+      "arms": {
+        "baseline": "0.60.48.0",
+        "candidate": "0.60.48.0"
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04-r2:temporal-edges-a",
+        "verdict": "pass",
+        "reasons": [],
+        "alpha": 0.05,
+        "holm_family": [
+          "now-precision",
+          "asof",
+          "during",
+          "correction",
+          "now-recall",
+          "live-recall"
+        ],
+        "comparisons": [
+          {
+            "id": "now-precision",
+            "metric": "now_precision",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 24,
+            "n_clusters": 24,
+            "n_excluded": 1067,
+            "stats": {
+              "n_pairs": 24,
+              "n_clusters": 24,
+              "mean_a": 0.3427812689761218,
+              "mean_b": 1,
+              "delta": 0.657218731023878,
+              "se_cluster": 0.027122631310579504,
+              "se_iid": 0.027122631310579508,
+              "design_effect": 0.9999999999999998,
+              "effective_n": 24.000000000000007,
+              "ci95": [
+                0.6042636285283343,
+                0.707072165987607
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.07598636297595132,
+              "min_one_sided_discordant": null,
+              "note": "with 24 pairs in 24 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0760; the observed delta is at least that size"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.1,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "asof",
+            "metric": "asof_exact",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [
+              "McNemar treats items as independent; the clustered sign-flip p-value is the primary test here"
+            ],
+            "n_pairs": 480,
+            "n_clusters": 160,
+            "n_excluded": 611,
+            "stats": {
+              "n_pairs": 480,
+              "n_clusters": 160,
+              "mean_a": 0.2125,
+              "mean_b": 0.9,
+              "delta": 0.6875,
+              "se_cluster": 0.033916221750567715,
+              "se_iid": 0.021178422370722868,
+              "design_effect": 2.564647735213773,
+              "effective_n": 187.16020660825384,
+              "ci95": [
+                0.6208333333333333,
+                0.7520833333333333
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 330,
+              "both_pass": 102,
+              "both_fail": 48,
+              "discordant": 330,
+              "p_two_sided": 9.1438991302582e-100
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.09501918553552131,
+              "min_one_sided_discordant": 6,
+              "note": "with 480 pairs in 160 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0950; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05; clustering inflates variance by 2.56x (effective n about 187.2 of 480)"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.15,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "during",
+            "metric": "during_f1",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 160,
+            "n_clusters": 160,
+            "n_excluded": 931,
+            "stats": {
+              "n_pairs": 160,
+              "n_clusters": 160,
+              "mean_a": 0.5943750000000001,
+              "mean_b": 0.8958333333333334,
+              "delta": 0.3014583333333335,
+              "se_cluster": 0.022056536835444136,
+              "se_iid": 0.022056536835444136,
+              "design_effect": 1,
+              "effective_n": 160,
+              "ci95": [
+                0.259375,
+                0.34541666666666687
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.061793267577130565,
+              "min_one_sided_discordant": null,
+              "note": "with 160 pairs in 160 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0618; the observed delta is at least that size"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.15,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "correction",
+            "metric": "correction_ok",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 30,
+            "n_clusters": 30,
+            "n_excluded": 1061,
+            "stats": {
+              "n_pairs": 30,
+              "n_clusters": 30,
+              "mean_a": 0,
+              "mean_b": 0.8666666666666667,
+              "delta": 0.8666666666666667,
+              "se_cluster": 0.06312427686319994,
+              "se_iid": 0.06312427686319992,
+              "design_effect": 1.0000000000000004,
+              "effective_n": 29.999999999999986,
+              "ci95": [
+                0.7333333333333333,
+                0.9666666666666667
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 26,
+              "both_pass": 0,
+              "both_fail": 4,
+              "discordant": 26,
+              "p_two_sided": 2.9802322387695312e-8
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.17684804101033486,
+              "min_one_sided_discordant": 6,
+              "note": "with 30 pairs in 30 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.1768; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.2,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "now-recall",
+            "metric": "now_recall",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 24,
+            "n_clusters": 24,
+            "n_excluded": 1067,
+            "stats": {
+              "n_pairs": 24,
+              "n_clusters": 24,
+              "mean_a": 0.8421897546897547,
+              "mean_b": 0.8421897546897547,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": null,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.02,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "live-recall",
+            "metric": "live_recall",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 139,
+            "n_clusters": 139,
+            "n_excluded": 952,
+            "stats": {
+              "n_pairs": 139,
+              "n_clusters": 139,
+              "mean_a": 0.841726618705036,
+              "mean_b": 0.841726618705036,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 0,
+              "both_pass": 117,
+              "both_fail": 22,
+              "discordant": 0,
+              "p_two_sided": 1
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": 6,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.02,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "traps",
+            "metric": "trap_ok",
+            "gate": "exact",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 74,
+            "n_excluded": 1017
+          },
+          {
+            "id": "invariance",
+            "metric": "invariant",
+            "gate": "exact",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 160,
+            "n_excluded": 931
+          },
+          {
+            "id": "names-current",
+            "metric": "correction_names_current",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 30,
+            "n_clusters": 30,
+            "n_excluded": 1061,
+            "stats": {
+              "n_pairs": 30,
+              "n_clusters": 30,
+              "mean_a": 0.1,
+              "mean_b": 0.3333333333333333,
+              "delta": 0.23333333333333334,
+              "se_cluster": 0.07854032324531726,
+              "se_iid": 0.07854032324531725,
+              "design_effect": 1.0000000000000004,
+              "effective_n": 29.999999999999986,
+              "ci95": [
+                0.1,
+                0.4
+              ],
+              "p_two_sided": 0.015798420157984203,
+              "p_greater": 0.0081991800819918,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 7,
+              "both_pass": 3,
+              "both_fail": 20,
+              "discordant": 7,
+              "p_two_sided": 0.015625
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.22003740868753166,
+              "min_one_sided_discordant": 6,
+              "note": "with 30 pairs in 30 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.2200; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher"
+          }
+        ]
+      }
+    },
+    {
+      "source": "temporal-edges-a2",
+      "verdict": "pass",
+      "arms": {
+        "baseline": "0.60.48.0",
+        "candidate": "0.60.48.0"
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04-r2:temporal-edges-a2",
+        "verdict": "pass",
+        "reasons": [],
+        "alpha": 0.05,
+        "holm_family": [
+          "now-precision",
+          "asof",
+          "during",
+          "correction",
+          "now-recall",
+          "live-recall"
+        ],
+        "comparisons": [
+          {
+            "id": "now-precision",
+            "metric": "now_precision",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 24,
+            "n_clusters": 24,
+            "n_excluded": 1067,
+            "stats": {
+              "n_pairs": 24,
+              "n_clusters": 24,
+              "mean_a": 0.35576377258362557,
+              "mean_b": 1,
+              "delta": 0.6442362274163743,
+              "se_cluster": 0.028370934144532792,
+              "se_iid": 0.028370934144532792,
+              "design_effect": 1,
+              "effective_n": 24,
+              "ci95": [
+                0.5888378676062499,
+                0.6964652279909633
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.07948358974419945,
+              "min_one_sided_discordant": null,
+              "note": "with 24 pairs in 24 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0795; the observed delta is at least that size"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.1,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "asof",
+            "metric": "asof_exact",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [
+              "McNemar treats items as independent; the clustered sign-flip p-value is the primary test here"
+            ],
+            "n_pairs": 480,
+            "n_clusters": 160,
+            "n_excluded": 611,
+            "stats": {
+              "n_pairs": 480,
+              "n_clusters": 160,
+              "mean_a": 0.21666666666666667,
+              "mean_b": 0.9125,
+              "delta": 0.6958333333333333,
+              "se_cluster": 0.034262151180188063,
+              "se_iid": 0.021020385053529645,
+              "design_effect": 2.6567330575344705,
+              "effective_n": 180.67302570678842,
+              "ci95": [
+                0.6270833333333333,
+                0.7604166666666666
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 334,
+              "both_pass": 104,
+              "both_fail": 42,
+              "discordant": 334,
+              "p_two_sided": 5.714936956411375e-101
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.0959883363123098,
+              "min_one_sided_discordant": 6,
+              "note": "with 480 pairs in 160 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0960; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05; clustering inflates variance by 2.66x (effective n about 180.7 of 480)"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.15,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "during",
+            "metric": "during_f1",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 160,
+            "n_clusters": 160,
+            "n_excluded": 931,
+            "stats": {
+              "n_pairs": 160,
+              "n_clusters": 160,
+              "mean_a": 0.6010416666666668,
+              "mean_b": 0.909375,
+              "delta": 0.30833333333333357,
+              "se_cluster": 0.021952636265234977,
+              "se_iid": 0.021952636265234977,
+              "design_effect": 1,
+              "effective_n": 160,
+              "ci95": [
+                0.26604166666666673,
+                0.3520833333333336
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.061502181275402835,
+              "min_one_sided_discordant": null,
+              "note": "with 160 pairs in 160 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0615; the observed delta is at least that size"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.15,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "correction",
+            "metric": "correction_ok",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 30,
+            "n_clusters": 30,
+            "n_excluded": 1061,
+            "stats": {
+              "n_pairs": 30,
+              "n_clusters": 30,
+              "mean_a": 0,
+              "mean_b": 0.7,
+              "delta": 0.7,
+              "se_cluster": 0.0850962943396763,
+              "se_iid": 0.0850962943396763,
+              "design_effect": 1,
+              "effective_n": 30,
+              "ci95": [
+                0.5333333333333333,
+                0.8666666666666667
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 21,
+              "both_pass": 0,
+              "both_fail": 9,
+              "discordant": 21,
+              "p_two_sided": 9.5367431640625e-7
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.23840452040067492,
+              "min_one_sided_discordant": 6,
+              "note": "with 30 pairs in 30 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.2384; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.2,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "now-recall",
+            "metric": "now_recall",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 24,
+            "n_clusters": 24,
+            "n_excluded": 1067,
+            "stats": {
+              "n_pairs": 24,
+              "n_clusters": 24,
+              "mean_a": 0.8695887445887447,
+              "mean_b": 0.8695887445887447,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": null,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.02,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "live-recall",
+            "metric": "live_recall",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 139,
+            "n_clusters": 139,
+            "n_excluded": 952,
+            "stats": {
+              "n_pairs": 139,
+              "n_clusters": 139,
+              "mean_a": 0.8705035971223022,
+              "mean_b": 0.8705035971223022,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 0,
+              "both_pass": 121,
+              "both_fail": 18,
+              "discordant": 0,
+              "p_two_sided": 1
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": 6,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.02,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "traps",
+            "metric": "trap_ok",
+            "gate": "exact",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 74,
+            "n_excluded": 1017
+          },
+          {
+            "id": "invariance",
+            "metric": "invariant",
+            "gate": "exact",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 160,
+            "n_excluded": 931
+          },
+          {
+            "id": "names-current",
+            "metric": "correction_names_current",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 30,
+            "n_clusters": 30,
+            "n_excluded": 1061,
+            "stats": {
+              "n_pairs": 30,
+              "n_clusters": 30,
+              "mean_a": 0.1,
+              "mean_b": 0.4,
+              "delta": 0.3,
+              "se_cluster": 0.0850962943396763,
+              "se_iid": 0.0850962943396763,
+              "design_effect": 1,
+              "effective_n": 30,
+              "ci95": [
+                0.13333333333333333,
+                0.4666666666666667
+              ],
+              "p_two_sided": 0.0035996400359964,
+              "p_greater": 0.0012998700129987,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 9,
+              "both_pass": 3,
+              "both_fail": 18,
+              "discordant": 9,
+              "p_two_sided": 0.00390625
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.23840452040067492,
+              "min_one_sided_discordant": 6,
+              "note": "with 30 pairs in 30 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.2384; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher"
+          }
+        ]
+      }
+    },
+    {
+      "source": "temporal-edges-a3",
+      "verdict": "pass",
+      "arms": {
+        "baseline": "0.60.48.0",
+        "candidate": "0.60.48.0"
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04-r2:temporal-edges-a3",
+        "verdict": "pass",
+        "reasons": [],
+        "alpha": 0.05,
+        "holm_family": [
+          "now-precision",
+          "asof",
+          "during",
+          "correction",
+          "now-recall",
+          "live-recall"
+        ],
+        "comparisons": [
+          {
+            "id": "now-precision",
+            "metric": "now_precision",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 24,
+            "n_clusters": 24,
+            "n_excluded": 1067,
+            "stats": {
+              "n_pairs": 24,
+              "n_clusters": 24,
+              "mean_a": 0.32668962981462984,
+              "mean_b": 0.8888888888888888,
+              "delta": 0.562199259074259,
+              "se_cluster": 0.04273143493953144,
+              "se_iid": 0.04273143493953144,
+              "design_effect": 1,
+              "effective_n": 24,
+              "ci95": [
+                0.4783164751914752,
+                0.640299284049284
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.11971575650670557,
+              "min_one_sided_discordant": null,
+              "note": "with 24 pairs in 24 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.1197; the observed delta is at least that size"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.1,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "asof",
+            "metric": "asof_exact",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [
+              "McNemar treats items as independent; the clustered sign-flip p-value is the primary test here"
+            ],
+            "n_pairs": 480,
+            "n_clusters": 160,
+            "n_excluded": 611,
+            "stats": {
+              "n_pairs": 480,
+              "n_clusters": 160,
+              "mean_a": 0.19375,
+              "mean_b": 0.69375,
+              "delta": 0.5,
+              "se_cluster": 0.03619768689692245,
+              "se_iid": 0.02284558311924769,
+              "design_effect": 2.510482180293502,
+              "effective_n": 191.19832985386213,
+              "ci95": [
+                0.42916666666666664,
+                0.5708333333333333
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 240,
+              "both_pass": 93,
+              "both_fail": 147,
+              "discordant": 240,
+              "p_two_sided": 1.131959884853339e-72
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.10141090456686293,
+              "min_one_sided_discordant": 6,
+              "note": "with 480 pairs in 160 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.1014; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05; clustering inflates variance by 2.51x (effective n about 191.2 of 480)"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.15,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "during",
+            "metric": "during_f1",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 160,
+            "n_clusters": 160,
+            "n_excluded": 931,
+            "stats": {
+              "n_pairs": 160,
+              "n_clusters": 160,
+              "mean_a": 0.47145833333333326,
+              "mean_b": 0.6904166666666667,
+              "delta": 0.21895833333333328,
+              "se_cluster": 0.021285187652443187,
+              "se_iid": 0.021285187652443183,
+              "design_effect": 1.0000000000000004,
+              "effective_n": 159.99999999999994,
+              "ci95": [
+                0.17791666666666653,
+                0.26249999999999996
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.059632267107465546,
+              "min_one_sided_discordant": null,
+              "note": "with 160 pairs in 160 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0596; the observed delta is at least that size"
+            },
+            "direction": "higher",
+            "p_holm": 0.0005999400059994001,
+            "min_effect": 0.15,
+            "p_superiority": 0.00029997000299970003
+          },
+          {
+            "id": "correction",
+            "metric": "correction_ok",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 30,
+            "n_clusters": 30,
+            "n_excluded": 1061,
+            "stats": {
+              "n_pairs": 30,
+              "n_clusters": 30,
+              "mean_a": 0,
+              "mean_b": 0.5333333333333333,
+              "delta": 0.5333333333333333,
+              "se_cluster": 0.09264111117062017,
+              "se_iid": 0.09264111117062017,
+              "design_effect": 1,
+              "effective_n": 30,
+              "ci95": [
+                0.36666666666666664,
+                0.7
+              ],
+              "p_two_sided": 0.00019998000199980003,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 16,
+              "both_pass": 0,
+              "both_fail": 14,
+              "discordant": 16,
+              "p_two_sided": 0.000030517578125
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.2595419677131539,
+              "min_one_sided_discordant": 6,
+              "note": "with 30 pairs in 30 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.2595; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0.0005999400059994001,
+            "min_effect": 0.2,
+            "p_superiority": 0.00039996000399960006
+          },
+          {
+            "id": "now-recall",
+            "metric": "now_recall",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 24,
+            "n_clusters": 24,
+            "n_excluded": 1067,
+            "stats": {
+              "n_pairs": 24,
+              "n_clusters": 24,
+              "mean_a": 0.670295214045214,
+              "mean_b": 0.670295214045214,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": null,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.02,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "live-recall",
+            "metric": "live_recall",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 139,
+            "n_clusters": 139,
+            "n_excluded": 952,
+            "stats": {
+              "n_pairs": 139,
+              "n_clusters": 139,
+              "mean_a": 0.6618705035971223,
+              "mean_b": 0.6618705035971223,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 0,
+              "both_pass": 92,
+              "both_fail": 47,
+              "discordant": 0,
+              "p_two_sided": 1
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": 6,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.02,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "traps",
+            "metric": "trap_ok",
+            "gate": "exact",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 74,
+            "n_excluded": 1017
+          },
+          {
+            "id": "invariance",
+            "metric": "invariant",
+            "gate": "exact",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 160,
+            "n_excluded": 931
+          },
+          {
+            "id": "names-current",
+            "metric": "correction_names_current",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 30,
+            "n_clusters": 30,
+            "n_excluded": 1061,
+            "stats": {
+              "n_pairs": 30,
+              "n_clusters": 30,
+              "mean_a": 0.1,
+              "mean_b": 0.4,
+              "delta": 0.3,
+              "se_cluster": 0.0850962943396763,
+              "se_iid": 0.0850962943396763,
+              "design_effect": 1,
+              "effective_n": 30,
+              "ci95": [
+                0.13333333333333333,
+                0.4666666666666667
+              ],
+              "p_two_sided": 0.0035996400359964,
+              "p_greater": 0.0012998700129987,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 9,
+              "both_pass": 3,
+              "both_fail": 18,
+              "discordant": 9,
+              "p_two_sided": 0.00390625
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.23840452040067492,
+              "min_one_sided_discordant": 6,
+              "note": "with 30 pairs in 30 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.2384; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher"
+          }
+        ]
+      }
+    },
+    {
+      "source": "locomo-dev",
+      "verdict": "pass",
+      "arms": {
+        "baseline": {
+          "package": "gbrain",
+          "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "version": "0.60.48.0",
+          "package_sha256": "fab1c3142270c58c8357f2298bb3f7bf9b59a1062f5954684e95bd1d1cc11c01",
+          "loaded_git_head": "6622a119e40ea09a7719233046aca24741863ed2"
+        },
+        "candidate": {
+          "package": "gbrain",
+          "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "version": "0.60.48.0",
+          "package_sha256": "0820a2a818200c791b3b9bacd8ce685996cd4c68f94d551febee55bee8465f22",
+          "loaded_git_head": "feb077ef9c21ec6b80ea2f026a2c2cb9c391d129"
+        }
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04-r2:locomo-dev",
+        "verdict": "pass",
+        "reasons": [],
+        "alpha": 0.05,
+        "holm_family": [
+          "recall-all-5"
+        ],
+        "comparisons": [
+          {
+            "id": "recall-all-5",
+            "metric": "recall_all_at_5",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [
+              "McNemar treats items as independent; the clustered sign-flip p-value is the primary test here"
+            ],
+            "n_pairs": 464,
+            "n_clusters": 3,
+            "n_excluded": 123,
+            "stats": {
+              "n_pairs": 464,
+              "n_clusters": 3,
+              "mean_a": 0.7543103448275862,
+              "mean_b": 0.7543103448275862,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 0,
+              "both_pass": 350,
+              "both_fail": 114,
+              "discordant": 0,
+              "p_two_sided": 1
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": 6,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.01,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "ndcg-10",
+            "metric": "ndcg_at_10",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 464,
+            "n_clusters": 3,
+            "n_excluded": 123,
+            "stats": {
+              "n_pairs": 464,
+              "n_clusters": 3,
+              "mean_a": 0.7413911991933279,
+              "mean_b": 0.7413911991933279,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": null,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data"
+            },
+            "direction": "higher"
+          },
+          {
+            "id": "latency",
+            "metric": "latency_ms",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 464,
+            "n_clusters": 3,
+            "n_excluded": 123,
+            "stats": {
+              "n_pairs": 464,
+              "n_clusters": 3,
+              "mean_a": 22.028879310344852,
+              "mean_b": 19.054310344827584,
+              "delta": -2.974568965517242,
+              "se_cluster": 2.3579638191516636,
+              "se_iid": 0.31129526782608546,
+              "design_effect": 57.3758637200702,
+              "effective_n": 8.087024227884378,
+              "ci95": [
+                -8.763414634146343,
+                -0.3931937172774868
+              ],
+              "p_two_sided": 0.25,
+              "p_greater": 1,
+              "p_less": 0.125,
+              "p_method": "exact-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 6.606036582310883,
+              "min_one_sided_discordant": null,
+              "note": "with 464 pairs in 3 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 6.6060; the observed delta is below that size, so a null result here is not evidence of no effect; clustering inflates variance by 57.38x (effective n about 8.1 of 464)"
+            },
+            "direction": "lower"
+          }
+        ]
+      }
+    },
+    {
+      "source": "beam-100k-dev",
+      "verdict": "inconclusive",
+      "arms": {
+        "baseline": {
+          "package": "gbrain",
+          "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "version": "0.60.48.0",
+          "package_sha256": "fab1c3142270c58c8357f2298bb3f7bf9b59a1062f5954684e95bd1d1cc11c01",
+          "loaded_git_head": "6622a119e40ea09a7719233046aca24741863ed2"
+        },
+        "candidate": {
+          "package": "gbrain",
+          "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "version": "0.60.48.0",
+          "package_sha256": "0820a2a818200c791b3b9bacd8ce685996cd4c68f94d551febee55bee8465f22",
+          "loaded_git_head": "feb077ef9c21ec6b80ea2f026a2c2cb9c391d129"
+        }
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04-r2:beam-100k-dev",
+        "verdict": "inconclusive",
+        "reasons": [
+          "recall-all-5: inconclusive"
+        ],
+        "alpha": 0.05,
+        "holm_family": [
+          "recall-all-5"
+        ],
+        "comparisons": [
+          {
+            "id": "recall-all-5",
+            "metric": "recall_all_at_5",
+            "gate": "noninferiority",
+            "status": "inconclusive",
+            "reasons": [
+              "McNemar treats items as independent; the clustered sign-flip p-value is the primary test here",
+              "6 clusters is below the family minimum of 10"
+            ],
+            "n_pairs": 108,
+            "n_clusters": 6,
+            "n_excluded": 12,
+            "stats": {
+              "n_pairs": 108,
+              "n_clusters": 6,
+              "mean_a": 0.4537037037037037,
+              "mean_b": 0.4537037037037037,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 0,
+              "both_pass": 49,
+              "both_fail": 59,
+              "discordant": 0,
+              "p_two_sided": 1
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": 6,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.01,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "ndcg-10",
+            "metric": "ndcg_at_10",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 108,
+            "n_clusters": 6,
+            "n_excluded": 12,
+            "stats": {
+              "n_pairs": 108,
+              "n_clusters": 6,
+              "mean_a": 0.5678053768472163,
+              "mean_b": 0.5678053768472163,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": null,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data"
+            },
+            "direction": "higher"
+          },
+          {
+            "id": "latency",
+            "metric": "latency_ms",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 108,
+            "n_clusters": 6,
+            "n_excluded": 12,
+            "stats": {
+              "n_pairs": 108,
+              "n_clusters": 6,
+              "mean_a": 55.519444444444424,
+              "mean_b": 55.2888888888889,
+              "delta": -0.2305555555555556,
+              "se_cluster": 1.4647938028178786,
+              "se_iid": 0.7802339851196628,
+              "design_effect": 3.5245466356356157,
+              "effective_n": 30.6422388933785,
+              "ci95": [
+                -2.7750000000000004,
+                2.461111111111111
+              ],
+              "p_two_sided": 0.78125,
+              "p_greater": 0.625,
+              "p_less": 0.390625,
+              "p_method": "exact-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 4.103744666632983,
+              "min_one_sided_discordant": null,
+              "note": "with 108 pairs in 6 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 4.1037; the observed delta is below that size, so a null result here is not evidence of no effect; clustering inflates variance by 3.52x (effective n about 30.6 of 108)"
+            },
+            "direction": "lower"
+          }
+        ]
+      }
+    },
+    {
+      "source": "n3-temporal-asof",
+      "verdict": "pass",
+      "arms": {
+        "baseline": "0.60.48.0",
+        "candidate": "0.60.48.0"
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04-r2:n3-temporal-asof",
+        "verdict": "pass",
+        "reasons": [],
+        "alpha": 0.05,
+        "holm_family": [
+          "n3-pass"
+        ],
+        "comparisons": [
+          {
+            "id": "n3-pass",
+            "metric": "pass",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [
+              "McNemar treats items as independent; the clustered sign-flip p-value is the primary test here"
+            ],
+            "n_pairs": 513,
+            "n_clusters": 18,
+            "n_excluded": 0,
+            "stats": {
+              "n_pairs": 513,
+              "n_clusters": 18,
+              "mean_a": 1,
+              "mean_b": 1,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 0,
+              "both_pass": 513,
+              "both_fail": 0,
+              "discordant": 0,
+              "p_two_sided": 1
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": 6,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.01,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "n3-no-regression",
+            "metric": "pass",
+            "gate": "exact",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 513,
+            "n_excluded": 0
+          }
+        ]
+      }
+    },
+    {
+      "source": "n4-entity-resolution",
+      "verdict": "pass",
+      "arms": {
+        "baseline": "0.60.48.0",
+        "candidate": "0.60.48.0"
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04-r2:n4-entity-resolution",
+        "verdict": "pass",
+        "reasons": [],
+        "alpha": 0.05,
+        "holm_family": [
+          "n4-correct"
+        ],
+        "comparisons": [
+          {
+            "id": "n4-correct",
+            "metric": "resolver_correct",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [
+              "McNemar treats items as independent; the clustered sign-flip p-value is the primary test here"
+            ],
+            "n_pairs": 136,
+            "n_clusters": 10,
+            "n_excluded": 8,
+            "stats": {
+              "n_pairs": 136,
+              "n_clusters": 10,
+              "mean_a": 0.6176470588235294,
+              "mean_b": 0.6176470588235294,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 0,
+              "both_pass": 84,
+              "both_fail": 52,
+              "discordant": 0,
+              "p_two_sided": 1
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": 6,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.01,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "n4-no-new-wrong-merge",
+            "metric": "resolver_wrong",
+            "gate": "exact",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 136,
+            "n_excluded": 8
+          }
+        ]
+      }
+    },
+    {
+      "source": "n1-knowledge-update",
+      "verdict": "pass",
+      "arms": {
+        "baseline": "0.60.48.0",
+        "candidate": "0.60.48.0"
+      },
+      "contracts": [
+        {
+          "path": "verdict",
+          "op": "eq",
+          "value": "pass",
+          "candidate": "pass",
+          "baseline": "pass",
+          "ok": true
+        }
+      ]
+    }
+  ]
+}

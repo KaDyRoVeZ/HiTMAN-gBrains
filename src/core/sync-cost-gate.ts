@@ -1,0 +1,668 @@
+/**
+ * Inline-embed cost gate + token estimation for `gbrain sync` (#2139).
+ * Peeled out of src/commands/sync.ts (containment sprint C13-C14) as a pure
+ * move — see that file for the command surface that drives this gate.
+ */
+import { readFileSync, statSync } from 'fs';
+import { join } from 'path';
+import { promptYesNo } from './confirm-prompt.ts';
+import type { BrainEngine } from './engine.ts';
+import { collectSyncableFiles } from '../commands/import.ts';
+import { DEFAULT_METAFILE_PAGES_MODE, isSyncable, readMetafilePagesMode, type MetafilePagesMode } from './sync.ts';
+import { diskMetafileHeads, metafilePagePredicate } from './sync-metafile-pages.ts';
+// v0.42.42.0 (#2139): `buildDetachedWorkingTreeManifest` relocated to
+// `src/core/sync-delta.ts` (re-imported below) so the inline cost estimator
+// prices detached sources through the same code the executor imports them with.
+import {
+  computeSyncDelta,
+  buildDetachedWorkingTreeManifest,
+} from './sync-delta.ts';
+import { fetchRemote } from './git-remote.ts';
+import {
+  parseUsdLimit,
+  formatUsdLimit,
+  resolveSpendPosture,
+} from './spend-posture.ts';
+import { estimateTokens, chunkerStamp, detectCodeLanguage } from './chunkers/code.ts';
+import {
+  estimateEmbeddingCostUsd,
+  getEmbeddingModelName,
+  currentEmbeddingPricePerMTok,
+  currentEmbeddingSignature,
+  shouldBlockSync,
+  type SyncEmbedMode,
+} from './embedding.ts';
+import { estimateCostFromChars } from './embedding-pricing.ts';
+import { SPEND_CAP_CONFIG_KEY } from './embed-backfill-submit.ts';
+import {
+  embedBackfillManualDrainCommand,
+  type EmbedBackfillWorkerSurface,
+} from './minions/embed-backfill-admission.ts';
+import { git, hasOriginRemote, isDetachedHead, unique } from './sync-git.ts';
+import { readManagedMode } from './persistence/managed-mode.ts';
+
+/**
+ * Walk ONE source's working tree and sum tokens for every syncable file.
+ * Conservative full-tree CEILING (full file content, not the incremental
+ * diff) — over-counts, never under-counts. Used only on the ceiling rungs of
+ * `estimateInlineNewTokens` (first sync, chunker drift, git-unavailable),
+ * where the delta is genuinely the whole tree or can't be computed.
+ *
+ * v0.31.2: routed through collectSyncableFiles (lstat + inode-cycle +
+ * max-depth) so the preview walks exactly what the real sync walks.
+ *
+ * Exported (v0.42.42.0, #2139) for direct unit testing.
+ */
+export function estimateSourceTreeTokens(
+  localPath: string,
+  strategy: 'markdown' | 'code' | 'auto',
+  opts: { includeGitignored?: boolean } = {},
+): { tokens: number; files: number } {
+  let tokens = 0;
+  let files = 0;
+  try {
+    const fileList = collectSyncableFiles(localPath, { strategy, includeGitignored: opts.includeGitignored });
+    for (const fullPath of fileList) {
+      try {
+        const stat = statSync(fullPath);
+        if (stat.size > 5_000_000) continue; // skip large binaries
+        const content = readFileSync(fullPath, 'utf-8');
+        tokens += estimateTokens(content);
+        files++;
+      } catch {
+        // Best-effort per file; sync itself tolerates the same.
+      }
+    }
+  } catch {
+    // Best-effort: a source whose local_path is gone/unreadable contributes 0.
+  }
+  return { tokens, files };
+}
+
+/**
+ * The languages whose grammar revision differs between a stored chunker stamp and
+ * the current one, when CHUNKER_VERSION itself is unchanged; null when the drift
+ * is the version (every code page re-chunks) or the stamp is unreadable.
+ */
+export function grammarOnlyDrift(stored: string | null, current: string): Set<string> | null {
+  if (stored === null) return null;
+  const parse = (stamp: string) => { const [version, ...revs] = stamp.split(';'); return { version, revs: new Map(revs.map(r => r.split('=') as [string, string])) }; };
+  const a = parse(stored), b = parse(current);
+  if (a.version !== b.version) return null;
+  const langs = new Set<string>();
+  for (const [lang, rev] of b.revs) if (a.revs.get(lang) !== rev) langs.add(lang);
+  for (const lang of a.revs.keys()) if (!b.revs.has(lang)) langs.add(lang);
+  return langs;
+}
+
+/** Tokens of the source's files in the given languages only (a grammar-revision drift re-chunks nothing else). */
+function estimateLanguageTokens(localPath: string, strategy: 'markdown' | 'code' | 'auto', languages: Set<string>): { tokens: number; files: number } {
+  let tokens = 0, files = 0;
+  try {
+    for (const fullPath of collectSyncableFiles(localPath, { strategy })) {
+      const lang = detectCodeLanguage(fullPath);
+      if (!lang || !languages.has(lang)) continue;
+      try {
+        if (statSync(fullPath).size > 5_000_000) continue;
+        tokens += estimateTokens(readFileSync(fullPath, 'utf-8'));
+        files++;
+      } catch { /* best-effort per file, as the tree walk */ }
+    }
+  } catch { /* best-effort: an unreadable source contributes 0 */ }
+  return { tokens, files };
+}
+
+/** Sum tokens for an explicit set of repo-relative paths read at live working-tree content. */
+function estimateDeltaTokens(localPath: string, relPaths: string[]): number {
+  let tokens = 0;
+  for (const rel of relPaths) {
+    try {
+      const full = join(localPath, rel);
+      const stat = statSync(full);
+      if (stat.size > 5_000_000) continue; // skip large binaries (matches tree walk)
+      tokens += estimateTokens(readFileSync(full, 'utf-8'));
+    } catch {
+      // Listed in the diff but unreadable (e.g. since deleted) → 0, like the tree walk.
+    }
+  }
+  return tokens;
+}
+
+/**
+ * v0.42.42.0 (#2139): resolve the commit the estimate should diff AGAINST.
+ *
+ * The cost gate runs BEFORE sync's own `git pull`, so a stale local HEAD would
+ * make the estimate blind to commits the run is about to pull (codex #1). So
+ * we FETCH first (fail-open) and target `origin/<branch>` — the estimate then
+ * prices exactly what this run will sync. The subsequent pull fast-forwards
+ * the already-fetched objects, so net new network cost ≈ 0.
+ *
+ *   - detached HEAD → no upstream; target = local HEAD (+ caller merges the
+ *     detached working-tree manifest, which sync imports on a detached repo).
+ *   - attached + origin remote → fetch origin/<branch> (best-effort), target =
+ *     origin/<branch> if resolvable, else local HEAD (offline / no upstream).
+ *   - HEAD unresolvable (not a git repo) → null (caller treats as unavailable).
+ *
+ * NOTE: this makes `--dry-run` perform a network fetch so the preview reflects
+ * what a real run would pull. Fail-open: offline dry-run still previews against
+ * local HEAD. Uses the shared `git()` 30s budget (the fetch cost is the pull
+ * cost paid a few seconds early — a tighter cap would frequently fall back to
+ * local HEAD and underestimate the remote delta).
+ */
+function resolveEstimateTarget(localPath: string, noPull = false): { target: string; detached: boolean } | null {
+  let head: string;
+  try {
+    head = git(localPath, ['rev-parse', 'HEAD']);
+  } catch {
+    return null;
+  }
+  const detached = isDetachedHead(localPath);
+  if (detached) return { target: head, detached: true };
+
+  let branch: string | null = null;
+  try {
+    branch = git(localPath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() || null;
+  } catch {
+    branch = null;
+  }
+  // GBRA-133 2b.3: a --no-pull run syncs local HEAD and never fetches, so its estimate prices local HEAD and the gate
+  // spends no network round trip (a fetch can take the shared 30 s git budget on a slow or unreachable remote).
+  if (!noPull && branch && branch !== 'HEAD' && hasOriginRemote(localPath)) {
+    try {
+      // v0.42.42.0 (#2139): route through the SSRF-hardened fetch (same flags +
+      // no-prompt env as pullRepo) — a cost preview / dry-run must NOT hit a
+      // remote through a less-protected path than real sync.
+      fetchRemote(localPath, branch, { timeoutMs: 30_000 });
+    } catch {
+      // fail-open: offline, auth failure, no upstream — fall through to local HEAD.
+    }
+    try {
+      const remoteSha = git(localPath, ['rev-parse', `origin/${branch}`]);
+      if (remoteSha) return { target: remoteSha, detached: false };
+    } catch {
+      // no remote-tracking ref for this branch — use local HEAD.
+    }
+  }
+  return { target: head, detached: false };
+}
+
+export type EstimateKind = 'delta' | 'ceiling' | 'mixed' | 'unchanged';
+
+export interface InlineEstimate {
+  tokens: number;
+  changedSources: number;
+  unchangedSources: number;
+  estimateKind: EstimateKind;
+  /** Per-source ceiling reasons (chunker_drift / grammar_drift / first_sync / git_unavailable) for honest labeling. */
+  ceilingReasons: string[];
+}
+
+/**
+ * v0.42.42.0 (#2139) — INLINE-path new-content estimate. The estimate now
+ * MIRRORS EXECUTION instead of pricing the whole tree on every dirty sync (the
+ * 400x overestimate that wedged the daily cron). Per-source fail-open ladder:
+ *
+ *   1. syncEnabled === false                  → skip (unchanged)
+ *   2. chunker drift (stored !== current)     → full-tree CEILING (a drift forces
+ *        performFullSync → full re-chunk → full re-embed; a delta would
+ *        underestimate by the whole corpus). kind: ceiling_chunker_drift
+ *        #6858: skipped when `chunkerDriftWalks` is false. A managed incremental
+ *        sync imports only the delta and keeps the stamp (sync-prepare.ts), so
+ *        the drift never walks the tree there and the delta rung prices it.
+ *        A drift in a language's grammar revision alone (`GRAMMAR_REVISIONS`,
+ *        CHUNKER_VERSION unchanged) prices only that language's files: the
+ *        walk re-imports nothing else. kind: ceiling_grammar_drift
+ *   3. last_commit === fetch target           → 0 (mirrors `up_to_date` at
+ *        sync.ts:1402 — NO clean-working-tree requirement; a dirty tree whose
+ *        commits are caught up imports nothing). kind: unchanged
+ *   4. last_commit === null (first sync)      → full-tree CEILING. kind: ceiling_first_sync
+ *   5. computeSyncDelta ok                    → price added∪modified∪renamed.to
+ *        (syncable, live working-tree content); deletes cost 0. kind: delta
+ *   6. computeSyncDelta unavailable           → full-tree CEILING. kind: ceiling_git_unavailable
+ *
+ * The delta rung routes through the SAME `computeSyncDelta` the executor uses
+ * (src/core/sync-delta.ts), so the gate's dollar figure can't drift from what
+ * the sync imports. `--full`'s extra stale-backlog sweep is added by the gate
+ * (it already has `staleCostUsd`), not here — see the call site.
+ *
+ * Exported for direct unit testing.
+ */
+export function estimateInlineNewTokens(
+  sources: Array<{
+    local_path: string | null;
+    config: Record<string, unknown>;
+    last_commit: string | null;
+    chunker_version: string | null;
+  }>,
+  currentChunkerVersion: string,
+  opts: { forceFullTree?: boolean; chunkerDriftWalks?: boolean; noPull?: boolean; metafilePages?: MetafilePagesMode } = {},
+): InlineEstimate {
+  let tokens = 0;
+  let changedSources = 0;
+  let unchangedSources = 0;
+  let hadDelta = false;
+  let hadCeiling = false;
+  const ceilingReasons: string[] = [];
+
+  const ceiling = (localPath: string, strategy: 'markdown' | 'code' | 'auto', reason: string) => {
+    tokens += estimateSourceTreeTokens(localPath, strategy).tokens;
+    changedSources++;
+    hadCeiling = true;
+    ceilingReasons.push(reason);
+  };
+
+  for (const src of sources) {
+    if (!src.local_path) continue;
+    const cfg = (src.config || {}) as { syncEnabled?: boolean; strategy?: 'markdown' | 'code' | 'auto' };
+    if (cfg.syncEnabled === false) continue;
+    const strategy = cfg.strategy ?? 'markdown';
+    const localPath = src.local_path;
+
+    if (opts.forceFullTree) {
+      tokens += estimateSourceTreeTokens(localPath, strategy, { includeGitignored: true }).tokens;
+      changedSources++;
+      hadCeiling = true;
+      ceilingReasons.push('include_gitignored');
+      continue;
+    }
+
+    // Rung 2: chunker drift forces a full re-chunk → full re-embed. CEILING.
+    // A drift in grammar revisions alone re-chunks only those languages' files:
+    // the walk compares hashes and every other file's hash is unchanged.
+    if (opts.chunkerDriftWalks !== false && src.chunker_version !== currentChunkerVersion) {
+      const languages = grammarOnlyDrift(src.chunker_version, currentChunkerVersion);
+      if (languages) {
+        tokens += estimateLanguageTokens(localPath, strategy, languages).tokens;
+        changedSources++;
+        hadCeiling = true;
+        ceilingReasons.push('grammar_drift');
+        continue;
+      }
+      ceiling(localPath, strategy, 'chunker_drift');
+      continue;
+    }
+
+    // Rung 4 (early): no bookmark → first sync imports everything. CEILING.
+    if (!src.last_commit) {
+      ceiling(localPath, strategy, 'first_sync');
+      continue;
+    }
+
+    const resolved = resolveEstimateTarget(localPath, opts.noPull === true);
+    if (!resolved) {
+      // HEAD unresolvable (not a git repo / gone) — can't compute a delta. CEILING.
+      ceiling(localPath, strategy, 'git_unavailable');
+      continue;
+    }
+
+    // Rung 3: caught up to the fetch target AND no detached working-tree changes.
+    // Mirrors the executor's `up_to_date` predicate — a dirty-but-committed-current
+    // tree imports nothing, so it must price $0 (the heart of the false-fire fix).
+    const detachedManifest = resolved.detached
+      ? buildDetachedWorkingTreeManifest(localPath)
+      : null;
+    const detachedHasChanges = detachedManifest !== null &&
+      (detachedManifest.added.length > 0 ||
+        detachedManifest.modified.length > 0 ||
+        detachedManifest.deleted.length > 0 ||
+        detachedManifest.renamed.length > 0);
+    if (src.last_commit === resolved.target && !detachedHasChanges) {
+      unchangedSources++;
+      continue;
+    }
+
+    // Rung 5/6: the delta itself — SAME helper the executor diffs with.
+    const delta = computeSyncDelta(localPath, src.last_commit, resolved.target, {
+      detachedManifest,
+    });
+    if (delta.status === 'unavailable') {
+      ceiling(localPath, strategy, 'git_unavailable');
+      continue;
+    }
+    const syncOpts = { strategy, metafilePage: metafilePagePredicate(opts.metafilePages ?? DEFAULT_METAFILE_PAGES_MODE, diskMetafileHeads(localPath)) };
+    const changedPaths = unique([
+      ...delta.manifest.added.filter(p => isSyncable(p, syncOpts)),
+      ...delta.manifest.modified.filter(p => isSyncable(p, syncOpts)),
+      ...delta.manifest.renamed.filter(r => isSyncable(r.to, syncOpts)).map(r => r.to),
+    ]);
+    tokens += estimateDeltaTokens(localPath, changedPaths);
+    changedSources++;
+    hadDelta = true;
+  }
+
+  const estimateKind: EstimateKind =
+    hadCeiling && hadDelta ? 'mixed' : hadCeiling ? 'ceiling' : hadDelta ? 'delta' : 'unchanged';
+  return { tokens, changedSources, unchangedSources, estimateKind, ceilingReasons };
+}
+
+/**
+ * Resolve the inline-path cost-gate floor in USD. Config key
+ * `sync.cost_gate_min_usd` (DB plane), default $0.50. Below this estimate
+ * the inline gate proceeds without blocking. Fail-open to the default on a
+ * missing/invalid value or a config-read error (the gate must never crash
+ * the sync). Accepts 0 (an operator can set the floor to $0 to make the
+ * gate block on any nonzero inline cost).
+ */
+async function resolveCostGateFloorUsd(engine: BrainEngine): Promise<number> {
+  try {
+    const raw = await engine.getConfig('sync.cost_gate_min_usd');
+    // v0.42.42.0 (#2139): `0` keeps meaning "block on any nonzero spend"
+    // (allowZero); `off`/`unlimited`/`none` → Infinity so the gate never
+    // blocks (`costUsd > Infinity` is always false).
+    return parseUsdLimit(raw, 0.5, { allowZero: true });
+  } catch {
+    return 0.5;
+  }
+}
+
+/**
+ * Resolve the per-source embed-backfill 24h spend cap (USD) for the deferred
+ * notice. Mirrors embed-backfill-submit.ts's own resolution of
+ * SPEND_CAP_CONFIG_KEY (default 25). Fail-open to the default.
+ */
+async function resolveBackfillCapUsd(engine: BrainEngine): Promise<number> {
+  try {
+    const raw = await engine.getConfig(SPEND_CAP_CONFIG_KEY);
+    // v0.42.42.0 (#2139): no allowZero — `0` falls back to the default
+    // (off semantics ≠ 0); `off`/`unlimited`/`none` → Infinity (cap disabled).
+    return parseUsdLimit(raw, 25);
+  } catch {
+    return 25;
+  }
+}
+
+// v0.42.42.0 (#2139): paste-ready knobs appended to every gate message so the
+// spend-control surface is discoverable at the moment of need (humans + agents),
+// not only after reading source. Closes the issue's "takes archaeology" complaint.
+const SPEND_HINT =
+  'widen: gbrain config set sync.cost_gate_min_usd 5 | ' +
+  'never gate: gbrain config set spend.posture tokenmax | ' +
+  'docs: docs/operations/spend-controls.md';
+
+/** Honest token label — delta vs full-tree ceiling, with the ceiling reasons. */
+function labelEstimate(inline: InlineEstimate): string {
+  if (inline.estimateKind === 'unchanged') return '0 new tokens (sources caught up)';
+  if (inline.estimateKind === 'delta') {
+    return `~${inline.tokens.toLocaleString()} new tokens (delta: changed files since last sync)`;
+  }
+  // ceiling | mixed — be explicit that this is an over-count, not the real spend.
+  const reasons = unique(inline.ceilingReasons).join(', ') || 'unknown';
+  return (
+    `<=${inline.tokens.toLocaleString()} tokens (full-tree ceiling for ${inline.changedSources} ` +
+    `source(s): ${reasons} — unchanged files skip via content_hash at execution)`
+  );
+}
+
+type CostGateSource = {
+  sourceId?: string;
+  local_path: string | null;
+  config: Record<string, unknown>;
+  last_commit: string | null;
+  chunker_version: string | null;
+};
+
+interface CostGateContext {
+  sources: CostGateSource[];
+  /** Resolved embed mode. Single-source is always 'inline' (not the parallel-deferred fan-out). */
+  mode: SyncEmbedMode;
+  dryRun: boolean;
+  jsonOut: boolean;
+  yesFlag: boolean;
+  full: boolean;
+  includeGitignored?: boolean;
+  /** The run will not pull: estimate against local HEAD without fetching. */
+  noPull?: boolean;
+  /** Message prefix ('sync --all' | 'sync'). */
+  label: string;
+  /** Public queue capability resolved at the command boundary. */
+  workerSurface: EmbedBackfillWorkerSurface;
+  /** Submission policy; distinct from whether the runtime has a worker. */
+  autoSubmitEnabled: boolean;
+}
+
+/**
+ * #4684: under `--json` a proceed path never prints — it hands its status
+ * object back as `notice` so the caller nests it in the ONE terminal envelope
+ * (`cost_gate`). Human output and every 'stop' path print here unchanged.
+ */
+type CostGateOutcome =
+  | { action: 'proceed'; autoDeferEmbeds: boolean; notice?: Record<string, unknown> }
+  | { action: 'stop' };
+
+type ManualDrainReason = 'no_worker_surface' | 'auto_submit_disabled';
+
+function manualDrainCommands(sources: CostGateSource[]): string[] {
+  return unique(
+    sources.map((source) => embedBackfillManualDrainCommand(source.sourceId ?? 'default')),
+  );
+}
+
+/**
+ * v0.42.42.0 (#2139): the inline-embed cost gate, shared by BOTH `sync --all`
+ * and single-source `sync` so the spend surface is consistent. Runs at the
+ * COMMAND layer (never inside performSync, which `runOne` also calls — that
+ * would double-gate `--all`).
+ *
+ * Behavior:
+ *   - deferred mode → FYI only, never blocks (backfill cap is the money gate).
+ *   - inline + below floor → proceed quietly.
+ *   - inline + spend.posture=tokenmax → informational, proceed inline.
+ *   - inline + above floor + TTY → [y/N] prompt.
+ *   - inline + above floor + non-TTY/--json → AUTO-DEFER embeds to capped
+ *     backfill jobs, exit 0 (NEVER exit 2 — the wedged-cron fix). Caller sets
+ *     effectiveNoEmbed and enqueues the backfill.
+ *
+ * Output format splits on the EXPLICIT `--json` flag only (absorbs the
+ * TODOS.md:340 #1784 conflation): JSON envelope iff `--json`, else human text.
+ */
+export async function runInlineCostGate(
+  engine: BrainEngine,
+  ctx: CostGateContext,
+): Promise<CostGateOutcome> {
+  const { sources, mode, dryRun, jsonOut, yesFlag, full, label } = ctx;
+  const manualDrainReason: ManualDrainReason | undefined =
+    ctx.workerSurface.status === 'no_worker_surface'
+      ? 'no_worker_surface'
+      : ctx.autoSubmitEnabled ? undefined : 'auto_submit_disabled';
+
+  // Stale backlog: cheap single SQL; fail-open to 0 so a transient DB hiccup
+  // never blocks the sync. Signature-aware (model/dims swap surfaces here).
+  let staleChars = 0;
+  try {
+    // D9: signature is null when the gateway is unconfigured — fall back to
+    // NULL-embedding-only staleness rather than filtering on a bogus stamp.
+    const staleSig = currentEmbeddingSignature();
+    staleChars = await engine.sumStaleChunkChars(staleSig ? { signature: staleSig } : {});
+  } catch {
+    staleChars = 0;
+  }
+  const staleCostUsd = estimateCostFromChars(staleChars, currentEmbeddingPricePerMTok());
+  const embeddingModelName = getEmbeddingModelName();
+  const floorUsd = await resolveCostGateFloorUsd(engine);
+  const posture = await resolveSpendPosture(engine);
+
+  if (mode === 'deferred') {
+    // Deferred path: print an FYI, NEVER block. The backfill cap is the real
+    // money gate.
+    const capUsd = await resolveBackfillCapUsd(engine);
+    let queuedBackfills = 0;
+    try {
+      const r = await engine.executeRaw<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM minion_jobs
+          WHERE name = 'embed-backfill'
+            AND status IN ('waiting','active','delayed','waiting-children')`,
+      );
+      queuedBackfills = Number(r[0]?.n) || 0;
+    } catch {
+      queuedBackfills = 0;
+    }
+    const deferredMsg =
+      `${label}: embedding deferred to backfill jobs ` +
+      `(capped $${formatUsdLimit(capUsd)}/source/24h, not charged by this sync). ` +
+      `Current backlog ~${staleChars.toLocaleString()} chars (~$${staleCostUsd.toFixed(2)} on ` +
+      `${embeddingModelName}) across ${sources.length} source(s); ` +
+      `${queuedBackfills} backfill job(s) queued.`;
+    if (manualDrainReason) {
+      const commands = manualDrainCommands(sources);
+      const refusal = manualDrainReason === 'no_worker_surface'
+        ? 'no persistent worker surface is available'
+        : 'automatic backfill submission is disabled by --no-auto-embed';
+      const manualMsg =
+        `${label}: embedding will not run inline and ${refusal}. ` +
+        `Manual drain required: ${commands.map((command) => `\`${command}\``).join(', ')}.`;
+      if (dryRun) {
+        if (jsonOut) {
+          console.log(JSON.stringify({
+            status: 'dry_run', mode, gate: 'dry_run', delivery: 'manual',
+            reason: manualDrainReason, workerSurface: ctx.workerSurface.status,
+            staleChars, staleCostUsd, capUsd: formatUsdLimit(capUsd),
+            floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName,
+            manualCommands: commands,
+          }));
+        } else {
+          console.log(manualMsg);
+          console.log('--dry-run: exit without syncing.');
+        }
+        return { action: 'stop' };
+      }
+      if (jsonOut) {
+        return { action: 'proceed', autoDeferEmbeds: false, notice: {
+          status: 'manual_drain_required', mode, gate: 'manual_drain_required',
+          reason: manualDrainReason, workerSurface: ctx.workerSurface.status, staleChars, staleCostUsd,
+          capUsd: formatUsdLimit(capUsd), floorUsd: formatUsdLimit(floorUsd),
+          model: embeddingModelName, manualCommands: commands,
+        } };
+      }
+      console.log(manualMsg);
+      return { action: 'proceed', autoDeferEmbeds: false };
+    }
+    if (dryRun) {
+      if (jsonOut) {
+        console.log(JSON.stringify({ status: 'dry_run', mode, gate: 'dry_run', staleChars, staleCostUsd, capUsd: formatUsdLimit(capUsd), floorUsd: formatUsdLimit(floorUsd), queuedBackfills, model: embeddingModelName }));
+      } else {
+        console.log(deferredMsg);
+        console.log('--dry-run: exit without syncing.');
+      }
+      return { action: 'stop' };
+    }
+    if (jsonOut) {
+      return { action: 'proceed', autoDeferEmbeds: false, notice: { status: 'deferred', mode, gate: 'deferred_notice', staleChars, staleCostUsd, capUsd: formatUsdLimit(capUsd), floorUsd: formatUsdLimit(floorUsd), queuedBackfills, model: embeddingModelName } };
+    }
+    console.log(deferredMsg);
+    return { action: 'proceed', autoDeferEmbeds: false };
+  }
+
+  // ── Inline path ───────────────────────────────────────────────
+  const inline = estimateInlineNewTokens(sources, chunkerStamp(), {
+    forceFullTree: ctx.includeGitignored === true,
+    noPull: ctx.noPull === true,
+    chunkerDriftWalks: full === true || !(await readManagedMode(engine).catch(() => false)),
+    metafilePages: await readMetafilePagesMode(engine),
+  });
+  // D7A: `--full` runs `performFullSync` → `runEmbedCore({stale:true})`, which
+  // sweeps the pre-existing stale backlog INLINE on top of the delta. Price it.
+  const costUsd = estimateEmbeddingCostUsd(inline.tokens) + (full ? staleCostUsd : 0);
+  const fullNote = full && staleChars > 0
+    ? ` (includes ~${staleChars.toLocaleString()} stale-backlog chars swept by --full)`
+    : '';
+  const staleNote = !full && staleChars > 0
+    ? ` (plus ~${staleChars.toLocaleString()} stale-backlog chars pending \`gbrain embed --stale\`)`
+    : '';
+  const previewMsg =
+    `${label} preview (inline embed): ${inline.changedSources} changed source(s), ` +
+    `${inline.unchangedSources} unchanged; ${labelEstimate(inline)}, ` +
+    `est. $${costUsd.toFixed(2)} on ${embeddingModelName}${fullNote}${staleNote}.`;
+
+  if (dryRun) {
+    if (jsonOut) {
+      console.log(JSON.stringify({ status: 'dry_run', mode, gate: 'dry_run', newTokens: inline.tokens, estimateKind: inline.estimateKind, staleChars, costUsd, floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName }));
+    } else {
+      console.log(previewMsg);
+      console.log('--dry-run: exit without syncing.');
+    }
+    return { action: 'stop' };
+  }
+
+  // --yes bypasses the gate entirely (embed inline, no preview).
+  if (yesFlag) return { action: 'proceed', autoDeferEmbeds: false };
+
+  // spend.posture=tokenmax → informational, proceed INLINE (operator declared
+  // cost isn't the constraint; don't defer).
+  if (posture === 'tokenmax') {
+    if (jsonOut) {
+      return { action: 'proceed', autoDeferEmbeds: false, notice: { status: 'proceeding', mode, gate: 'posture_tokenmax', newTokens: inline.tokens, estimateKind: inline.estimateKind, costUsd, floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName, hint: SPEND_HINT } };
+    }
+    console.log(`${previewMsg} spend.posture=tokenmax: proceeding (informational). ${SPEND_HINT}`);
+    return { action: 'proceed', autoDeferEmbeds: false };
+  }
+
+  // Link intent: search.mode=tokenmax but spend posture unset → nudge once.
+  let searchModeHint = '';
+  try {
+    const sm = await engine.getConfig('search.mode');
+    if (typeof sm === 'string' && sm.trim().toLowerCase() === 'tokenmax') {
+      searchModeHint =
+        ` (search.mode=tokenmax detected — \`gbrain config set spend.posture tokenmax\` ` +
+        `makes cost gates informational)`;
+    }
+  } catch {
+    /* best-effort */
+  }
+
+  if (shouldBlockSync(costUsd, floorUsd, mode, posture)) {
+    const isTTY = Boolean(process.stdout.isTTY) && Boolean(process.stdin.isTTY);
+    if (isTTY && !jsonOut) {
+      // Interactive TTY: prompt [y/N].
+      console.log(previewMsg + searchModeHint);
+      const answer = await promptYesNo('Proceed? [y/N] ');
+      if (!answer) {
+        console.log('Cancelled.');
+        return { action: 'stop' };
+      }
+      return { action: 'proceed', autoDeferEmbeds: false };
+    }
+    // Non-TTY or --json: defer without wedging. Use the background queue only
+    // when it has a drainable worker surface; otherwise report the exact
+    // manual command and never imply that a job was or will be queued.
+    if (manualDrainReason) {
+      const commands = manualDrainCommands(sources);
+      if (jsonOut) {
+        return { action: 'proceed', autoDeferEmbeds: true, notice: {
+          status: 'manual_drain_required', mode, gate: 'manual_drain_required',
+          reason: manualDrainReason, workerSurface: ctx.workerSurface.status, newTokens: inline.tokens,
+          estimateKind: inline.estimateKind, costUsd,
+          floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName,
+          manualCommands: commands, hint: SPEND_HINT,
+        } };
+      }
+      const refusal = manualDrainReason === 'no_worker_surface'
+        ? 'no persistent worker surface is available'
+        : 'automatic backfill submission is disabled by --no-auto-embed';
+      console.log(
+        `${previewMsg} Exceeds floor $${formatUsdLimit(floorUsd)} in a non-interactive ` +
+        `session — importing now without embeddings because ${refusal}. Manual drain required: ` +
+        `${commands.map((command) => `\`${command}\``).join(', ')}. ` +
+        `Pass --yes to embed inline.\n${SPEND_HINT}`,
+      );
+      return { action: 'proceed', autoDeferEmbeds: true };
+    }
+
+    // Worker-backed AUTO-DEFER. NEVER exit 2 (the wedged-cron fix).
+    if (jsonOut) {
+      return { action: 'proceed', autoDeferEmbeds: true, notice: { status: 'auto_deferred', mode, gate: 'auto_deferred_embeds', newTokens: inline.tokens, estimateKind: inline.estimateKind, costUsd, floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName, hint: SPEND_HINT } };
+    }
+    console.log(
+      `${previewMsg} Exceeds floor $${formatUsdLimit(floorUsd)} in a non-interactive ` +
+      `session — importing now, deferring embeds to capped backfill jobs. ` +
+      `Drain: run the jobs worker or \`gbrain embed --stale\`. Pass --yes to embed inline.\n${SPEND_HINT}`,
+    );
+    return { action: 'proceed', autoDeferEmbeds: true };
+  }
+
+  // Below floor → proceed without blocking (kills inline-cron noise).
+  if (jsonOut) {
+    return { action: 'proceed', autoDeferEmbeds: false, notice: { status: 'below_floor', mode, gate: 'below_floor', newTokens: inline.tokens, estimateKind: inline.estimateKind, staleChars, costUsd, floorUsd: formatUsdLimit(floorUsd), model: embeddingModelName } };
+  }
+  console.log(`${previewMsg} Below cost gate floor ($${formatUsdLimit(floorUsd)}), proceeding.`);
+  return { action: 'proceed', autoDeferEmbeds: false };
+}

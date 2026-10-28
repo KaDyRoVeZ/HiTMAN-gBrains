@@ -1,0 +1,1250 @@
+[
+  {
+    "source": "source-a",
+    "slug": "people/saskia-fennmoor",
+    "type": "person",
+    "role": "target:E9"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/ysolde-fennford",
+    "type": "person",
+    "role": "target:E9"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/lisbet-brinhollow",
+    "type": "person",
+    "role": "target:E9"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/torben-fennmere",
+    "type": "person",
+    "role": "target:E9"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/veda-ravnby",
+    "type": "person",
+    "role": "target:E2"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/marlow-jorvvane",
+    "type": "person",
+    "role": "target:E2"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/dorrit-lornley",
+    "type": "person",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/odalys-naskdale",
+    "type": "person",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/rhosyn-jorvham",
+    "type": "person",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/zephyra-yarlvane",
+    "type": "person",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/tesstun-works",
+    "type": "company",
+    "role": "target:E4"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/vorrel-cloud",
+    "type": "company",
+    "role": "target:E4"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/nexlet-robotics",
+    "type": "company",
+    "role": "target:E4"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/umbaly-cloud",
+    "type": "company",
+    "role": "target:E4"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/zorrel-analytics",
+    "type": "company",
+    "role": "target:E4"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/umbix-dynamics",
+    "type": "company",
+    "role": "target:E4"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/glimow-studio",
+    "type": "company",
+    "role": "target:E2"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/nuvix-systems",
+    "type": "company",
+    "role": "target:E2"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2024-07-08-tiebot-deployment-strategy-discussion",
+    "type": "meeting",
+    "role": "target:E11"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2023-12-10-kickoff-for-automated-berth-coordination",
+    "type": "meeting",
+    "role": "target:E11"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2024-04-13-quarterly-adaptive-tools-strategy-review",
+    "type": "meeting",
+    "role": "target:E11"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2023-09-16-wildfire-early-warning-system-strategy",
+    "type": "meeting",
+    "role": "target:E11"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2024-10-01-queue-optimization-strategy-session",
+    "type": "meeting",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2023-05-16-clause-extraction-algorithm-review",
+    "type": "meeting",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/camera-network-sensitivity-calibration",
+    "type": "note",
+    "role": "target:E3"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/insight-on-sensor-tag-battery-life",
+    "type": "note",
+    "role": "target:E3"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/best-practices-for-dosing-systems",
+    "type": "note",
+    "role": "target:E3"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/interconnection-queue-challenges-overview",
+    "type": "note",
+    "role": "target:E3"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/vendor-contract-compliance-tips",
+    "type": "note",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/chair-utilization-optimization-tips",
+    "type": "note",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/improving-flood-extent-accuracy",
+    "type": "note",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/safety-monitoring-algorithm-tuning",
+    "type": "note",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/grid-battery-dispatch",
+    "type": "concept",
+    "role": "target:E2"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/clause-extraction",
+    "type": "concept",
+    "role": "target:E2"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2024-06-04-cold-chain-data-integration-strategy",
+    "type": "meeting",
+    "role": "target:E13"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2023-02-03-optimizing-nutrient-flow-rates",
+    "type": "meeting",
+    "role": "target:E13"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/dynamic-scheduling-model",
+    "type": "concept",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/roof-condition-scoring",
+    "type": "concept",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/autonomous-rebar-tying",
+    "type": "concept",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/berth-allocation-algorithms",
+    "type": "concept",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/mastery-based-learning",
+    "type": "concept",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/integrated-fire-detection",
+    "type": "concept",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/advances-in-post-flood-damage-mapping",
+    "type": "media",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/optimizing-rebar-automation-workflows",
+    "type": "media",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/innovations-in-dockside-scheduling",
+    "type": "media",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/innovations-in-student-mastery-tracking",
+    "type": "media",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/maximizing-district-procurement-efficiency",
+    "type": "writing",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/optimizing-camera-networks-for-fire-detection",
+    "type": "writing",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/optimizing-sensor-deployment-in-cold-logistics",
+    "type": "writing",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/reducing-waste-through-smart-dosing",
+    "type": "writing",
+    "role": "target:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/linnea-marqmoor",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/rune-ulmmoor",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/amadeo-ibbdale",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/tobiah-naskley",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/oriel-zelkdale",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/zosia-jorvley",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/oriel-fennvane",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/dorrit-peltdale",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/eilis-holmstead",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/tobiah-ulmford",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/fiora-velkbrook",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/kestrel-gwilham",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/dorrit-ravnham",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/dorrit-ibbmere",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/bram-holmmoor",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/yorick-talvwick",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/nadezhda-ibbton",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/saskia-silvhollow",
+    "type": "person",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/xanmere-cloud",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/orbdra-networks",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/vexvane-studio",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/pyrora-cloud",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/halora-works",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/dratun-studio",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/nexvane-networks",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/zordra-robotics",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/halow-freight",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/dortun-dynamics",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/vorley-analytics",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/zordra-works",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/tessix-networks",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/lumaly-health",
+    "type": "company",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2025-01-06-crane-telemetry-data-review-session",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2024-07-02-district-procurement-coordination-session",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2023-03-08-line-inspection-drone-deployment-planning",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2025-02-24-vaccine-temperature-compliance-review",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2025-07-13-forecasting-yield-accuracy-improvements",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2023-12-24-battery-degradation-data-review",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2025-01-07-procurement-redlining-workflow-kickoff",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2023-05-03-kickoff-for-insurance-claim-automation",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2023-11-22-kickoff-for-roof-analytics-integration",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2023-03-10-surveywing-data-workflow-review",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2024-03-23-customs-clearance-workflow-update",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2024-12-10-teacher-feedback-roundtable-on-dashteach",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2024-09-27-outage-risk-analytics-review",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2023-08-02-next-gen-packaging-materials-discussion",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "meetings/2025-06-04-dispatch-software-feature-planning",
+    "type": "meeting",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/shipment-delay-impact-analysis",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/machine-learning-model-updates",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/degradation-modeling-best-practices",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/improving-clause-extraction-precision",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/reducing-claim-denial-rates",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/catastrophe-response-data-latency",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/container-tracking-system-overview",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/challenges-in-mastery-tracking-implementation",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/vegetation-growth-seasonal-trends",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/training-protocol-for-cold-chain-handlers",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/maintenance-checklist-for-grow-towers",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/dispatch-software-user-feedback",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "notes/dynamic-redlining-benefits",
+    "type": "note",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/redlining-automation",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/multi-channel-recall-outreach",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/flood-extent-mapping",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/aerial-site-mapping",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/teacher-dashboard-analytics",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/temperature-excursion-definition",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/calendar-aging-effects",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/claim-lifecycle-management",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/rapid-disaster-analytics",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/customs-clearance-automation",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/district-procurement-workflow",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/predictive-outage-modeling",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/biopharma-cold-chain-compliance",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/yield-forecast-modeling",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/interconnection-queue-management",
+    "type": "concept",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/drone-mapping-innovations-in-construction",
+    "type": "media",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/reducing-crane-downtime-with-iot",
+    "type": "media",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/optimizing-teacher-dashboards-for-impact",
+    "type": "media",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/advances-in-automated-line-inspections",
+    "type": "media",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/ensuring-vaccine-integrity-in-transit",
+    "type": "media",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/balancing-nutrients-in-vertical-systems",
+    "type": "media",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/revolutionizing-contract-review-processes",
+    "type": "media",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/data-driven-vegetation-management-strategies",
+    "type": "writing",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/packaging-innovations-for-vaccine-stability",
+    "type": "writing",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/data-driven-yield-forecasting-benefits",
+    "type": "writing",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/balancing-longevity-and-dispatch-performance",
+    "type": "writing",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/challenges-in-automating-procurement-contracts",
+    "type": "writing",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/improving-revenue-through-recall-campaigns",
+    "type": "writing",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/leveraging-satellite-data-to-transform-insurance-claims",
+    "type": "writing",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "writing/enhancing-safety-with-ai-monitoring",
+    "type": "writing",
+    "role": "distractor:plain"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/niamh-marqley",
+    "type": "person",
+    "role": "founder"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/zosia-brinbrook",
+    "type": "person",
+    "role": "founder"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/marlow-thrumbrook",
+    "type": "person",
+    "role": "founder"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/halvard-talvley",
+    "type": "person",
+    "role": "founder"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/rhosyn-dunkford",
+    "type": "person",
+    "role": "founder"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/gideon-marqvane",
+    "type": "person",
+    "role": "founder"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/camera-network-sensitivity-calibration-lessons-from-the-field",
+    "type": "media",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/camera-network-sensitivity-calibration-lessons-from-the-field-summary",
+    "type": "media",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/camera-network-sensitivity-calibration-lessons-from-the-field",
+    "type": "concept",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/insight-on-sensor-tag-battery-life-lessons-from-the-field",
+    "type": "media",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/insight-on-sensor-tag-battery-life-lessons-from-the-field-summary",
+    "type": "media",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/insight-on-sensor-tag-battery-life-lessons-from-the-field",
+    "type": "concept",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/best-practices-for-dosing-systems-lessons-from-the-field",
+    "type": "media",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/best-practices-for-dosing-systems-lessons-from-the-field-summary",
+    "type": "media",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/best-practices-for-dosing-systems-lessons-from-the-field",
+    "type": "concept",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/interconnection-queue-challenges-overview-lessons-from-the-field",
+    "type": "media",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "media/interconnection-queue-challenges-overview-lessons-from-the-field-summary",
+    "type": "media",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/interconnection-queue-challenges-overview-lessons-from-the-field",
+    "type": "concept",
+    "role": "E3-family"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/tiebot-integration-pilot-overview",
+    "type": "concept",
+    "role": "E11-stub"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/berth-coordination-pilot-overview",
+    "type": "concept",
+    "role": "E11-stub"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/adaptive-integration-pilot-overview",
+    "type": "concept",
+    "role": "E11-stub"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/wildfire-sensor-pilot-overview",
+    "type": "concept",
+    "role": "E11-stub"
+  },
+  {
+    "source": "source-a",
+    "slug": "images/2025-07-15-img-5385.jpg",
+    "type": "image",
+    "role": "E9-image"
+  },
+  {
+    "source": "source-a",
+    "slug": "images/2025-01-03-img-6342.jpg",
+    "type": "image",
+    "role": "E9-image"
+  },
+  {
+    "source": "source-a",
+    "slug": "images/2025-11-25-img-8418.jpg",
+    "type": "image",
+    "role": "E9-image"
+  },
+  {
+    "source": "source-a",
+    "slug": "images/2025-07-22-img-8976.jpg",
+    "type": "image",
+    "role": "E9-image"
+  },
+  {
+    "source": "source-a",
+    "slug": "images/2025-06-23-img-2265.jpg",
+    "type": "image",
+    "role": "E9-image"
+  },
+  {
+    "source": "source-a",
+    "slug": "images/2025-09-03-img-1181.jpg",
+    "type": "image",
+    "role": "E9-image"
+  },
+  {
+    "source": "source-a",
+    "slug": "images/2025-02-23-img-7472.jpg",
+    "type": "image",
+    "role": "E9-image"
+  },
+  {
+    "source": "source-a",
+    "slug": "images/2025-09-06-img-9172.jpg",
+    "type": "image",
+    "role": "E9-image"
+  },
+  {
+    "source": "source-a",
+    "slug": "images/2024-11-19-img-7599.jpg",
+    "type": "image",
+    "role": "E9-image"
+  },
+  {
+    "source": "source-a",
+    "slug": "images/2024-10-15-img-2726.jpg",
+    "type": "image",
+    "role": "E9-image"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/veda-ravnby-1",
+    "type": "person",
+    "role": "E2-stub"
+  },
+  {
+    "source": "source-a",
+    "slug": "people/marlow-jorvvane-1",
+    "type": "person",
+    "role": "E2-stub"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/glimow-studio-old",
+    "type": "company",
+    "role": "E2-stub"
+  },
+  {
+    "source": "source-a",
+    "slug": "companies/nuvix-systems-old",
+    "type": "company",
+    "role": "E2-stub"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/grid-battery-dispatch-old",
+    "type": "concept",
+    "role": "E2-stub"
+  },
+  {
+    "source": "source-a",
+    "slug": "concepts/clause-extraction-old",
+    "type": "concept",
+    "role": "E2-stub"
+  },
+  {
+    "source": "source-b",
+    "slug": "people/dorrit-lornley",
+    "type": "person",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "people/rhosyn-jorvham",
+    "type": "person",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "people/zephyra-yarlvane",
+    "type": "person",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "meetings/2023-05-16-clause-extraction-algorithm-review",
+    "type": "meeting",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "notes/vendor-contract-compliance-tips",
+    "type": "note",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "notes/chair-utilization-optimization-tips",
+    "type": "concept",
+    "role": "twin-divergent:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "notes/improving-flood-extent-accuracy",
+    "type": "concept",
+    "role": "twin-divergent:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "concepts/dynamic-scheduling-model",
+    "type": "concept",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "concepts/berth-allocation-algorithms",
+    "type": "concept",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "concepts/integrated-fire-detection",
+    "type": "concept",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "media/advances-in-post-flood-damage-mapping",
+    "type": "media",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "media/optimizing-rebar-automation-workflows",
+    "type": "concept",
+    "role": "twin-divergent:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "media/innovations-in-student-mastery-tracking",
+    "type": "media",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "writing/optimizing-sensor-deployment-in-cold-logistics",
+    "type": "writing",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "writing/reducing-waste-through-smart-dosing",
+    "type": "writing",
+    "role": "twin-identical:target"
+  },
+  {
+    "source": "source-b",
+    "slug": "companies/tessik-health",
+    "type": "company",
+    "role": "distractor:b-only"
+  },
+  {
+    "source": "source-b",
+    "slug": "companies/zordra-robotics",
+    "type": "company",
+    "role": "twin-identical:distractor"
+  },
+  {
+    "source": "source-b",
+    "slug": "companies/jorley-freight",
+    "type": "company",
+    "role": "distractor:b-only"
+  },
+  {
+    "source": "source-b",
+    "slug": "meetings/2024-07-02-district-procurement-coordination-session",
+    "type": "note",
+    "role": "twin-divergent:distractor"
+  },
+  {
+    "source": "source-b",
+    "slug": "meetings/2023-02-06-scaling-multi-tower-operations",
+    "type": "meeting",
+    "role": "distractor:b-only"
+  },
+  {
+    "source": "source-b",
+    "slug": "notes/rebar-robot-maintenance-checklist",
+    "type": "note",
+    "role": "distractor:b-only"
+  },
+  {
+    "source": "source-b",
+    "slug": "notes/maintenance-checklist-for-grow-towers",
+    "type": "note",
+    "role": "twin-identical:distractor"
+  },
+  {
+    "source": "source-b",
+    "slug": "concepts/crane-telemetry-integration",
+    "type": "concept",
+    "role": "distractor:b-only"
+  },
+  {
+    "source": "source-b",
+    "slug": "concepts/vegetation-encroachment-risk",
+    "type": "concept",
+    "role": "distractor:b-only"
+  },
+  {
+    "source": "source-b",
+    "slug": "concepts/nutrient-dosing-cycles",
+    "type": "concept",
+    "role": "distractor:b-only"
+  },
+  {
+    "source": "source-b",
+    "slug": "concepts/procurement-review-workflow",
+    "type": "concept",
+    "role": "distractor:b-only"
+  },
+  {
+    "source": "source-b",
+    "slug": "concepts/ai-hazard-detection",
+    "type": "concept",
+    "role": "distractor:b-only"
+  },
+  {
+    "source": "source-b",
+    "slug": "concepts/district-procurement-workflow",
+    "type": "concept",
+    "role": "twin-identical:distractor"
+  },
+  {
+    "source": "source-b",
+    "slug": "media/reducing-crane-downtime-with-iot",
+    "type": "concept",
+    "role": "twin-divergent:distractor"
+  },
+  {
+    "source": "source-b",
+    "slug": "media/navigating-interconnection-queue-complexities",
+    "type": "media",
+    "role": "distractor:b-only"
+  }
+]

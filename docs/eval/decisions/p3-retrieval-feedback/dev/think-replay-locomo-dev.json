@@ -1,0 +1,128 @@
+{
+  "plan": "P3 E2",
+  "benchmark": "locomo",
+  "split": "dev",
+  "product": {
+    "package": "gbrain",
+    "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+    "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+    "version": "0.60.48.0",
+    "package_sha256": "44c3773101d390d859af380747dfa4335f06f60ba1e61b9300ffd10a63c03f9d",
+    "loaded_git_head": "23d2597e215c93acf23a08f16cb63ad8379f9d40"
+  },
+  "seed": 42,
+  "lambda": 0.1,
+  "think_model": "anthropic:claude-sonnet-5-5",
+  "judge": {
+    "model": "openai:gpt-4o-2024-08-06",
+    "runs": 3,
+    "temperature": 0.7
+  },
+  "limits": {
+    "train": 25,
+    "score": 20
+  },
+  "conversations": [
+    {
+      "id": "conv-44",
+      "train": 25,
+      "score": 20
+    },
+    {
+      "id": "conv-47",
+      "train": 25,
+      "score": 20
+    },
+    {
+      "id": "conv-48",
+      "train": 25,
+      "score": 20
+    }
+  ],
+  "cost": {
+    "usd": 23.65
+  },
+  "arms": {
+    "off": {
+      "n": 60,
+      "errors": 0,
+      "judge_mean": 0.7833,
+      "judge_sd_across_replicates": 0.0136,
+      "delta_vs_off": 0,
+      "delta_ci95_question_bootstrap": null,
+      "by_conversation": {
+        "conv-44": 0.7167,
+        "conv-47": 0.9,
+        "conv-48": 0.7333
+      },
+      "answerable_judge_mean": 0.7391,
+      "adversarial_abstention_mean": 0.9286,
+      "trap_repeat_rate": 0.4286,
+      "gather_recall_at_5": 0.7391,
+      "implicit_cited_events_per_100_answers": 0
+    },
+    "frozen": {
+      "n": 60,
+      "errors": 0,
+      "judge_mean": 0.7833,
+      "judge_sd_across_replicates": 0.0136,
+      "delta_vs_off": 0,
+      "delta_ci95_question_bootstrap": [
+        -0.0444,
+        0.05
+      ],
+      "by_conversation": {
+        "conv-44": 0.75,
+        "conv-47": 0.85,
+        "conv-48": 0.75
+      },
+      "answerable_judge_mean": 0.7609,
+      "adversarial_abstention_mean": 0.8571,
+      "trap_repeat_rate": 0.4286,
+      "gather_recall_at_5": 0.7391,
+      "implicit_cited_events_per_100_answers": 369.33
+    },
+    "sparse": {
+      "n": 60,
+      "errors": 0,
+      "judge_mean": 0.7611,
+      "judge_sd_across_replicates": 0.0157,
+      "delta_vs_off": -0.0222,
+      "delta_ci95_question_bootstrap": [
+        -0.0944,
+        0.0667
+      ],
+      "by_conversation": {
+        "conv-44": 0.7,
+        "conv-47": 0.8833,
+        "conv-48": 0.7
+      },
+      "answerable_judge_mean": 0.7101,
+      "adversarial_abstention_mean": 0.9286,
+      "trap_repeat_rate": 0.5,
+      "gather_recall_at_5": 0.7391,
+      "implicit_cited_events_per_100_answers": 415.79
+    },
+    "online": {
+      "n": 60,
+      "errors": 0,
+      "judge_mean": 0.7667,
+      "judge_sd_across_replicates": 0,
+      "delta_vs_off": -0.0167,
+      "delta_ci95_question_bootstrap": [
+        -0.0667,
+        0.0222
+      ],
+      "by_conversation": {
+        "conv-44": 0.7167,
+        "conv-47": 0.9,
+        "conv-48": 0.6833
+      },
+      "answerable_judge_mean": 0.7174,
+      "adversarial_abstention_mean": 0.9286,
+      "trap_repeat_rate": 0.4286,
+      "gather_recall_at_5": 0.7391,
+      "implicit_cited_events_per_100_answers": 380
+    }
+  }
+}

@@ -1,0 +1,176 @@
+/**
+ * postgres-engine.ts source-level guardrails.
+ *
+ * Live Postgres coverage for search paths lives in test/e2e/search-quality.test.ts.
+ * This file stays fast and DB-free: it inspects the source of
+ * src/core/postgres-engine.ts to lock in decisions that protect the
+ * shared connection pool from per-request GUC leaks.
+ *
+ * Regression: R6-F006 / R4-F002.
+ * searchKeyword and searchVector used to call bare
+ *   await sql`SET statement_timeout = '8s'`
+ *   ...query...
+ *   finally { await sql`SET statement_timeout = '0'` }
+ * against the shared pool. Each tagged template picks an arbitrary
+ * connection, so the SET, the query, and the reset could all land on
+ * DIFFERENT connections. Worst case: the 8s GUC sticks on some pooled
+ * connection and clips the next caller's long-running query; or the
+ * reset to 0 lands on a connection that other code expected to be
+ * protected. The fix wraps each query in sql.begin() and uses
+ * SET LOCAL so the GUC is transaction-scoped and auto-resets on
+ * COMMIT/ROLLBACK, regardless of error path.
+ */
+
+import { describe, test, expect } from 'bun:test';
+import { surfaceFileSource } from './helpers/source-surface.ts';
+
+const SRC = surfaceFileSource('postgres-engine', 'src/core/postgres-engine.ts');
+// #5824: the vector statement (SQL text, date bounds, timeout constant) is
+// built in search/vector-statement.ts, shared with PGLite and doctor.
+const VECTOR_STATEMENT_SRC = surfaceFileSource('postgres-engine', 'src/core/search/vector-statement.ts');
+
+describe('postgres-engine / search path timeout isolation', () => {
+  test('no bare `SET statement_timeout` statement survives', () => {
+    // Strip comments so the commentary mentioning the anti-pattern does
+    // not trigger a false positive. Block-comment + line-comment strip.
+    const stripped = SRC
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|\s)\/\/[^\n]*/g, '$1');
+
+    // Match a tagged-template statement of the form
+    //   sql`SET statement_timeout = ...`
+    // that is NOT preceded by LOCAL. This is the exact shape that bleeds
+    // onto pooled connections; SET LOCAL is safe inside a transaction.
+    const bare = stripped.match(
+      /sql`\s*SET\s+(?!LOCAL\s)statement_timeout\b[^`]*`/gi,
+    );
+    expect(bare).toBeNull();
+  });
+
+  test('searchKeyword wraps its query in a transaction (via withScopedReadTransaction alwaysTransaction)', () => {
+    // Post-RLS-scope-binding invariant: the search methods route through
+    // withScopedReadTransaction with alwaysTransaction: true, which
+    // guarantees a sql.begin() wrap in BOTH modes — flag off (identical to
+    // master's pre-helper wrap) and flag on (scoped transaction with
+    // set_config). See the helper tests in
+    // test/postgres-engine-rls-scope.test.ts for the behavioral pins.
+    const fn = extractMethod(SRC, 'searchKeyword');
+    expect(fn).toMatch(/withScopedReadTransaction\s*\(/);
+    expect(fn).toMatch(/alwaysTransaction:\s*true/);
+  });
+
+  test('searchVector wraps its query in a transaction (via withScopedReadTransaction alwaysTransaction)', () => {
+    const fn = extractMethod(SRC, 'searchVector');
+    expect(fn).toMatch(/withScopedReadTransaction\s*\(/);
+    expect(fn).toMatch(/alwaysTransaction:\s*true/);
+  });
+
+  test('withScopedReadTransaction uses the composable transaction when needed', () => {
+    // Keep the inspected body bounded; behavioral scope/savepoint coverage
+    // lives in postgres-engine-rls-scope.test.ts.
+    const helper = stripComments(SRC).split('private async withScopedReadTransaction<T>')[1]!.split('async connect(')[0]!;
+    expect(helper).toMatch(/this\.transaction\(async engine =>/);
+    expect(helper).toMatch(/const tx = \(engine as PostgresEngine\)\.sql;/);
+    // One settings statement (scope, JIT off, the caller's settings) runs before the callback; nested reads restore.
+    expect(helper).toMatch(/withSearchSettings\(tx, this\._pageTransaction, settings, \(\) => callback\(tx\), VECTOR_SETTING_DEFAULTS\)/);
+    // Flag off without a transaction requirement preserves pool passthrough.
+    expect(helper).toMatch(
+      /if\s*\(!this\.rlsScopeBindingEnabled\s*&&\s*!opts\?\.alwaysTransaction\)\s*\{\s*return\s+await\s+callback\(this\.sql\);/,
+    );
+  });
+
+  test('both search methods bind a transaction-local timeout through the transaction settings', () => {
+    const keyword = stripComments(extractMethod(SRC, 'searchKeyword'));
+    const attempt = stripComments(SRC).split('private runVectorAttempt(')[1]!.split('async getEmbeddingsByChunkIds(')[0]!;
+    expect(keyword).toMatch(/settings: relaxed \? \{ statement_timeout: statementTimeout, enable_seqscan: 'off', \.\.\.KEYWORD_STATEMENT_SETTINGS \} : \{ statement_timeout: statementTimeout, \.\.\.KEYWORD_STATEMENT_SETTINGS \}/);
+    // A thunk: the deadline's remaining budget is read after BEGIN, one round trip before the query.
+    expect(attempt).toMatch(/settings: \(\) => vectorScanSettings\(iterative, innerLimit, maxScanTuples, deadline,/);
+  });
+
+  test('connect() with poolSize honors resolvePrepare (PgBouncer regression guard)', () => {
+    // Regression: worker-instance pools were NOT honoring the prepare decision
+    // before v0.15.4. Module singleton connect() in db.ts was fixed by #284 but
+    // PostgresEngine.connect({poolSize}) (the branch used by `gbrain jobs work`)
+    // silently ignored it — agents running background work against Supabase
+    // pooler URLs still hit `prepared statement "..." does not exist` under
+    // load. Source-level grep is enough: runtime mocking of postgres.js's
+    // tagged-template interface is painful under bun ESM and the wiring is
+    // simple enough that if `resolvePrepare` name appears and a conditional
+    // `prepare` key appears in the options literal, the wire-up is live.
+    const stripped = stripComments(SRC);
+    expect(stripped).toMatch(/db\.resolvePrepare\s*\(\s*url\s*\)/);
+    expect(stripped).toMatch(/typeof\s+prepare\s*===\s*['"]boolean['"]/);
+  });
+
+  test('neither search method clears the timeout with `SET statement_timeout = 0`', () => {
+    // The reset-to-zero pattern was the other half of the leak: if SET
+    // LOCAL is in play, COMMIT handles the reset and an explicit
+    // `SET statement_timeout = '0'` would itself leak the GUC change
+    // onto the returned connection. Strip comments first so the
+    // commentary in the method itself (which quotes the anti-pattern
+    // to explain it) does not trigger a false positive.
+    const keyword = stripComments(extractMethod(SRC, 'searchKeyword'));
+    const vector = stripComments(extractMethod(SRC, 'searchVector'));
+    expect(keyword).not.toMatch(/SET\s+statement_timeout\s*=\s*['"]?0/);
+    expect(vector).not.toMatch(/SET\s+statement_timeout\s*=\s*['"]?0/);
+  });
+});
+
+describe('postgres-engine / search date filtering', () => {
+  test('search paths filter since/until on effective_date before import-time fallback', () => {
+    const expectedDateExpr = 'COALESCE(p.effective_date, p.updated_at, p.created_at)';
+    const staleDatePredicate = /COALESCE\(p\.updated_at,\s*p\.created_at\)\s*[<>]\s*\$/;
+
+    for (const methodName of ['searchKeyword', 'searchKeywordChunks']) {
+      const fn = stripComments(extractMethod(SRC, methodName));
+
+      expect(countOccurrences(fn, expectedDateExpr)).toBe(2);
+      expect(fn).not.toMatch(staleDatePredicate);
+    }
+  });
+
+  test('vector search spells the same effective_date-first fallback per column (#5824)', () => {
+    const builder = stripComments(VECTOR_STATEMENT_SRC);
+    expect(builder).toContain('`AND (p.effective_date ${op} ${bound} OR (p.effective_date IS NULL AND (p.updated_at ${op} ${bound} OR (p.updated_at IS NULL AND p.created_at ${op} ${bound}))))`');
+    expect(builder).toMatch(/opts\?\.afterDate\) filters\.push\(dateBound\(/);
+    expect(builder).toMatch(/opts\?\.beforeDate\) filters\.push\(dateBound\(/);
+    expect(builder).not.toMatch(/COALESCE\(p\.updated_at,\s*p\.created_at\)/);
+    expect(stripComments(extractMethod(SRC, 'searchVector'))).toContain('buildVectorSearchStatement(');
+  });
+});
+
+function stripComments(s: string): string {
+  return s
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|\s)\/\/[^\n]*/g, '$1');
+}
+
+function countOccurrences(s: string, needle: string): number {
+  return s.split(needle).length - 1;
+}
+
+// extractMethod grabs the body of a class method by brace-matching from
+// its opening line. Returns the method body up to the matching closing
+// brace. Good enough for the small number of methods in this file.
+function extractMethod(source: string, name: string): string {
+  // Find "async <name>(" at method-definition indentation (2 spaces).
+  const openRe = new RegExp(`^\\s+async\\s+${name}\\s*\\(`, 'm');
+  const match = openRe.exec(source);
+  if (!match) {
+    throw new Error(`method ${name} not found in postgres-engine.ts`);
+  }
+  // Scan forward balancing braces.
+  let i = source.indexOf('{', match.index);
+  if (i < 0) throw new Error(`no opening brace for ${name}`);
+  const start = i;
+  let depth = 0;
+  for (; i < source.length; i++) {
+    const c = source[i];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  throw new Error(`unbalanced braces in ${name}`);
+}

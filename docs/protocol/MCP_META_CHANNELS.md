@@ -1,0 +1,43 @@
+# MCP `_meta` channels
+
+Normative conventions for `ToolResult._meta` on gbrain's MCP surfaces.
+`_meta` is the structured, out-of-band
+channel for tool-call responses; the response BODY contract never changes
+shape for it.
+
+## Rules
+
+1. **One producer per top-level key.** A producer owns exactly one
+   namespaced key and never writes another producer's key. The dispatch
+   layer (`src/mcp/dispatch.ts`) merges per top-level key — never wholesale
+   `_meta` assignment.
+2. **Additive-forever within a key.** Fields inside a key may be added,
+   never renamed or removed — the RESPONSE_SCHEMAS discipline applied to
+   `_meta`. Consumers must tolerate unknown fields.
+3. **Producer isolation.** Every producer attaches inside its own
+   try/catch. A failing producer degrades to its key being absent; it never
+   drops another producer's key and never errors the tool call.
+4. **Merge precedence.** Handler-emitted keys (via
+   `OperationContext.emitResponseMeta`) attach first; transport hooks
+   (`metaHook`) attach after and may add keys but shadow nothing that
+   matters — key ownership (rule 1) makes ordering a non-event.
+5. **Model visibility caveat.** Mainstream harnesses do NOT feed `_meta` to
+   the model. Anything the model must SEE rides a content block (see the
+   second text block on empty retrievals); `_meta` serves structured
+   programmatic consumers (thin clients, harness plumbing, tests).
+
+## Registered keys
+
+| Key | Producer | Contents |
+|-----|----------|----------|
+| `brain_hot_memory` | serve-http `metaHook` (`getBrainHotMemoryMeta`) | Hot-memory facts relevant to the call; each fact carries `trust_tier` and `origin`, and `suppressed` (`{withheld, review}`, present only when non-zero) counts unconfirmed agent-written facts activation control withheld, never their content |
+| `retrieval` | `search`/`query` op handlers | `returned_count`, `retrieved_count`, `vector_enabled`, `expansion_applied`, `cache`, `token_budget`, `degraded[]` (closed stage vocabulary), `rerank_degraded` (on a call whose reranker failed: `{reason, fallback: "fused_order", calls_this_session}`; reason is `timeout`, `budget`, `rate_limited`, `unreachable`, `auth` or `provider_error`; no `fields: "full"` needed), `hint` (non-contractual prose), `rows` (`"lean"` or `"full"`: the row shape of content[0]; reported for remote callers and whenever `fields` is passed), `timings` (`{total_ms, stages_ms, other_ms, overlapped_ms?, parts_ms?}`, integer ms, every response; [search-explain.md](../guides/search-explain.md#see-where-the-time-went)) |
+| `warnings` | dispatch strict-params warn mode | `[{code: 'unknown_param', param, suggestion?}]` |
+| `pagination` | `list_pages` op handler | `truncated` (more rows match), `limit` (effective), `clamped_from?` (the caller's limit when capped), `next?` (params for the following page: `{sort, updated_after, updated_after_slug}` under `updated_asc`, else `{offset}`). The model-visible counterpart is the `listing_truncated` notice block (kind `info`, never deduped), whose `fix.mcp` is the next-page call. |
+
+Inbound `_meta` (e.g. `_meta.session_id` inside tool ARGUMENTS) is a
+separate, client-to-server plane. The eval-report `_meta.metric_glossary`
+lives in JSON BODIES of eval commands — a third, unrelated plane. Ambient
+recall rides content/hooks, not `_meta`.
+
+Adding a key: register it in the table above, one producer, additive-forever.

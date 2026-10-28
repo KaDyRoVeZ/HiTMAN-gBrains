@@ -1,0 +1,1461 @@
+/**
+ * synthesize-verify.ts — mechanical claim verification on dream pages
+ * (F1b/F4b, eval write-path fix wave; grounding gate, gbrain 10x amendment 7).
+ *
+ * The synthesis prompt mandates verbatim quotes and source-exact numbers;
+ * measured against the Cat 35 benchmark, fewer than half of quoted spans in
+ * produced pages were substrings of the source transcript. This pass runs
+ * right after the children's put_page writes and BEFORE stampDreamProvenance /
+ * reverseWriteRefs / the phase-end embed sweep, so the provenance stamp, the
+ * markdown file, and the embedded chunks all carry the verified body.
+ *
+ *   writtenRefs ──▶ group by page ──▶ claim units (sentences, list items,
+ *   (slug,src,      sources = every     table rows) that are NEW:
+ *    raw_source)    transcript that       - whole body for pages created
+ *                   wrote the page          during this run
+ *                                         - only units absent from the
+ *                                           pre-run revision (page_versions)
+ *                                           for pages that already existed
+ *                                     per new unit:
+ *                                       quotes → exact / normalized / near
+ *                                         (verbatim transcript slice, never
+ *                                         across a speaker turn)
+ *                                       attribution → the named speaker must
+ *                                         be the turn's speaker
+ *                                       numbers → must occur in a source
+ *                                       decisions → a speaker's decision or
+ *                                         commitment carries only numbers and
+ *                                         dates from that speaker's turns or a
+ *                                         turn they explicitly accepted (#5425)
+ *                                     any failure → the WHOLE unit leaves the
+ *                                       body and is kept in frontmatter
+ *                                       `unverified_claims`
+ *
+ * Invariants:
+ *   - NEVER fabricate: every replacement is a verbatim slice of a source
+ *     transcript, trimmed to the matched tokens inside one speaker turn.
+ *   - NEVER keep an unsupported derived assertion as authoritative text: the
+ *     unit is removed from compiled_truth/timeline (so it has no chunks, no
+ *     search_vector weight, no timeline/facts extraction, no think/context
+ *     evidence) and preserved verbatim in `unverified_claims` for review.
+ *     Frontmatter is not chunked or searched, so the record is visible to
+ *     get_page readers but excluded from authoritative recall.
+ *   - Provenance: every grounded quote records its source path, the
+ *     character span in that source, and the speaker of that turn in
+ *     frontmatter `grounding.quotes`.
+ *
+ * Failure contract (fail-open per page, pacer precedent — a verify bug never
+ * kills the phase): page read-back miss → count + skip; write-back throw →
+ * log slug+source, count, continue. Zero LLM calls; pure string ops with hard
+ * probe/size caps.
+ *
+ * Write-back reuses the SAME canonical pipeline the children's put_page tool
+ * executes — importFromContent (page + tags + chunks + link extraction in one
+ * transaction, content_hash recomputed) with noEmbed: the phase-end embed
+ * sweep backfills.
+ *
+ * Kill switch: `dream.synthesize.quote_verify` (default on), read by
+ * loadSynthConfig — the incident escape hatch for the one mechanism that
+ * rewrites page bodies.
+ */
+
+import { basename } from 'node:path';
+import type { BrainEngine } from '../engine.ts';
+import { importFromContent } from '../import-file.ts';
+import { transcriptsDerivation } from './dream-taint.ts';
+import { derivedMaintenanceTransaction } from '../trust/taint.ts';
+import { serializePageToMarkdown } from '../markdown.ts';
+import { throwIfAborted } from '../abort-check.ts';
+import { materializedHistoryRanges, prepareCanonicalProjections } from '../persistence/canonical-projections.ts';
+import { normalizePageFences } from '../fence-repair/import-step.ts';
+import { prepareAutomaticLinks } from '../persistence/links-preparation.ts';
+import { isAutoLinkEnabled } from '../link-extraction.ts';
+import { resolveCycleDate, utcDate } from './cycle-date.ts';
+import { attributionChecksEnabled } from './attribution-checks.ts';
+import { resolveVerifyPrior } from './synthesize-verify-epochs.ts';
+export { readVerifyEpoch, loadChildWriteEpochs, loadPreRunRevision, isDreamOwnedPage, resolveVerifyPrior } from './synthesize-verify-epochs.ts';
+
+/** Minimum quoted-span inner length considered a "quote" (shorter spans are
+ * scare quotes / titles, not transcript quotations). */
+const MIN_QUOTE_CHARS = 15;
+/** Soft cap: quoted spans examined per page (CPU bound, not correctness). */
+const MAX_QUOTES_PER_PAGE = 200;
+/** Near-match acceptance floor (token overlap) and ambiguity margin. */
+const NEAR_MATCH_FLOOR = 0.8;
+const NEAR_MATCH_AMBIGUITY = 0.05;
+/** A near-match repair longer than this multiple of the quote is refused. */
+const NEAR_MATCH_MAX_GROWTH = 1.3;
+/** Rung-3 CPU bounds: candidate windows scored, TOTAL trigram indexOf probes
+ * (a long ungroundable quote must not do thousands of full-transcript scans
+ * on the event loop), trigrams considered (stride-sampled above this), and
+ * the largest normalized quote rung 3 will attempt at all — a multi-thousand
+ * char "quote" that isn't exact/normalized is fabricated in practice. */
+const MAX_ANCHOR_CANDIDATES = 50;
+const MAX_ANCHOR_PROBES = 200;
+const MAX_NEAR_TRIGRAMS = 50;
+const MAX_NEAR_QUOTE_NORM_CHARS = 2000;
+/** Near-match window shaping: growth over the quote's normalized length and
+ * fixed char slack on each side (clipped to one speaker turn, then trimmed to
+ * the matched tokens). */
+const WINDOW_GROWTH = 1.2;
+const WINDOW_SLACK_BEFORE = 20;
+const WINDOW_SLACK_AFTER = 40;
+/** Occurrences of an exact/normalized quote considered for speaker checks. */
+const MAX_OCCURRENCES = 8;
+/** Unique numeric/date claims checked per page (CPU bound). */
+const MAX_NUMERIC_CLAIMS_PER_PAGE = 200;
+/** Frontmatter record caps (newest kept) so repeated cycles stay bounded. */
+const MAX_UNVERIFIED_RECORDS = 100;
+const MAX_PROVENANCE_RECORDS = 200;
+const PROVENANCE_TEXT_CHARS = 160;
+
+export const UNVERIFIED_CLAIMS_KEY = 'unverified_claims';
+export const GROUNDING_KEY = 'grounding';
+/** Body left behind when every unit on a page failed verification (the
+ * engine refuses to blank a non-empty body for maintenance writers). */
+export const ALL_CLAIMS_QUARANTINED_BODY = 'All claims on this page failed source verification; they are kept in `unverified_claims` for review.';
+
+/** Shared code/link masking (offset-preserving): fenced blocks, inline code,
+ * wikilinks, and markdown link targets are replaced with spaces so quote
+ * marks and slug dates inside them never register as prose claims. */
+function maskNonProse(body: string): string {
+  return body
+    .replace(/```[\s\S]*?(?:```|$)/g, m => ' '.repeat(m.length))
+    .replace(/`[^`\n]*`/g, m => ' '.repeat(m.length))
+    .replace(/\[\[[^\]]*\]\]/g, m => ' '.repeat(m.length))
+    .replace(/\]\([^)]*\)/g, m => ' '.repeat(m.length));
+}
+
+export interface QuoteVerifyStats {
+  pages_checked: number;
+  /** Pages whose body or grounding record was written back. */
+  pages_repaired: number;
+  /** Pages with at least one quarantined claim. */
+  pages_with_quarantine: number;
+  /** Pre-existing pages verified against their pre-run revision (diff only). */
+  preexisting_diffed: number;
+  /** Pre-existing pages with no revision recorded during this run (unchanged). */
+  skipped_unchanged: number;
+  quotes_total: number;
+  exact: number;
+  normalized_fixed: number;
+  near_fixed: number;
+  unbalanced: number;
+  /** Claim units removed from the body into `unverified_claims`. */
+  quarantined_claims: number;
+  /** Quotes found in no source transcript. */
+  quote_not_in_source: number;
+  /** Quotes whose only source match crossed a speaker turn. */
+  quote_crosses_speakers: number;
+  /** Quotes attributed to a speaker other than the one who said them. */
+  speaker_mismatch: number;
+  /** Numeric/date claims found in no source transcript. */
+  number_not_in_source: number;
+  /** A speaker's decision or commitment whose numbers/dates only another speaker stated (#5425). */
+  decision_misattributed: number;
+  /** A sentence whose grounded quote a later user turn took back on the same number or date (#5425 [UC4]; `dream.attribution_checks`). */
+  superseded_in_source: number;
+  skipped_no_transcript: number;
+  /** Pages where read-back or write-back failed (fail-open, logged). */
+  errors: number;
+}
+
+export function emptyQuoteVerifyStats(): QuoteVerifyStats {
+  return {
+    pages_checked: 0,
+    pages_repaired: 0,
+    pages_with_quarantine: 0,
+    preexisting_diffed: 0,
+    skipped_unchanged: 0,
+    quotes_total: 0,
+    exact: 0,
+    normalized_fixed: 0,
+    near_fixed: 0,
+    unbalanced: 0,
+    quarantined_claims: 0,
+    quote_not_in_source: 0,
+    quote_crosses_speakers: 0,
+    speaker_mismatch: 0,
+    number_not_in_source: 0,
+    decision_misattributed: 0,
+    superseded_in_source: 0,
+    skipped_no_transcript: 0,
+    errors: 0,
+  };
+}
+
+/**
+ * Offset-mapped grounding normalization — the wave's shared primitive (also
+ * used by the triage-rescue segment check and, at prompt-build time, by
+ * buildTriageMapBlock's quote filter via the mapless `normForGrounding`).
+ *
+ * Folds: whitespace runs → single space, curly quotes/apostrophes → straight,
+ * unicode dashes → '-', case → lower; markdown inline markup (`*`, backticks,
+ * `~~`) is skipped (`foldSkipSet`). `map[i]` = index in the ORIGINAL string
+ * of the character that produced `norm[i]`, so any match in normalized space
+ * maps back to a VERBATIM original slice (outside-voice amendment: without
+ * the map, "replace with verbatim span" would not be verbatim).
+ *
+ * Invariant: norm.length === map.length ALWAYS — toLowerCase() can expand one
+ * code unit into several (U+0130 'İ' → 'i' + U+0307), so every emitted code
+ * unit records its own source index (security-review fix: a single push per
+ * source char desynced every later offset and could slice garbage — or
+ * nothing — back into a page as a "verbatim" repair).
+ */
+export function normalizeForGrounding(s: string, opts: { tolerant?: boolean } = {}): { norm: string; map: number[] } {
+  return foldForGrounding(s, true, opts.tolerant === true) as { norm: string; map: number[] };
+}
+
+/**
+ * The ONE folding core. `withMap=false` skips the offset-map allocation (an
+ * 8-byte-per-char array the presence-check callers throw away) but runs the
+ * IDENTICAL fold, so `normForGrounding(x) === normalizeForGrounding(x).norm`
+ * holds by construction rather than by assertion — including the cases a
+ * whole-string `.toLowerCase()` fast path got wrong (Greek final sigma
+ * 'ΟΔΟΣ' → per-char 'οδοσ' vs whole-string 'οδος', and non-BMP pairs).
+ * Parity matters: the rescue gate and the repair ladder must mean the same
+ * thing by "normalized substring of the transcript".
+ */
+function foldForGrounding(s: string, withMap: boolean, tolerant = false): { norm: string; map: number[] } | string {
+  const out: string[] = [];
+  const map: number[] = [];
+  const skip = foldSkipSet(s, tolerant);
+  let pendingSpace = false;
+  // Iterate by CODE POINT (for..of), not code unit: a surrogate pair
+  // lowercases as a pair (Deseret 𐐀 → 𐐨) but never half by half, so a
+  // per-unit loop would silently leave non-BMP text unfolded and diverge
+  // from the mapless path. `idx` tracks the code-unit offset for the map.
+  let idx = 0;
+  for (const cp of s) {
+    const i = idx;
+    idx += cp.length;
+    if (skip?.has(i)) continue;
+    let ch = cp;
+    if (/\s/.test(ch)) {
+      pendingSpace = out.length > 0;
+      continue;
+    }
+    if (ch === '‘' || ch === '’' || ch === 'ʼ') ch = "'";
+    else if (ch === '“' || ch === '”') ch = '"';
+    else if (ch === '–' || ch === '—' || ch === '−') ch = '-';
+    // #4706: models render '…' as three dots; fold so quote provenance and
+    // grounding agree. One-to-many like the toLowerCase expansions below —
+    // every emitted unit maps to the ellipsis' original index.
+    else if (ch === '…') ch = '...';
+    if (tolerant && ch === '"') ch = "'";
+    if (pendingSpace) {
+      out.push(' ');
+      if (withMap) map.push(map.length > 0 ? map[map.length - 1] : i);
+      pendingSpace = false;
+    }
+    const low = ch.toLowerCase();
+    for (const lowCp of low) {
+      out.push(lowCp);
+      if (withMap) for (let k = 0; k < lowCp.length; k++) map.push(i);
+    }
+  }
+  const norm = out.join('');
+  return withMap ? { norm, map } : norm;
+}
+
+const MD_LINK = /\[([^\[\]\n]{1,300})\]\([^()\s]{1,500}\)/g;
+
+/**
+ * Code-unit offsets the tolerant fold skips: markdown link syntax (`[` and
+ * `](target)`, since a quote never carries a link target) and every other
+ * square bracket, so `[Ana](people/ana)`, `[Ana]` and `Ana` read alike, and so
+ * do an editorial `[T]he` and `The`.
+ */
+function bracketMask(s: string): Set<number> | null {
+  if (!s.includes('[') && !s.includes(']')) return null;
+  const skip = new Set<number>();
+  for (const m of s.matchAll(MD_LINK)) {
+    const at = m.index!;
+    for (let k = at + 1 + m[1]!.length; k < at + m[0].length; k++) skip.add(k);
+  }
+  for (let i = 0; i < s.length; i++) if (s[i] === '[' || s[i] === ']') skip.add(i);
+  return skip;
+}
+
+/**
+ * Code-unit offsets the fold skips: markdown inline markup (every `*`, every
+ * backtick, and `~` in a `~~` run) in both modes, so `**sync**`, `` `sync` ``
+ * and `sync` read alike; plus `bracketMask` in tolerant mode. `_` is kept:
+ * it is too common in identifiers and paths.
+ */
+function foldSkipSet(s: string, tolerant: boolean): Set<number> | null {
+  const brackets = tolerant ? bracketMask(s) : null;
+  if (!/[*`]|~~/.test(s)) return brackets;
+  const skip = brackets ?? new Set<number>();
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === '*' || ch === '`' || (ch === '~' && (s[i - 1] === '~' || s[i + 1] === '~'))) skip.add(i);
+  }
+  return skip;
+}
+
+/**
+ * `s` without the inline markup `foldSkipSet` skips in strict mode. A source
+ * slice that differs from a quote only by these marks says the quote's exact
+ * words, so it grounds as exact rather than splicing in a `**` the slice may
+ * leave unbalanced.
+ */
+function withoutInlineMarkup(s: string): string {
+  const skip = foldSkipSet(s, false);
+  if (!skip) return s;
+  let out = '';
+  for (let i = 0; i < s.length; i++) if (!skip.has(i)) out += s[i];
+  return out;
+}
+
+/** A source slice as a reader sees it, ready to sit inside a quotation: link syntax reduced to the link text, inner double quotes as single. */
+function displayText(slice: string): string {
+  return slice.replace(MD_LINK, '$1').replace(/\]\([^()\s]*\)/g, '').replace(/"/g, "'");
+}
+
+/**
+ * Whether `form` is the source's `words` with only the changes a writer may
+ * make in a quotation: brackets (link display, editorial), the case of a
+ * bracketed letter (`[T]he` for `the`) and the inner quote style.
+ */
+function sameWords(words: string, form: string): boolean {
+  const src = words.replace(/[[\]]/g, '').replace(/["“”]/g, "'");
+  let out = '';
+  let bracketed = false;
+  const loose = new Set<number>();
+  for (const ch of form.replace(/["“”]/g, "'")) {
+    if (ch === '[' || ch === ']') { bracketed = ch === '['; continue; }
+    if (bracketed) loose.add(out.length);
+    out += ch;
+  }
+  if (out.length !== src.length) return false;
+  for (let i = 0; i < out.length; i++) {
+    if (out[i] !== src[i] && !(loose.has(i) && out[i]!.toLowerCase() === src[i]!.toLowerCase())) return false;
+  }
+  return true;
+}
+
+/** A quote without editorial insertions attached to a word (`decide[s]`, `want[ed]`): the letters are the writer's. */
+function withoutInsertions(inner: string): string {
+  return inner.replace(/(?<=\p{L})\[\p{L}{1,3}\]/gu, '');
+}
+
+/** A quote's core: the elision marks and closing punctuation writers put at a quotation's edges ("the deal," / "…edge cases o…"). */
+function quoteCore(inner: string): string {
+  return inner.replace(/^(?:\s|\.\.\.|…)+/u, '').replace(/(?:\s|[.,;:!?]|…)+$/u, '');
+}
+
+/**
+ * Plain normalized form (no offset map) — for presence checks (the triage
+ * rescue's segment verification, buildTriageMapBlock's quote filter, the
+ * numeric-claim scan). Same fold as normalizeForGrounding by construction;
+ * skips only the offset-map allocation.
+ */
+export function normForGrounding(s: string): string {
+  return foldForGrounding(s, false) as string;
+}
+
+/** One speaker-turn anchor (`**Name** (ts):`, `role (tN):`, `Name:`), in
+ * ORIGINAL transcript offsets. `labelEnd` is where the turn's words begin. */
+export interface SpeakerTurn {
+  labelStart: number;
+  labelEnd: number;
+  speaker: string;
+}
+
+export interface GroundedTranscript {
+  content: string;
+  norm: string;
+  map: number[];
+  /** Speaker-turn anchors, ascending. Absent or empty: no turn structure. */
+  turns?: SpeakerTurn[];
+  /**
+   * The newer quote grounding's tolerance (think, concepts, patterns): link
+   * syntax reads as its text, and the writer's punctuation or elision at a
+   * quote's edges, brackets (`[Name]`, `[T]he`, `decide[s]`) and inner quote
+   * style (`'` for the source's `"`) do not change its words. Unset (dream
+   * synthesis): exact, normalized and near rungs only.
+   */
+  tolerant?: boolean;
+}
+
+/** A transcript prepared for verification: grounding text, speaker turns,
+ * the canonical numbers and dates it states, and the speaker-mention
+ * patterns used for attribution checks. */
+export interface GroundedSource extends GroundedTranscript {
+  path: string;
+  turns: SpeakerTurn[];
+  numbers: Set<string>;
+  /** Speaker key → numbers/dates from that speaker's turns, plus those of a
+   * turn the speaker explicitly accepted in the next turn (#5425). */
+  numbersBySpeaker: Map<string, Set<string>>;
+  nameNorm: string;
+  speakers: Array<{ key: string; label: string; re: RegExp }>;
+}
+
+export interface TranscriptForVerify {
+  content: string;
+}
+
+const ROLE_ALIASES: Record<string, string> = {
+  user: 'user', human: 'user', me: 'user',
+  assistant: 'assistant', ai: 'assistant', bot: 'assistant',
+  system: 'system',
+};
+const ROLE_MENTION: Record<string, string> = {
+  user: 'user|human',
+  assistant: 'assistant',
+  system: 'system',
+};
+const BOLD_ANCHOR_RE = /^[ \t]*\*\*([^*\n]{1,60}?)\*\*(?:[ \t]*\([^)\n]{0,40}\))?[ \t]*:/;
+const BRACKET_ROLE_RE = /^[ \t]*\[(user|human|assistant|ai|bot|system|tool)\][ \t]*\r?$/i;
+const PLAIN_ANCHOR_RE = /^[ \t]*(?:\[[^\]\n]{1,40}\][ \t]*)?([A-Za-z][A-Za-z0-9.'_-]*(?: [A-Za-z][A-Za-z0-9.'_-]*){0,3})(?:[ \t]*\([^)\n]{0,40}\))?[ \t]*:(?=[ \t]|\r?$)/;
+
+/** Canonical speaker identity: role labels fold to their role, names to lowercase. */
+export function speakerKey(label: string): string {
+  const k = label.trim().toLowerCase();
+  return ROLE_ALIASES[k] ?? k;
+}
+
+/**
+ * Speaker turns from line-start anchors. Bold anchors (the transcript
+ * renderer's format) and standalone `[user]` / `[assistant]` role lines (the
+ * session-corpus renderer's turn boundaries, #5717) always count; plain
+ * `Label:` anchors count when the label is a role word or opens at least two
+ * lines, so a prose line such as `Note: ...` is not mistaken for a speaker.
+ */
+export function parseSpeakerTurns(content: string): SpeakerTurn[] {
+  const turns: SpeakerTurn[] = [];
+  const plain: SpeakerTurn[] = [];
+  const plainCounts = new Map<string, number>();
+  let offset = 0;
+  for (const line of content.split('\n')) {
+    const bold = BOLD_ANCHOR_RE.exec(line);
+    const role = bold ? null : BRACKET_ROLE_RE.exec(line);
+    if (bold) {
+      turns.push({ labelStart: offset, labelEnd: offset + bold[0].length, speaker: bold[1].trim() });
+    } else if (role) {
+      turns.push({ labelStart: offset, labelEnd: offset + line.length, speaker: speakerKey(role[1]) });
+    } else {
+      const p = PLAIN_ANCHOR_RE.exec(line);
+      if (p) {
+        const speaker = p[1].trim();
+        plain.push({ labelStart: offset, labelEnd: offset + p[0].length, speaker });
+        plainCounts.set(speaker.toLowerCase(), (plainCounts.get(speaker.toLowerCase()) ?? 0) + 1);
+      }
+    }
+    offset += line.length + 1;
+  }
+  for (const t of plain) {
+    const k = t.speaker.toLowerCase();
+    if (ROLE_ALIASES[k] || (plainCounts.get(k) ?? 0) >= 2) turns.push(t);
+  }
+  return turns.sort((a, b) => a.labelStart - b.labelStart);
+}
+
+function turnIndexAt(turns: SpeakerTurn[], offset: number): number {
+  let lo = 0, hi = turns.length - 1, found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (turns[mid].labelStart <= offset) { found = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return found;
+}
+
+/** Speaker of the turn containing an original-offset position, or null. */
+export function speakerAt(turns: SpeakerTurn[] | undefined, offset: number): string | null {
+  if (!turns?.length) return null;
+  const i = turnIndexAt(turns, offset);
+  return i >= 0 ? turns[i].speaker : null;
+}
+
+/** True when [start, end) touches a speaker label, i.e. spans two turns. */
+function crossesTurn(turns: SpeakerTurn[] | undefined, start: number, end: number): boolean {
+  if (!turns?.length) return false;
+  let lo = 0, hi = turns.length - 1, first = turns.length;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (turns[mid].labelEnd > start) { first = mid; hi = mid - 1; } else lo = mid + 1;
+  }
+  return first < turns.length && turns[first].labelStart < end;
+}
+
+/** First normalized index whose original offset is >= `orig`. */
+function normIndexAt(map: number[], orig: number): number {
+  let lo = 0, hi = map.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (map[mid] < orig) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function speakerMentionPatterns(turns: SpeakerTurn[]): GroundedSource['speakers'] {
+  const byKey = new Map<string, string>();
+  for (const t of turns) if (!byKey.has(speakerKey(t.speaker))) byKey.set(speakerKey(t.speaker), t.speaker);
+  const out: GroundedSource['speakers'] = [];
+  for (const [key, label] of byKey) {
+    const role = ROLE_MENTION[key];
+    let alts: string[];
+    let flags = 'u';
+    if (role) {
+      alts = [role];
+      flags += 'i';
+    } else {
+      alts = [escapeRegExp(label)];
+      const first = label.split(' ')[0];
+      if (label.includes(' ') && first.length >= 3 && !ROLE_ALIASES[first.toLowerCase()]) alts.push(escapeRegExp(first));
+      if (label[0] === label[0].toLowerCase()) flags += 'i';
+    }
+    out.push({ key, label, re: new RegExp(`(?<![\\p{L}\\p{N}_-])(?:${alts.join('|')})(?![\\p{L}\\p{N}_-])`, flags) });
+  }
+  return out;
+}
+
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const MONTH_ALT = 'jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec';
+const MULTIPLIERS: Record<string, number> = { k: 1e3, thousand: 1e3, m: 1e6, mm: 1e6, million: 1e6, b: 1e9, bn: 1e9, billion: 1e9 };
+
+function canonNumber(n: number): string {
+  return String(Math.round(n * 1000) / 1000);
+}
+
+/**
+ * Every number and date a text states, in canonical forms, so "$250K",
+ * "$250,000" and "250 thousand" agree, and "2026-03-14" agrees with
+ * "March 14th". Keys: plain values ("250000"), percents ("5%"), ISO dates
+ * ("date:2026-03-14") and month-day pairs ("md:3-14").
+ */
+export function numericFacts(text: string): Set<string> {
+  const out = new Set<string>();
+  const s = normForGrounding(text);
+  for (const m of s.matchAll(/(\d[\d,]*(?:\.\d+)?)\s*(k|mm|m|bn|b|thousand|million|billion)?(?![a-z])/g)) {
+    const base = Number.parseFloat(m[1].replace(/,/g, ''));
+    if (!Number.isFinite(base)) continue;
+    out.add(canonNumber(base));
+    if (m[2]) out.add(canonNumber(base * MULTIPLIERS[m[2]]));
+  }
+  for (const m of s.matchAll(/(\d+(?:\.\d+)?)\s*(?:%|percent\b)/g)) out.add(`${canonNumber(Number.parseFloat(m[1]))}%`);
+  for (const m of s.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) {
+    out.add(`date:${m[1]}-${m[2]}-${m[3]}`);
+    out.add(`md:${Number(m[2])}-${Number(m[3])}`);
+  }
+  for (const m of s.matchAll(new RegExp(`\\b(${MONTH_ALT})[a-z]*\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`, 'g'))) {
+    out.add(`md:${MONTHS.indexOf(m[1]) + 1}-${Number(m[2])}`);
+  }
+  for (const m of s.matchAll(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?(${MONTH_ALT})[a-z]*\\b`, 'g'))) {
+    out.add(`md:${MONTHS.indexOf(m[2]) + 1}-${Number(m[1])}`);
+  }
+  return out;
+}
+
+/** A turn that opens by accepting the previous turn's proposal. */
+const ACCEPTANCE_RE = /^\W*(?:yes|yep|yeah|sure|ok(?:ay)?|agreed|sounds good|perfect|great|do (?:it|that)|go ahead|let'?s do (?:it|that)|approved)\b/i;
+
+/**
+ * What each speaker stated, by speaker key: the tokens `extract` finds in the
+ * speaker's own turns, plus those of a turn by someone else that the speaker
+ * explicitly accepted in the very next turn (#5425: "yes, do that" makes the
+ * assistant's numbers the user's). `numbersBySpeaker` is the numeric form;
+ * `propose-takes-attribution.ts` passes its own token extractor.
+ */
+export function statedBySpeaker(content: string, turns: SpeakerTurn[], extract: (text: string) => Iterable<string>): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  let previous: { key: string; tokens: Set<string> } | null = null;
+  turns.forEach((turn, i) => {
+    const text = content.slice(turn.labelEnd, turns[i + 1]?.labelStart ?? content.length);
+    const key = speakerKey(turn.speaker);
+    const tokens = new Set(extract(text));
+    const own = out.get(key) ?? new Set<string>();
+    for (const n of tokens) own.add(n);
+    if (previous && previous.key !== key && ACCEPTANCE_RE.test(text)) for (const n of previous.tokens) own.add(n);
+    out.set(key, own);
+    previous = { key, tokens };
+  });
+  return out;
+}
+
+function numbersBySpeaker(content: string, turns: SpeakerTurn[]): Map<string, Set<string>> {
+  return statedBySpeaker(content, turns, numericFacts);
+}
+
+/** Prepare one transcript for verification. */
+export function groundSource(path: string, content: string, opts: { tolerant?: boolean } = {}): GroundedSource {
+  const { norm, map } = normalizeForGrounding(content, { tolerant: opts.tolerant });
+  const turns = parseSpeakerTurns(content);
+  const name = basename(path);
+  return {
+    path,
+    content,
+    norm,
+    map,
+    turns,
+    numbers: numericFacts(`${content}\n${name}`),
+    numbersBySpeaker: numbersBySpeaker(content, turns),
+    nameNorm: normForGrounding(name),
+    speakers: speakerMentionPatterns(turns),
+    ...(opts.tolerant ? { tolerant: true } : {}),
+  };
+}
+
+/**
+ * Quote-span extraction from a page BODY (frontmatter already split off).
+ * Marks are collected with ABSOLUTE offsets over the masked body (no
+ * paragraph-slice arithmetic — the original split/rejoin approximation
+ * dropped every span after a separator longer than two chars, which let
+ * fabricated quotes escape verification entirely; caught by the ship review's
+ * runtime probe). Pairing is per mark TYPE within each paragraph: straight
+ * `"` pairs sequentially; curly pairs directionally (`“` with the next `”`),
+ * so an interior curly-quoted phrase inside a straight-quoted span no longer
+ * mis-pairs across types. A paragraph with unpairable marks of a type skips
+ * that type's spans there (counted `unbalanced`, never guessed at); spans
+ * nested inside another span are dropped (the outer span is the quote).
+ */
+export function extractQuoteSpans(body: string): { spans: Array<{ start: number; end: number; inner: string }>; unbalanced: number } {
+  const spans: Array<{ start: number; end: number; inner: string }> = [];
+  let unbalanced = 0;
+  const masked = maskNonProse(body);
+
+  // Exact paragraph ranges via matchAll — offsets never drift.
+  const bounds: Array<{ start: number; end: number }> = [];
+  let cursor = 0;
+  for (const m of masked.matchAll(/\n\s*\n/g)) {
+    bounds.push({ start: cursor, end: m.index ?? 0 });
+    cursor = (m.index ?? 0) + m[0].length;
+  }
+  bounds.push({ start: cursor, end: masked.length });
+
+  for (const b of bounds) {
+    const straight: number[] = [];
+    const curlyOpen: number[] = [];
+    const pairs: Array<[number, number]> = [];
+    let paraUnbalanced = false;
+    for (let i = b.start; i < b.end; i++) {
+      const ch = masked[i];
+      if (ch === '"') straight.push(i);
+      else if (ch === '“') curlyOpen.push(i);
+      else if (ch === '”') {
+        const open = curlyOpen.pop();
+        if (open === undefined) paraUnbalanced = true;
+        else pairs.push([open, i]);
+      }
+    }
+    if (curlyOpen.length > 0) paraUnbalanced = true;
+    if (straight.length % 2 !== 0) paraUnbalanced = true;
+    else for (let m = 0; m + 1 < straight.length; m += 2) pairs.push([straight[m], straight[m + 1]]);
+    if (paraUnbalanced) unbalanced++;
+
+    for (const [start, end] of pairs) {
+      const inner = body.slice(start + 1, end);
+      if (inner.length >= MIN_QUOTE_CHARS) spans.push({ start, end, inner });
+      if (spans.length >= MAX_QUOTES_PER_PAGE) break;
+    }
+    if (spans.length >= MAX_QUOTES_PER_PAGE) break;
+  }
+
+  // Drop spans nested inside another span — the outer span is the quote; a
+  // nested repair would splice inside a region the outer repair replaces.
+  spans.sort((a, b2) => a.start - b2.start);
+  const kept: typeof spans = [];
+  let lastEnd = -1;
+  for (const sp of spans) {
+    if (sp.start < lastEnd) continue;
+    kept.push(sp);
+    lastEnd = sp.end;
+  }
+  return { spans: kept, unbalanced };
+}
+
+export type GroundResult =
+  | { status: 'exact'; spans: Array<[number, number]> }
+  | { status: 'normalized' | 'near'; replacement: string; spans: Array<[number, number]> }
+  | { status: 'none'; reason: 'not_found' | 'crosses_speakers' };
+
+const PUNCT_EDGE = /[.,;:!?]/;
+
+/**
+ * Ground one quoted span against a transcript. Returns the verbatim
+ * transcript slice to substitute for a normalized or near match, the
+ * original-offset spans of the accepted occurrences (for speaker and
+ * source-span provenance), or 'none'. A match that spans two speaker turns
+ * is never accepted: quoting across a turn boundary puts one speaker's words
+ * in another's mouth.
+ */
+export function groundQuote(inner: string, t: GroundedTranscript): GroundResult {
+  if (!t.tolerant) return groundStrictQuote(inner, t);
+  const bare = withoutInsertions(inner);
+  const forms = [...new Set([inner, quoteCore(inner), bare, quoteCore(bare)])]
+    .filter((form, i) => i === 0 || form.split(/\s+/).filter(Boolean).length >= 2);
+  for (const form of forms) {
+    const r = groundQuoteSpan(form, t, false);
+    if (r.status === 'none') continue;
+    // Edge punctuation, editorial brackets, link display and inner quote style are the writer's: the words themselves are grounded.
+    if (r.status === 'exact' || sameWords(r.replacement, form)) return { status: 'exact', spans: r.spans };
+    return r;
+  }
+  return groundQuoteSpan(inner, t, true);
+}
+
+/**
+ * Strict grounding (dream synthesis). A quote that misses only because the
+ * writer put closing punctuation or elision inside the marks grounds on its
+ * core: an exact core keeps the writer's edges, a normalized core is replaced
+ * by the verbatim source slice. No bracket or quote-style folding.
+ */
+function groundStrictQuote(inner: string, t: GroundedTranscript): GroundResult {
+  const full = groundQuoteSpan(inner, t, true);
+  if (full.status !== 'none') return full;
+  const core = quoteCore(inner);
+  if (core === inner || core.split(/\s+/).filter(Boolean).length < 2) return full;
+  const r = groundQuoteSpan(core, t, false);
+  return r.status === 'none' ? full : r;
+}
+
+/** One past the source code point that starts at `lastStart`: a slice end never splits a surrogate pair. */
+function sourceCodePointEnd(content: string, lastStart: number): number {
+  return lastStart + (content.codePointAt(lastStart)! > 0xffff ? 2 : 1);
+}
+
+function groundQuoteSpan(inner: string, t: GroundedTranscript, near: boolean): GroundResult {
+  let crossed = false;
+
+  // Rung 1: exact substring.
+  const exact: Array<[number, number]> = [];
+  for (let at = t.content.indexOf(inner), n = 0; at >= 0 && n < MAX_OCCURRENCES; at = t.content.indexOf(inner, at + 1), n++) {
+    if (crossesTurn(t.turns, at, at + inner.length)) crossed = true;
+    else exact.push([at, at + inner.length]);
+  }
+  if (exact.length) return { status: 'exact', spans: exact };
+
+  const q = normalizeForGrounding(inner, { tolerant: t.tolerant });
+  const shown = (slice: string) => t.tolerant ? displayText(slice) : slice;
+  if (q.norm.length === 0) return { status: 'none', reason: 'not_found' };
+
+  // Rung 2: normalized whole-span match → map back to the original slice.
+  const normalized: Array<[number, number]> = [];
+  for (let pos = t.norm.indexOf(q.norm), n = 0; pos >= 0 && n < MAX_OCCURRENCES; pos = t.norm.indexOf(q.norm, pos + 1), n++) {
+    const start = t.map[pos];
+    const endIdx = t.map[pos + q.norm.length - 1];
+    // Defensive: a map hole must never become a "verbatim" repair.
+    if (start === undefined || endIdx === undefined) continue;
+    const end = sourceCodePointEnd(t.content, endIdx);
+    if (crossesTurn(t.turns, start, end)) crossed = true;
+    else normalized.push([start, end]);
+  }
+  if (normalized.length) {
+    const [start, end] = normalized[0];
+    const replacement = shown(t.content.slice(start, end));
+    if (replacement.length === 0) return { status: 'none', reason: 'not_found' };
+    const same = replacement === inner || withoutInlineMarkup(replacement) === withoutInlineMarkup(inner);
+    return same ? { status: 'exact', spans: normalized } : { status: 'normalized', replacement, spans: normalized };
+  }
+
+  // Rung 3: near match. Anchor on word trigrams from the quote; score
+  // candidate windows (clipped to the anchor's speaker turn) by token
+  // overlap; accept a single clear winner ≥ floor, trimmed to the matched
+  // tokens. Hard-bounded: total probes, trigrams (stride-sampled), quote size.
+  const none: GroundResult = { status: 'none', reason: crossed ? 'crosses_speakers' : 'not_found' };
+  if (!near || q.norm.length > MAX_NEAR_QUOTE_NORM_CHARS) return none;
+  const qTokens = q.norm.split(' ').filter(w => w.length > 0);
+  if (qTokens.length < 4) return none;
+  const qBare = new Set(qTokens.map(w => w.replace(/[^\p{L}\p{N}]/gu, '')).filter(w => w.length > 0));
+  const triCount = qTokens.length - 2;
+  const stride = Math.max(1, Math.ceil(triCount / MAX_NEAR_TRIGRAMS));
+  const candidates: Array<{ start: number; end: number; score: number }> = [];
+  const seenStarts = new Set<number>();
+  let probes = 0;
+  for (let g = 0; g + 2 < qTokens.length && candidates.length < MAX_ANCHOR_CANDIDATES && probes < MAX_ANCHOR_PROBES; g += stride) {
+    const gram = qTokens.slice(g, g + 3).join(' ');
+    let from = 0;
+    while (candidates.length < MAX_ANCHOR_CANDIDATES && probes < MAX_ANCHOR_PROBES) {
+      probes++;
+      const at = t.norm.indexOf(gram, from);
+      if (at < 0) break;
+      from = at + 1;
+      let lo = 0, hi = t.norm.length;
+      if (t.turns?.length) {
+        const ti = turnIndexAt(t.turns, t.map[at]);
+        if (ti >= 0) lo = normIndexAt(t.map, t.turns[ti].labelEnd);
+        if (ti + 1 < t.turns.length) hi = normIndexAt(t.map, t.turns[ti + 1].labelStart);
+        if (at < lo) continue;
+      }
+      const targetLen = q.norm.length;
+      let winStart = Math.max(lo, at - Math.floor(g / Math.max(1, qTokens.length) * targetLen) - WINDOW_SLACK_BEFORE);
+      let winEnd = Math.min(hi, winStart + Math.ceil(targetLen * WINDOW_GROWTH) + WINDOW_SLACK_AFTER);
+      while (winStart > lo && t.norm[winStart] !== ' ') winStart--;
+      while (winEnd < hi && t.norm[winEnd] !== ' ') winEnd++;
+      if (seenStarts.has(winStart)) continue;
+      seenStarts.add(winStart);
+      const winTokens = t.norm.slice(winStart, winEnd).split(' ').filter(w => w.length > 0);
+      const counts = new Map<string, number>();
+      for (const w of winTokens) counts.set(w, (counts.get(w) ?? 0) + 1);
+      let hit = 0;
+      for (const w of qTokens) {
+        const c = counts.get(w) ?? 0;
+        if (c > 0) { hit++; counts.set(w, c - 1); }
+      }
+      candidates.push({ start: winStart, end: winEnd, score: hit / qTokens.length });
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+  if (!best || best.score < NEAR_MATCH_FLOOR) return none;
+  const second = candidates.find(c => c.start !== best.start);
+  if (second && best.score - second.score < NEAR_MATCH_AMBIGUITY && second.score >= NEAR_MATCH_FLOOR) {
+    // Two plausible homes — refusing to guess beats repairing to the wrong span.
+    return none;
+  }
+  // Trim the window to the first and last tokens the quote shares with it.
+  const tokens: Array<{ start: number; end: number }> = [];
+  for (const m of t.norm.slice(best.start, best.end).matchAll(/\S+/g)) {
+    const bare = m[0].replace(/[^\p{L}\p{N}]/gu, '');
+    if (qBare.has(bare)) tokens.push({ start: best.start + (m.index ?? 0), end: best.start + (m.index ?? 0) + m[0].length });
+  }
+  if (!tokens.length) return none;
+  const oFirst = t.map[tokens[0].start];
+  const oLast = t.map[tokens[tokens.length - 1].end - 1];
+  if (oFirst === undefined || oLast === undefined) return none;
+  let a = oFirst, b = sourceCodePointEnd(t.content, oLast);
+  const innerTrim = inner.trim();
+  if (!PUNCT_EDGE.test(innerTrim[0] ?? '')) while (a < b && PUNCT_EDGE.test(t.content[a])) a++;
+  if (!PUNCT_EDGE.test(innerTrim[innerTrim.length - 1] ?? '')) while (b > a && PUNCT_EDGE.test(t.content[b - 1])) b--;
+  const replacement = shown(t.content.slice(a, b)).trim();
+  if (replacement.length === 0) return none;
+  if (normForGrounding(replacement).length > Math.ceil(q.norm.length * NEAR_MATCH_MAX_GROWTH)) return none;
+  if (crossesTurn(t.turns, a, b)) return { status: 'none', reason: 'crosses_speakers' };
+  return { status: 'near', replacement, spans: [[a, b]] };
+}
+
+const NUMERIC_CLAIM_RES: Array<{ re: RegExp; key: (m: RegExpMatchArray) => string[] }> = [
+  // Currency, optionally scaled ($2M, $250,000, $1.5 billion).
+  { re: /\$\s?(\d[\d,]*(?:\.\d+)?)\s*(k|mm|m|bn|b|thousand|million|billion)?(?![a-z])/gi,
+    key: m => [canonNumber(Number.parseFloat(m[1].replace(/,/g, '')) * (m[2] ? MULTIPLIERS[m[2].toLowerCase()] : 1))] },
+  // Scaled plain amounts (3 million users).
+  { re: /\b(\d[\d,]*(?:\.\d+)?)\s+(thousand|million|billion)\b/gi,
+    key: m => [canonNumber(Number.parseFloat(m[1].replace(/,/g, '')) * MULTIPLIERS[m[2].toLowerCase()])] },
+  { re: /\b(\d+(?:\.\d+)?)\s*(?:%|percent\b)/gi, key: m => [`${canonNumber(Number.parseFloat(m[1]))}%`] },
+  { re: /\b(\d{4})-(\d{2})-(\d{2})\b/g, key: m => [`date:${m[1]}-${m[2]}-${m[3]}`, `md:${Number(m[2])}-${Number(m[3])}`] },
+  { re: new RegExp(`\\b(${MONTH_ALT})[a-z]*\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`, 'gi'),
+    key: m => [`md:${MONTHS.indexOf(m[1].toLowerCase()) + 1}-${Number(m[2])}`] },
+  // Thousands-separated or 4+ digit numbers (years, counts, ids).
+  { re: /\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b|\b\d{4,}\b/g, key: m => [canonNumber(Number.parseFloat(m[0].replace(/,/g, '')))] },
+];
+
+/** Numeric and date claims in `text` (currency, scaled amounts, percents, dates, 4+ digit numbers), each once, with its canonical keys. */
+export function numericClaims(text: string): Array<{ raw: string; claim: string; keys: string[] }> {
+  const out: Array<{ raw: string; claim: string; keys: string[] }> = [];
+  const seen = new Set<string>();
+  const covered: Array<[number, number]> = [];
+  for (const { re, key } of NUMERIC_CLAIM_RES) {
+    for (const m of text.matchAll(re)) {
+      const at = m.index ?? 0;
+      if (covered.some(([s, e]) => at >= s && at < e)) continue;
+      covered.push([at, at + m[0].length]);
+      const claim = normForGrounding(m[0]);
+      if (!claim || seen.has(claim) || seen.size >= MAX_NUMERIC_CLAIMS_PER_PAGE) continue;
+      seen.add(claim);
+      out.push({ raw: m[0].trim(), claim, keys: key(m) });
+    }
+  }
+  return out;
+}
+
+/**
+ * Numeric and date claims in `text` that no source states. `text` must
+ * already be masked (code, links) and have grounded quotes blanked. A claim
+ * is supported when any of its canonical keys appears among a source's
+ * numbers or in `exemptNumericKeys` (facts the writer's prompt supplied,
+ * such as `date:<cycle date>`), or its normalized text occurs in a source or
+ * its file name.
+ */
+export function unsupportedNumericClaims(text: string, sources: GroundedSource[], exemptNumericKeys?: ReadonlySet<string>): string[] {
+  return numericClaims(text)
+    .filter(({ keys }) => !keys.some(k => exemptNumericKeys?.has(k)))
+    .filter(({ claim, keys }) => !sources.some(src =>
+      keys.some(k => src.numbers.has(k)) || src.norm.includes(claim) || src.nameNorm.includes(claim)))
+    .map(({ raw }) => raw);
+}
+
+/** A claim that a speaker decided, agreed, accepted, committed or will act. */
+const DECISION_RE = /\b(?:decid(?:e|ed|es)|agree(?:d|s)?|accept(?:ed|s)?|approv(?:e|ed|es)|ch(?:o|oo)se|chosen|commit(?:ted|s)?|promis(?:e|ed|es)|confirm(?:ed|s)?|settled on|opted|signed off|will|plans? to|intends? to|going to)\b/i;
+
+/** A unit that records a proposal, a refusal or a negation is not asserting agreement. */
+const PROPOSAL_OR_REFUSAL_RE = /\b(?:(?:suggest|propos|recommend|offer|advis|declin|reject|refus)\w*|turned down|instead|rather than|not|no|never)\b|n't\b/i;
+/** A bare year names when, not what was decided; it is never attributed. */
+export const YEAR_KEY_RE = /^(?:19|20|21)\d\d$/;
+
+/**
+ * #5425: numbers and dates in a decision claim that some speaker stated but
+ * none of the speakers the claim names stated (or explicitly accepted).
+ * Sources without turns cannot attribute anything and are ignored; numbers
+ * no turn states (a file-name date, say) are not attributable either.
+ */
+function misattributedDecisionClaims(text: string, attribution: string, sources: GroundedSource[], speakers: string[]): string[] {
+  if (speakers.length === 0 || !DECISION_RE.test(attribution) || PROPOSAL_OR_REFUSAL_RE.test(attribution)) return [];
+  const turned = sources.filter(src => src.turns.length > 0);
+  const statedBy = (keys: string[], who: (sp: string) => boolean) =>
+    turned.some(src => [...src.numbersBySpeaker].some(([sp, nums]) => who(sp) && keys.some(k => nums.has(k))));
+  return numericClaims(text)
+    .filter(({ keys }) => !keys.every(k => YEAR_KEY_RE.test(k)))
+    .filter(({ keys }) => statedBy(keys, () => true) && !statedBy(keys, sp => speakers.includes(sp)))
+    .map(({ raw }) => raw);
+}
+
+/** A user sentence that takes something back: a negation or a correction word. */
+const NEGATION_RE = /\b(?:not|no|never|nope|instead|rather than|scratch that|forget (?:it|that)|cancel\w*|drop(?:ped)? (?:it|that)|no longer|changed (?:my|our) mind|withdr\w+|retract\w*|revers\w+|wrong|incorrect|correction)\b|n't\b/i;
+const SENTENCE_SPLIT_RE = /(?<=[.!?])\s+|\n+/;
+
+/**
+ * #5425 [UC4] `superseded_in_source`: the numbers and dates a unit carries
+ * that a user turn later in the same transcript, after the turn the unit's
+ * grounded quote came from, takes back in a sentence that negates and names
+ * that same number or date. Only `user` turns count (role-labelled
+ * transcripts), only the sentence holding both the negation and the number,
+ * never a bare year, so a later sentence that merely repeats a number, or
+ * negates a different one, supersedes nothing.
+ */
+function supersededClaims(text: string, grounded: Array<{ source: GroundedSource; start: number }>): string[] {
+  const claims = numericClaims(text).filter(({ keys }) => !keys.every(k => YEAR_KEY_RE.test(k)));
+  if (claims.length === 0) return [];
+  const out: string[] = [];
+  for (const { source, start } of grounded) {
+    if (source.turns.length === 0) continue;
+    const from = turnIndexAt(source.turns, start);
+    for (let i = from + 1; i < source.turns.length; i++) {
+      const turn = source.turns[i];
+      if (speakerKey(turn.speaker) !== 'user') continue;
+      const turnText = source.content.slice(turn.labelEnd, source.turns[i + 1]?.labelStart ?? source.content.length);
+      for (const sentence of turnText.split(SENTENCE_SPLIT_RE)) {
+        if (!NEGATION_RE.test(sentence)) continue;
+        const stated = numericFacts(sentence);
+        for (const { raw, keys } of claims) {
+          if (keys.some(k => stated.has(k)) && !out.some(o => o.startsWith(`${raw} `))) out.push(`${raw} was later taken back by the user: ${clip(sentence.trim(), 120)}`);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+const LIST_MARKER_RE = /^(?:[-*+]|\d+[.)]|>|#{1,6})[ \t]+/;
+const EMPTY_LINE_AFTER_REMOVAL_RE = /^\s*(?:[-*+]|\d+[.)]|>|#{1,6})?\s*$/;
+const REMOVED = '\uFFFF';
+
+/**
+ * Claim units: sentences within a line, whole list items, whole table rows.
+ * A boundary never falls inside a quoted span, so every quote belongs to
+ * exactly one unit. Offsets exclude surrounding whitespace and list markers.
+ */
+export function claimUnits(body: string, spans: Array<{ start: number; end: number }>): Array<{ start: number; end: number }> {
+  const inQuote = new Uint8Array(body.length + 1);
+  const closeAt = new Set<number>();
+  for (const sp of spans) {
+    for (let i = sp.start + 1; i < sp.end; i++) inQuote[i] = 1;
+    closeAt.add(sp.end);
+  }
+  const raw: Array<[number, number]> = [];
+  let unitStart = 0;
+  let lineStart = 0;
+  let tableLine = body.trimStart().startsWith('|');
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === '\n' && !inQuote[i]) {
+      raw.push([unitStart, i]);
+      unitStart = i + 1;
+      lineStart = i + 1;
+      tableLine = body.slice(lineStart, lineStart + 200).trimStart().startsWith('|');
+      continue;
+    }
+    if (tableLine || inQuote[i]) continue;
+    const next = body[i + 1];
+    const atGap = next === undefined || /\s/.test(next);
+    if (atGap && (/[.!?]/.test(ch) || (closeAt.has(i) && /[.!?]/.test(body[i - 1] ?? '')))) {
+      raw.push([unitStart, i + 1]);
+      unitStart = i + 1;
+    }
+  }
+  raw.push([unitStart, body.length]);
+  const units: Array<{ start: number; end: number }> = [];
+  for (let [s, e] of raw) {
+    while (s < e && /\s/.test(body[s])) s++;
+    const marker = LIST_MARKER_RE.exec(body.slice(s, Math.min(e, s + 12)));
+    if (marker && (s === 0 || body[s - 1] === '\n' || /^[ \t]*$/.test(body.slice(body.lastIndexOf('\n', s - 1) + 1, s)))) s += marker[0].length;
+    while (e > s && /\s/.test(body[e - 1])) e--;
+    if (e > s) units.push({ start: s, end: e });
+  }
+  return units;
+}
+
+export type ClaimFailure = 'quote_not_in_source' | 'quote_crosses_speakers' | 'speaker_mismatch' | 'number_not_in_source' | 'decision_misattributed' | 'superseded_in_source';
+
+export interface QuarantinedClaim {
+  text: string;
+  /** Mechanical failure, or S8's `unsupported_paraphrase` (grounding-decide.ts). */
+  reason: ClaimFailure | 'unsupported_paraphrase';
+  detail: string;
+}
+
+export interface QuoteProvenance {
+  text: string;
+  source: string;
+  span: [number, number];
+  speaker: string | null;
+}
+
+export interface BodyVerification {
+  body: string;
+  changed: boolean;
+  quotes: number;
+  exact: number;
+  normalized: number;
+  near: number;
+  unbalanced: number;
+  quarantined: QuarantinedClaim[];
+  provenance: QuoteProvenance[];
+  failures: Record<ClaimFailure, number>;
+  /** Substantive new units that pass the mechanical checks, with their final quote repairs (System One S8 checks these). */
+  groundingUnits: string[];
+}
+
+function groundAcross(inner: string, sources: GroundedSource[]): { result: Exclude<GroundResult, { status: 'none' }>; source: GroundedSource } | { result: Extract<GroundResult, { status: 'none' }> } {
+  const rank = { exact: 3, normalized: 2, near: 1 } as const;
+  let best: { result: Exclude<GroundResult, { status: 'none' }>; source: GroundedSource } | null = null;
+  let crossed = false;
+  for (const source of sources) {
+    const g = groundQuote(inner, source);
+    if (g.status === 'none') { if (g.reason === 'crosses_speakers') crossed = true; continue; }
+    if (!best || rank[g.status] > rank[best.result.status]) best = { result: g, source };
+    if (g.status === 'exact') break;
+  }
+  return best ?? { result: { status: 'none', reason: crossed ? 'crosses_speakers' : 'not_found' } };
+}
+
+/**
+ * Quote grounding for dream patterns and concept narratives:
+ * `dream.quote_verify`, on unless set false (its held-out retest passed).
+ * Synthesis keeps its own switch, `dream.synthesize.quote_verify` (default on).
+ */
+export async function dreamQuoteVerifyEnabled(engine: { getConfig(key: string): Promise<string | null> }): Promise<boolean> {
+  const raw = (await engine.getConfig('dream.quote_verify'))?.trim().toLowerCase();
+  return !(raw === 'false' || raw === '0' || raw === 'off' || raw === 'no');
+}
+
+export interface AnswerQuoteCheck {
+  /** The answer with near-match quotes repaired to the evidence's words and unverified quotes unquoted and marked. */
+  answer: string;
+  quote_check: { grounded: number; repaired: number; unverified: number };
+  unverified_quotes: Array<{ text: string; reason: 'quote_not_in_source' | 'quote_crosses_speakers' }>;
+}
+
+export const UNVERIFIED_QUOTE_MARK = '[unverified]';
+
+/**
+ * Span-level quote check for a live answer (`think`, `synthesize`): every
+ * quoted span is grounded against the evidence the answer was written from.
+ * Exact matches stay; normalized or near matches are replaced with the
+ * evidence's own words; a quote found nowhere loses its quotation marks and
+ * gains `[unverified]`, so no caller can present it as a quotation. Pure.
+ */
+export function groundAnswerQuotes(answer: string, sources: GroundedSource[]): AnswerQuoteCheck {
+  const { spans } = extractQuoteSpans(answer);
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const out: AnswerQuoteCheck = { answer, quote_check: { grounded: 0, repaired: 0, unverified: 0 }, unverified_quotes: [] };
+  for (const sp of spans) {
+    const g = groundAcross(sp.inner, sources);
+    if (g.result.status === 'none') {
+      out.quote_check.unverified++;
+      out.unverified_quotes.push({ text: clip(sp.inner, 300), reason: g.result.reason === 'crosses_speakers' ? 'quote_crosses_speakers' : 'quote_not_in_source' });
+      edits.push({ start: sp.start, end: sp.end + 1, text: `${sp.inner} ${UNVERIFIED_QUOTE_MARK}` });
+    } else if (g.result.status === 'exact') {
+      out.quote_check.grounded++;
+    } else {
+      out.quote_check.repaired++;
+      edits.push({ start: sp.start + 1, end: sp.end, text: g.result.replacement.replace(/\s*\n\s*/g, ' ') });
+    }
+  }
+  let body = answer;
+  for (const e of edits.sort((a, b) => b.start - a.start)) body = body.slice(0, e.start) + e.text + body.slice(e.end);
+  out.answer = body;
+  return out;
+}
+
+function blank(s: string, ranges: Array<[number, number]>): string {
+  let out = s;
+  for (const [a, b] of ranges) out = out.slice(0, a) + ' '.repeat(b - a) + out.slice(b);
+  return out;
+}
+
+function clip(s: string, n = PROVENANCE_TEXT_CHARS): string {
+  const flat = s.replace(/\s+/g, ' ').trim();
+  return flat.length > n ? `${flat.slice(0, n - 3)}...` : flat;
+}
+
+/**
+ * Verify one body (compiled_truth or timeline) against its source
+ * transcripts. Pure. With `priorNorm` (the normalized pre-run revision of a
+ * page that already existed), only units absent from it are checked; every
+ * other unit is left exactly as it was. `checks: 'quotes'` grounds quotes and
+ * their speaker attribution only (no number, date or decision checks), for
+ * writers whose prose legitimately derives numbers from its sources.
+ */
+export function verifyBody(body: string, sources: GroundedSource[], opts: { priorNorm?: string; checks?: 'all' | 'quotes'; exemptNumericKeys?: ReadonlySet<string>;
+  /** #5425 [UC4]: also quarantine `superseded_in_source` units (`dream.attribution_checks`; off: no change). */
+  supersession?: boolean } = {}): BodyVerification {
+  const { spans, unbalanced } = extractQuoteSpans(body);
+  const masked = maskNonProse(body);
+  const failures: Record<ClaimFailure, number> = { quote_not_in_source: 0, quote_crosses_speakers: 0, speaker_mismatch: 0, number_not_in_source: 0, decision_misattributed: 0, superseded_in_source: 0 };
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const quarantined: QuarantinedClaim[] = [];
+  const provenance: QuoteProvenance[] = [];
+  const groundingUnits: string[] = [];
+  let quotes = 0, exact = 0, normalized = 0, near = 0;
+
+  // Materialized timeline history (#5567) is database history a write rendered
+  // back into an existing page, not a claim this run authored. Only a marked
+  // bullet absent from the pre-run revision was materialized during the run
+  // (with its stored detail); an edit under a bullet that already existed is
+  // verified like any other new unit. A new page has no history to render.
+  const history = opts.priorNorm === undefined ? [] : materializedHistoryRanges(body)
+    .filter(([start, end]) => !opts.priorNorm!.includes(normForGrounding(body.slice(start, end).split('\n')[1] ?? '')));
+  for (const u of claimUnits(body, spans)) {
+    const text = body.slice(u.start, u.end);
+    if (history.some(([start, end]) => u.start >= start && u.start < end)) continue;
+    if (opts.priorNorm !== undefined && opts.priorNorm.includes(normForGrounding(text))) continue;
+    const unitSpans = spans.filter(sp => sp.start >= u.start && sp.end < u.end);
+    const quoteRanges = unitSpans.map(sp => [sp.start - u.start, sp.end - u.start + 1] as [number, number]);
+    const attribution = blank(text, quoteRanges);
+    const mentioned = new Map<string, string>();
+    for (const src of sources) for (const sp of src.speakers) if (sp.re.test(attribution)) mentioned.set(sp.key, sp.label);
+
+    const unitFailures: Array<{ reason: ClaimFailure; detail: string }> = [];
+    const fail = (reason: ClaimFailure, detail: string) => { failures[reason]++; unitFailures.push({ reason, detail }); };
+    const unitEdits: typeof edits = [];
+    const unitProvenance: QuoteProvenance[] = [];
+    const grounded: Array<{ source: GroundedSource; start: number }> = [];
+    for (const sp of unitSpans) {
+      quotes++;
+      const g = groundAcross(sp.inner, sources);
+      if (g.result.status === 'none') {
+        fail(g.result.reason === 'crosses_speakers' ? 'quote_crosses_speakers' : 'quote_not_in_source', clip(sp.inner));
+        continue;
+      }
+      const { result, source } = g as { result: Exclude<GroundResult, { status: 'none' }>; source: GroundedSource };
+      const speakers = result.spans.map(([a]) => speakerAt(source.turns, a)).filter((s): s is string => s !== null);
+      if (mentioned.size > 0 && speakers.length > 0 && !speakers.some(s => mentioned.has(speakerKey(s)))) {
+        fail('speaker_mismatch', `attributed to ${[...mentioned.values()].join(', ')}; said by ${speakers[0]}: ${clip(sp.inner, 80)}`);
+        continue;
+      }
+      if (result.status === 'exact') exact++;
+      else {
+        if (result.status === 'normalized') normalized++; else near++;
+        // Collapse interior newlines: splicing a transcript line break inside
+        // a quoted span would split the markdown paragraph and orphan the marks.
+        unitEdits.push({ start: sp.start + 1, end: sp.end, text: result.replacement.replace(/\s*\n\s*/g, ' ') });
+      }
+      unitProvenance.push({
+        text: clip(result.status === 'exact' ? sp.inner : result.replacement),
+        source: source.path,
+        span: result.spans[0],
+        speaker: speakers[0] ?? null,
+      });
+      grounded.push({ source, start: result.spans[0][0] });
+    }
+    const unquoted = blank(masked.slice(u.start, u.end), quoteRanges);
+    // Quotes-only mode (answers that legitimately compute numbers): no number or decision checks.
+    const numbers = opts.checks === 'quotes' ? [] : unsupportedNumericClaims(unquoted, sources, opts.exemptNumericKeys);
+    for (const n of numbers) fail('number_not_in_source', n);
+    if (numbers.length === 0 && opts.checks !== 'quotes') {
+      for (const n of misattributedDecisionClaims(unquoted, attribution, sources, [...mentioned.keys()])) {
+        fail('decision_misattributed', `${[...mentioned.values()].join(', ')}: ${n} was stated only by another speaker`);
+      }
+      if (opts.supersession) for (const n of supersededClaims(masked.slice(u.start, u.end), grounded)) fail('superseded_in_source', n);
+    }
+
+    if (unitFailures.length > 0) {
+      quarantined.push({ text: clip(text, 2000), reason: unitFailures[0].reason, detail: unitFailures.map(f => f.detail).join('; ') });
+      edits.push({ start: u.start, end: u.end, text: REMOVED });
+    } else {
+      edits.push(...unitEdits);
+      provenance.push(...unitProvenance);
+      // Mechanical evidence validates a quote or number, not the interpretation
+      // around it, so S8 judges every substantive new passing unit, attributed
+      // and numeric ones and labels around valid quotes included. It sees the
+      // final quote repairs: its quarantine reducer removes units by exact text.
+      if (isGroundingCandidate(body, u.start, masked.slice(u.start, u.end))) {
+        let repaired = text;
+        for (const e of [...unitEdits].sort((a, b) => b.start - a.start)) {
+          repaired = repaired.slice(0, e.start - u.start) + e.text + repaired.slice(e.end - u.start);
+        }
+        groundingUnits.push(repaired);
+      }
+    }
+  }
+
+  let out = body;
+  for (const e of edits.sort((a, b) => b.start - a.start)) out = out.slice(0, e.start) + e.text + out.slice(e.end);
+  out = collapseRemoved(out, body);
+  return { body: out, changed: out !== body, quotes, exact, normalized, near, unbalanced, quarantined, provenance, failures, groundingUnits };
+}
+
+/** Units shorter than this many words (labels, headings, fragments) are not claims S8 judges. */
+const MIN_GROUNDING_UNIT_WORDS = 5;
+
+/** A passing prose unit, not a heading, long enough to be a claim. */
+function isGroundingCandidate(body: string, start: number, prose: string): boolean {
+  const lineStart = body.lastIndexOf('\n', start - 1) + 1;
+  if (/^[ \t]*#{1,6}[ \t]/.test(body.slice(lineStart, start + 1))) return false;
+  return (prose.match(/\p{L}[\p{L}'-]*/gu) ?? []).length >= MIN_GROUNDING_UNIT_WORDS;
+}
+
+/** Drop REMOVED markers and the empty list items / blank runs they leave, keeping the body's trailing newline. */
+function collapseRemoved(out: string, original: string): string {
+  if (!out.includes(REMOVED)) return out;
+  const lines: string[] = [];
+  for (const line of out.split('\n')) {
+    if (!line.includes(REMOVED)) { lines.push(line); continue; }
+    const rest = line.split(REMOVED).join('').replace(/([^ \t])[ \t]{2,}/g, '$1 ').replace(/[ \t]+$/, '');
+    if (!EMPTY_LINE_AFTER_REMOVAL_RE.test(rest)) lines.push(rest);
+  }
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '').replace(/\n+$/, original.endsWith('\n') ? '\n' : '');
+}
+
+export interface VerifiablePage {
+  compiled_truth: string;
+  timeline: string;
+  frontmatter: Record<string, unknown>;
+}
+
+interface UnverifiedRecord extends QuarantinedClaim { sources: string[]; detected_at: string }
+
+function recordList<T>(fm: Record<string, unknown> | undefined, key: string, pick?: string): T[] {
+  const v = pick ? (fm?.[key] as Record<string, unknown> | undefined)?.[pick] : fm?.[key];
+  return Array.isArray(v) ? v.filter(x => x && typeof x === 'object') as T[] : [];
+}
+
+/**
+ * Verify a whole dream page: both bodies, then the frontmatter records.
+ * `prior` is the page's pre-run revision when it already existed (only new
+ * units are checked, and its records carry forward); null for a page this
+ * run created. Quarantined units accumulate in `unverified_claims`; grounded
+ * quotes accumulate source-span + speaker provenance in `grounding.quotes`.
+ */
+export interface VerifiedDreamPage extends VerifiablePage {
+  changed: boolean;
+  /** Substantive new units that pass the mechanical checks, per body (S8 input). */
+  groundingUnits: Array<{ body: 'compiled_truth' | 'timeline'; text: string }>;
+}
+
+/**
+ * System One S8 hook: runs after the mechanical checks and before the page is
+ * persisted, at both verifyDreamPage call sites. It may only remove units the
+ * mechanical checks passed (grounding-decide.ts); it can never admit one.
+ */
+export interface GroundingPass {
+  apply(page: VerifiedDreamPage, sources: GroundedSource[], subject: string, checkedAt: string): Promise<VerifiedDreamPage>;
+}
+
+/**
+ * Verify both bodies of one dream page. `checkedAt` is the cycle date the
+ * synthesis prompt gave the child as today's date, so a page stating that ISO
+ * date is not flagged `number_not_in_source`; every other date still is.
+ */
+export function verifyDreamPage(
+  page: VerifiablePage,
+  sources: GroundedSource[],
+  opts: { prior: VerifiablePage | null; checkedAt: string;
+    /** #5425 [UC4]: `attributionChecksEnabled(engine)`; absent or false leaves the output unchanged. */
+    supersession?: boolean },
+  stats: QuoteVerifyStats,
+): VerifiedDreamPage {
+  const priorNorm = opts.prior ? normForGrounding(`${opts.prior.compiled_truth}\n${opts.prior.timeline ?? ''}`) : undefined;
+  const exemptNumericKeys = new Set([`date:${opts.checkedAt}`]);
+  const truth = verifyBody(page.compiled_truth ?? '', sources, { priorNorm, exemptNumericKeys, supersession: opts.supersession });
+  const timeline = verifyBody(page.timeline ?? '', sources, { priorNorm, exemptNumericKeys, supersession: opts.supersession });
+  stats.pages_checked++;
+  for (const r of [truth, timeline]) {
+    stats.quotes_total += r.quotes;
+    stats.exact += r.exact;
+    stats.normalized_fixed += r.normalized;
+    stats.near_fixed += r.near;
+    stats.unbalanced += r.unbalanced;
+    stats.quarantined_claims += r.quarantined.length;
+    for (const k of Object.keys(r.failures) as ClaimFailure[]) stats[k] += r.failures[k];
+  }
+  const newlyQuarantined = [...truth.quarantined, ...timeline.quarantined];
+  if (newlyQuarantined.length > 0) stats.pages_with_quarantine++;
+
+  let compiled = truth.body;
+  if (!compiled.trim() && (page.compiled_truth ?? '').trim() && !timeline.body.trim()) compiled = ALL_CLAIMS_QUARANTINED_BODY;
+
+  const sourcePaths = sources.map(s => s.path);
+  const unverified = new Map<string, UnverifiedRecord>();
+  for (const r of [
+    ...recordList<UnverifiedRecord>(opts.prior?.frontmatter, UNVERIFIED_CLAIMS_KEY),
+    ...recordList<UnverifiedRecord>(page.frontmatter, UNVERIFIED_CLAIMS_KEY),
+    ...newlyQuarantined.map(q => ({ ...q, sources: sourcePaths, detected_at: opts.checkedAt })),
+  ]) {
+    if (typeof r.text === 'string') unverified.set(normForGrounding(r.text), r);
+  }
+  const bodyNorm = normForGrounding(`${compiled}\n${timeline.body}`);
+  const quotes = new Map<string, QuoteProvenance>();
+  for (const q of [...recordList<QuoteProvenance>(opts.prior?.frontmatter, GROUNDING_KEY, 'quotes'), ...truth.provenance, ...timeline.provenance]) {
+    if (typeof q.text !== 'string' || !bodyNorm.includes(normForGrounding(q.text.replace(/\.\.\.$/, '')))) continue;
+    quotes.set(`${q.source} ${q.span?.[0]} ${q.span?.[1]}`, q);
+  }
+
+  const frontmatter: Record<string, unknown> = { ...page.frontmatter };
+  if (unverified.size > 0) frontmatter[UNVERIFIED_CLAIMS_KEY] = [...unverified.values()].slice(-MAX_UNVERIFIED_RECORDS);
+  if (quotes.size > 0 || unverified.size > 0 || opts.prior?.frontmatter?.[GROUNDING_KEY]) {
+    frontmatter[GROUNDING_KEY] = {
+      checked_at: opts.checkedAt,
+      sources: sourcePaths,
+      quotes: [...quotes.values()].slice(-MAX_PROVENANCE_RECORDS),
+    };
+  } else {
+    delete frontmatter[GROUNDING_KEY];
+  }
+  const changed = compiled !== page.compiled_truth || timeline.body !== (page.timeline ?? '')
+    || JSON.stringify(frontmatter) !== JSON.stringify(page.frontmatter);
+  const groundingUnits = [
+    ...truth.groundingUnits.map(text => ({ body: 'compiled_truth' as const, text })),
+    ...timeline.groundingUnits.map(text => ({ body: 'timeline' as const, text })),
+  ];
+  return { compiled_truth: compiled, timeline: timeline.body, frontmatter, changed, groundingUnits };
+}
+
+/**
+ * S8 quarantine: remove units (verbatim unit text as verifyBody reported it)
+ * from their body and keep each in `unverified_claims` with its reason. Only
+ * text that is still present is removed, so a unit can never be re-admitted
+ * or double-counted. Removing a unit always changes the page.
+ */
+export function quarantineUnits(
+  page: VerifiedDreamPage,
+  units: Array<{ body: 'compiled_truth' | 'timeline'; text: string; reason: QuarantinedClaim['reason']; detail: string }>,
+  sourcePaths: string[],
+  checkedAt: string,
+): VerifiedDreamPage {
+  if (units.length === 0) return page;
+  const bodies = { compiled_truth: page.compiled_truth, timeline: page.timeline };
+  const records: UnverifiedRecord[] = [];
+  for (const u of units) {
+    const at = bodies[u.body].indexOf(u.text);
+    if (at < 0) continue;
+    bodies[u.body] = bodies[u.body].slice(0, at) + REMOVED + bodies[u.body].slice(at + u.text.length);
+    records.push({ text: clip(u.text, 2000), reason: u.reason, detail: u.detail, sources: sourcePaths, detected_at: checkedAt });
+  }
+  if (records.length === 0) return page;
+  let compiled = collapseRemoved(bodies.compiled_truth, page.compiled_truth);
+  const timeline = collapseRemoved(bodies.timeline, page.timeline);
+  if (!compiled.trim() && page.compiled_truth.trim() && !timeline.trim()) compiled = ALL_CLAIMS_QUARANTINED_BODY;
+  const unverified = new Map<string, UnverifiedRecord>();
+  for (const r of [...recordList<UnverifiedRecord>(page.frontmatter, UNVERIFIED_CLAIMS_KEY), ...records]) {
+    if (typeof r.text === 'string') unverified.set(normForGrounding(r.text), r);
+  }
+  const frontmatter: Record<string, unknown> = { ...page.frontmatter, [UNVERIFIED_CLAIMS_KEY]: [...unverified.values()].slice(-MAX_UNVERIFIED_RECORDS) };
+  const removed = new Set(records.map(r => r.text));
+  return { compiled_truth: compiled, timeline, frontmatter, changed: true, groundingUnits: page.groundingUnits.filter(u => !removed.has(clip(u.text, 2000))) };
+}
+
+/**
+ * Orchestrator entry: verify every page this phase's children wrote.
+ * Sources are the transcripts of every child that wrote the page (a page
+ * two transcripts touched is checked against both). A page's epoch is the
+ * earliest `sinceByTranscript` entry of its sources, else `since`. Pages
+ * created at or after it are verified whole; older pages are verified only
+ * on the units their pre-epoch revision lacks. A small LRU keeps
+ * resident grounding state bounded to a few transcripts.
+ */
+export async function verifyAndRepairDreamPages(
+  engine: BrainEngine,
+  refs: Array<{ slug: string; source_id: string; raw_source?: string; first_write_at?: Date }>,
+  transcriptsByPath: Map<string, TranscriptForVerify>,
+  opts: { since: Date; sinceByTranscript?: Map<string, Date>; checkedAt?: string; signal?: AbortSignal; grounding?: GroundingPass;
+    /** #5575 I2: transcripts under it are third-party speech (dream-taint.ts). */
+    meetingTranscriptsDir?: string | null },
+): Promise<QuoteVerifyStats> {
+  const stats = emptyQuoteVerifyStats();
+  const checkedAt = opts.checkedAt ?? await resolveCycleDate(engine).catch(() => utcDate());
+  const supersession = await attributionChecksEnabled(engine);
+  const pages = new Map<string, { slug: string; source_id: string; paths: string[]; first_write_at?: Date }>();
+  for (const ref of refs) {
+    const key = `${ref.source_id} ${ref.slug}`;
+    const known = ref.raw_source && transcriptsByPath.has(ref.raw_source) ? ref.raw_source : undefined;
+    const entry = pages.get(key) ?? { slug: ref.slug, source_id: ref.source_id, paths: [] };
+    if (known && !entry.paths.includes(known)) entry.paths.push(known);
+    if (ref.first_write_at && (!entry.first_write_at || ref.first_write_at < entry.first_write_at)) entry.first_write_at = ref.first_write_at;
+    pages.set(key, entry);
+  }
+  const cache = new Map<string, GroundedSource>();
+  const sourceFor = (path: string): GroundedSource => {
+    let g = cache.get(path);
+    if (g) { cache.delete(path); cache.set(path, g); return g; }
+    g = groundSource(path, transcriptsByPath.get(path)!.content);
+    cache.set(path, g);
+    if (cache.size > 4) cache.delete(cache.keys().next().value as string);
+    return g;
+  };
+
+  const ordered = [...pages.values()].sort((a, b) => (a.paths[0] ?? '').localeCompare(b.paths[0] ?? ''));
+  for (const ref of ordered) {
+    throwIfAborted(opts.signal, '[dream] quote verify');
+    if (ref.paths.length === 0) { stats.skipped_no_transcript++; continue; }
+    try {
+      const page = await engine.getPage(ref.slug, { sourceId: ref.source_id });
+      if (!page) { stats.errors++; continue; }
+      // The child's first write to this page is the ownership boundary: a
+      // page another writer created before it is not the run's own.
+      const since = ref.first_write_at ?? ref.paths.reduce((min, p) => {
+        const at = opts.sinceByTranscript?.get(p);
+        return at && at < min ? at : min;
+      }, opts.since);
+      const prior = await resolveVerifyPrior(engine, page, ref.source_id, since);
+      if (prior === 'unchanged') { stats.skipped_unchanged++; continue; }
+      if (prior) stats.preexisting_diffed++;
+      const sources = ref.paths.map(sourceFor);
+      const mechanical = verifyDreamPage(page, sources, { prior, checkedAt, supersession }, stats);
+      const verified = opts.grounding ? await opts.grounding.apply(mechanical, sources, `page:${ref.source_id}:${ref.slug}`, checkedAt) : mechanical;
+      if (verified.changed) {
+        const tags = await engine.getTags(ref.slug, { sourceId: ref.source_id });
+        const next = { ...page, compiled_truth: verified.compiled_truth, timeline: verified.timeline, frontmatter: verified.frontmatter };
+        // #6188: Tier 1 normalizes a fixable fence before the verified body is compiled and written.
+        const fences = await normalizePageFences(engine, { sourceId: ref.source_id, slug: ref.slug, page: next });
+        if (fences) Object.assign(next, fences.page);
+        const md = serializePageToMarkdown(next, tags);
+        // The children's put_page projected timeline, facts, takes and links
+        // from the unverified body; re-project from the verified body in the
+        // same transaction so no derived row outlives its quarantined claim.
+        const parsed = { type: page.type, title: page.title, compiled_truth: next.compiled_truth, timeline: next.timeline, frontmatter: next.frontmatter, tags };
+        // Preserving writer (#5567): rows for bullets the verifier removed are
+        // deleted; database-only timeline history is kept.
+        const project = await prepareCanonicalProjections(engine, parsed, ref.slug, ref.source_id,
+          await engine.readPageSnapshot(ref.slug, { sourceId: ref.source_id }), 'preserving');
+        const links = await isAutoLinkEnabled(engine) ? await prepareAutomaticLinks(engine, ref.slug, parsed, ref.source_id) : undefined;
+        // noEmbed: the phase-end embed sweep backfills. Provenance fields
+        // null → engine COALESCE keeps the first-write record intact.
+        // #5575 I2: the repaired page and its re-projected rows are written at
+        // the tier of the transcripts it was synthesized from, with its edges.
+        const derivation = await transcriptsDerivation(engine, ref.paths.map(path => ({ filePath: path, content: transcriptsByPath.get(path)!.content })), opts.meetingTranscriptsDir);
+        await derivedMaintenanceTransaction(engine, derivation, async tx => ({ result: await importFromContent(tx, ref.slug, md, {
+          noEmbed: true, remote: false, preserveGateMarkers: true, sourceId: ref.source_id,
+          beforeCommit: async inner => { await project(inner); await links?.apply(inner); },
+        }), rows: [{ table: 'pages' as const, id: page.id, sourceId: ref.source_id }] }));
+        stats.pages_repaired++;
+      }
+    } catch (e) {
+      // Fail-open: a verify bug never kills the phase — but a cooperative
+      // abort must still unwind.
+      throwIfAborted(opts.signal, '[dream] quote verify');
+      stats.errors++;
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`[dream] quote verify ${ref.slug}@${ref.source_id} failed: ${msg}\n`);
+    }
+    // Cooperative yield per page: the string passes are synchronous CPU.
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+  return stats;
+}

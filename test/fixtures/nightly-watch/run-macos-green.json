@@ -1,0 +1,19 @@
+{
+  "id": 37197810506,
+  "name": "macOS 26 validation",
+  "event": "schedule",
+  "status": "completed",
+  "conclusion": "success",
+  "run_attempt": 1,
+  "path": ".github/workflows/macos-validation.yml",
+  "workflow_id": 370626310,
+  "head_branch": "master",
+  "head_sha": "8b5ed04c6c061031acd953fccd5590357e8bfe8e",
+  "html_url": "https://github.com/garrytan/gbrain/actions/runs/37197810506",
+  "head_repository": {
+    "full_name": "garrytan/gbrain"
+  },
+  "repository": {
+    "full_name": "garrytan/gbrain"
+  }
+}

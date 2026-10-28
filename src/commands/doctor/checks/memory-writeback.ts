@@ -1,0 +1,490 @@
+/**
+ * memory_writeback — the ambient-writeback diagnostics surface (WP6).
+ *
+ * One check answers requirement 10's four questions: is it on; what
+ * mode/TTL/visibility actually resolve; which harness integrations are
+ * installed (receipt says "installed", the live sentinel probe says "still
+ * present", the drift compare says "still CURRENT" — all three reported,
+ * OV-A3); and the recent inserted/duplicate/superseded/skipped/failed
+ * counts.
+ *
+ * Counter honesty (OV-A11): the `remember` counters come from the local
+ * verbs usage sidecar and cover ALL MCP callers — the wire cannot
+ * distinguish an ambient save from an explicit one, and the label says so.
+ * The backstop counters are PERSISTED results from the serve-side harvest
+ * heartbeat (`event: 'writeback'`), never hook-side candidate counts. Both
+ * stores are local, append-only, loss-tolerant observability — never a
+ * source of truth (usage-log.ts / telemetry.ts posture).
+ *
+ * Intentionally-off is `status: 'ok'` with zero noise (the
+ * integrations-memorable convention: a disabled opt-in is never a warn).
+ */
+
+import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
+import type { BrainEngine } from '../../../core/engine.ts';
+import type { Check } from '../../doctor.ts';
+import type { Effect } from '../../../core/agent-output.ts';
+import { loadConfig } from '../../../core/config.ts';
+import { resolveGbrainHome } from '../../../core/gbrain-home.ts';
+import {
+  captureLaneStates,
+  resolveWritebackConfig,
+  resolveWritebackConfigFromFile,
+  WRITEBACK_RESTART_AFTER_OFF,
+  AUTO_WRITEBACK_NOTICE_KEY,
+  PRIVATE_DEFAULT_REMOTE_CONSEQUENCE,
+} from '../../../core/facts/writeback-config.ts';
+import { resolveDefaultVisibility } from '../../../core/facts/visibility.ts';
+import { classifyBrainAudience } from '../../../core/facts/writeback-audience.ts';
+import { readVerbUsage } from '../../../core/verbs/usage-log.ts';
+import { readClientOpUsage } from '../../../core/mcp-usage.ts';
+import { OPENCLAW_COMPACT_EVENT, readHeartbeatTail } from '../../../core/context/hook-heartbeat.ts';
+import { CORPUS_UNINGESTED_RETENTION_FACTOR, CORPUS_WINDOW_FAILURE_CAP, corpusBacklog, corpusSpoolDir, listCorpusFailures } from '../../../core/context/corpus-segments.ts';
+import { listCorpusSourceHolds } from '../../../core/context/corpus-source.ts';
+import { readHarnessReceiptState } from '../../../core/bootstrap/format.ts';
+import { mutedFirstRunDecisionsNotice } from '../../../core/onboard/mcp-onboarding.ts';
+import {
+  probeAmbientBlock,
+  renderAmbientInstructionBlock,
+} from '../../../core/bootstrap/instructions-block.ts';
+import {
+  claudeUserMemoryPath,
+  codexAgentsOverridePath,
+  codexGlobalAgentsPath,
+} from '../../../core/bootstrap/host-specs.ts';
+
+export const MEMORY_WRITEBACK_CHECK_NAME = 'memory_writeback';
+
+const COUNTER_WINDOW_DAYS = 7;
+/**
+ * #5557: share of finished serve-side harvests (ok + error; a busy-writer
+ * re-queue is not finished) that fails before the check warns, judged on at
+ * least this many harvests.
+ */
+const HARVEST_FAILURE_WARN_SHARE = 0.2;
+const HARVEST_FAILURE_MIN_FINISHED = 10;
+
+/** Every path an ambient block could live at: the receipt's recorded
+ * `instructions` targets UNION the two canonical install paths — an
+ * out-of-band or crashed-receipt install must still be findable (the
+ * converge-on-off lane probes the same union). */
+function ambientBlockCandidatePaths(): Array<{ host: string; path: string }> {
+  const out: Array<{ host: string; path: string }> = [];
+  const seen = new Set<string>();
+  const push = (host: string, path: string | null | undefined) => {
+    if (!path || seen.has(path)) return;
+    seen.add(path);
+    out.push({ host, path });
+  };
+  try { push('claude-code', claudeUserMemoryPath()); } catch { /* env-dependent */ }
+  try { push('codex', codexGlobalAgentsPath()); } catch { /* env-dependent */ }
+  try {
+    const receipt = readHarnessReceiptState(resolveGbrainHome());
+    if (receipt.state === 'ok') {
+      for (const t of receipt.receipt.targets) {
+        if (t.kind === 'instructions' && t.path) push(t.host, t.path);
+      }
+    }
+  } catch { /* receipt probe is best-effort */ }
+  return out;
+}
+
+/** #5671: who reads this brain remotely (world-only reads) — the bootstrap
+ * harness receipt (an HTTP MCP registration) and HTTP token clients active
+ * in the last 30 days. Best-effort local reads; empty = no remote evidence. */
+async function remoteFactReaders(engine: BrainEngine): Promise<string[]> {
+  const readers: string[] = [];
+  try {
+    const receipt = readHarnessReceiptState(resolveGbrainHome());
+    if (receipt.state === 'ok') readers.push(`bootstrap harness (HTTP MCP at ${receipt.receipt.url})`);
+  } catch { /* receipt probe is best-effort */ }
+  try {
+    const clients = await readClientOpUsage(engine, { days: 30 });
+    if (clients.length) readers.push(`${clients.length} HTTP MCP client(s) active in 30d`);
+  } catch { /* pre-OAuth brain: no request log */ }
+  return readers;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * E-N1: corpus turn files nothing has extracted yet. Retention keeps them up
+ * to CORPUS_UNINGESTED_RETENTION_FACTOR x `corpus_retention_days`; once one is
+ * past plain retention it is on its way to deletion, so the check says so.
+ * Records `details.corpus_backlog`; returns the warning text or null.
+ */
+async function sessionCorpusDir(engine: BrainEngine, fileCfg: ReturnType<typeof loadConfig>): Promise<string> {
+  const synth = fileCfg?.dream?.synthesize as Record<string, unknown> | undefined;
+  const configured = (await engine.getConfig('dream.synthesize.session_corpus_dir').catch(() => null)) ?? synth?.session_corpus_dir;
+  return typeof configured === 'string' && isAbsolute(configured) ? configured : join(resolveGbrainHome(), 'transcripts', 'corpus');
+}
+
+/**
+ * #6268: captured session files held because nothing proves their source
+ * (legacy top-level files on a multi-source brain, or sessions whose source
+ * never resolved). Only the operator can say where they belong, so the
+ * warning names the preview command. Records `details.corpus_source_holds`.
+ */
+async function corpusSourceHoldProblem(engine: BrainEngine, fileCfg: ReturnType<typeof loadConfig>, details: Record<string, unknown>): Promise<string | null> {
+  const sources = await engine.executeRaw<{ id: string }>('SELECT id FROM sources ORDER BY id LIMIT 2');
+  const holds = listCorpusSourceHolds(await sessionCorpusDir(engine, fileCfg), sources.length === 1);
+  details.corpus_source_holds = { legacy_unstamped: holds.legacy_unstamped, unresolved: holds.unresolved, sessions: holds.sessions.length };
+  const held = holds.legacy_unstamped + holds.unresolved;
+  if (held === 0) return null;
+  return `${held} captured session file(s) from ${holds.sessions.length} session(s) are held because nothing records which source they belong to `
+    + '(written before corpus files carried their source, or the session never resolved one); they are not extracted until mapped. '
+    + 'Ask the user which source they belong to, preview with gbrain sweep --assign-corpus <source>, then add --apply';
+}
+
+/**
+ * #6316: the OpenClaw context engine writes one heartbeat per compaction.
+ * Compactions in the window that never banked a segment mean the lane is
+ * silently dead (a host that passes neither a session file nor a target the
+ * engine can read). Records `details.openclaw_compactions_7d`.
+ */
+async function openclawCompactionProblem(details: Record<string, unknown>): Promise<string | null> {
+  const cutoff = Date.now() - COUNTER_WINDOW_DAYS * DAY_MS;
+  const runs = (await readHeartbeatTail(2000)).filter((e) => e.event === OPENCLAW_COMPACT_EVENT && Date.parse(e.ts) >= cutoff);
+  if (!runs.length) return null;
+  const skipped = runs.filter((e) => e.segment === 'skipped');
+  const reasons: Record<string, number> = {};
+  for (const e of skipped) reasons[e.reason ?? 'unknown'] = (reasons[e.reason ?? 'unknown'] ?? 0) + 1;
+  details.openclaw_compactions_7d = { total: runs.length, banked: runs.length - skipped.length, skipped: reasons };
+  const blind = (reasons.no_session ?? 0) + (reasons.transcript_runtime_unavailable ?? 0) + (reasons.transcript_read_failed ?? 0);
+  if (skipped.length < runs.length || blind === 0) return null;
+  const top = Object.entries(reasons).sort((a, b) => b[1] - a[1])[0]!;
+  return `OpenClaw ran ${runs.length} compaction(s) in ${COUNTER_WINDOW_DAYS}d and the gbrain checkpoint banked none (top skip: ${top[0]} x${top[1]}); `
+    + 'compaction-time facts are not being captured. Upgrade gbrain on the OpenClaw host and restart the gateway, then check again: gbrain doctor --json';
+}
+
+async function corpusBacklogProblem(engine: BrainEngine, fileCfg: ReturnType<typeof loadConfig>, details: Record<string, unknown>): Promise<string | null> {
+  const synth = fileCfg?.dream?.synthesize as Record<string, unknown> | undefined;
+  const dir = await sessionCorpusDir(engine, fileCfg);
+  const days = typeof synth?.corpus_retention_days === 'number' && synth.corpus_retention_days > 0 ? synth.corpus_retention_days : 30;
+  const now = Date.now();
+  const top = corpusBacklog(dir, days * DAY_MS, now);
+  const spool = corpusBacklog(corpusSpoolDir(dir), days * DAY_MS, now);
+  const oldest = [top.oldestPendingMtimeMs, spool.oldestPendingMtimeMs].filter((m): m is number => m !== null);
+  const backlog = { pending: top.pending + spool.pending, pastRetention: top.pastRetention + spool.pastRetention, oldestPendingMtimeMs: oldest.length ? Math.min(...oldest) : null };
+  const oldestDays = backlog.oldestPendingMtimeMs === null ? null : Math.floor((now - backlog.oldestPendingMtimeMs) / DAY_MS);
+  const purgeDays = days * CORPUS_UNINGESTED_RETENTION_FACTOR;
+  details.corpus_backlog = { pending: backlog.pending, oldest_pending_days: oldestDays, past_retention: backlog.pastRetention, retention_days: days, deleted_after_days: purgeDays };
+  if (backlog.pastRetention === 0) return null;
+  return `${backlog.pastRetention} of ${backlog.pending} captured session file(s) are older than the ${days}-day corpus retention and were never extracted `
+    + `(oldest ${oldestDays}d); they are deleted at ${purgeDays}d. Extract them now: gbrain sweep --once --budget-ms 600000`;
+}
+
+/** #6785: the problem text a stopped corpus window carries; the check's fix keys on it. */
+const CORPUS_RETRY_COMMAND = 'gbrain sweep --retry-failed --apply';
+
+/**
+ * #6785: corpus windows the sweep stopped paying for after
+ * CORPUS_WINDOW_FAILURE_CAP failures past the model call. Nothing retries
+ * them until the operator does (paid), so the check names the retry as its
+ * fix. Records `details.corpus_failed_windows`.
+ */
+async function corpusFailureProblem(engine: BrainEngine, fileCfg: ReturnType<typeof loadConfig>, details: Record<string, unknown>): Promise<string | null> {
+  const dir = await sessionCorpusDir(engine, fileCfg);
+  const failed = [...listCorpusFailures(corpusSpoolDir(dir)), ...listCorpusFailures(dir)];
+  const stopped = failed.filter((f) => f.record.count >= CORPUS_WINDOW_FAILURE_CAP);
+  if (!failed.length) return null;
+  const codes = new Map<string, number>();
+  for (const f of stopped) codes.set(f.record.last_code, (codes.get(f.record.last_code) ?? 0) + 1);
+  details.corpus_failed_windows = { retrying: failed.length - stopped.length, stopped: stopped.length, last_codes: Object.fromEntries(codes) };
+  if (!stopped.length) return null;
+  const [topCode] = [...codes.entries()].sort((a, b) => b[1] - a[1])[0]!;
+  return `${stopped.length} captured session file(s) stopped extracting after ${CORPUS_WINDOW_FAILURE_CAP} failed attempts at one window (top: ${topCode}); `
+    + `fix the cause, then retry them (paid): ${CORPUS_RETRY_COMMAND}`;
+}
+
+const CORPUS_RETRY_FIX = {
+  argv: ['gbrain', 'sweep', '--retry-failed', '--apply'], consent: ['paid'] as Effect[], actor: 'agent' as const, requires_exclusive: false,
+  why: 'Clears the failure counts of corpus windows the sweep stopped retrying, so the next sweep pays to extract them again.',
+  user_message: 'Some captured session text stopped being turned into memory because extracting it kept failing (gbrain doctor names the error). Once the cause is fixed, retrying costs model calls. OK to retry them?',
+  verify: { argv: ['gbrain', 'doctor', '--only', MEMORY_WRITEBACK_CHECK_NAME, '--json'] },
+};
+
+export async function buildMemoryWritebackCheck(engine: BrainEngine | null): Promise<Check> {
+  try {
+    const fileCfg = loadConfig();
+    if (!engine) {
+      // Engine-free doctor run: report the file-plane mirror honestly and
+      // stop — the DB plane (the authoritative gate), audience, and counters
+      // need a connection.
+      const fileWb = resolveWritebackConfigFromFile(fileCfg);
+      return {
+        name: MEMORY_WRITEBACK_CHECK_NAME,
+        status: 'ok',
+        message: fileWb.enabled
+          ? `ambient writeback ${fileWb.mode} per the file-plane mirror (database unreachable — DB plane is authoritative; re-run with the engine up for the full report)`
+          : 'ambient writeback off (default; file-plane mirror — database unreachable)',
+        details: { mode: fileWb.mode, mode_valid: fileWb.mode_valid, transient_ttl: fileWb.transient_ttl, ttl_valid: fileWb.ttl_valid, plane: 'file-mirror-only' },
+      };
+    }
+    const wb = await resolveWritebackConfig(engine, fileCfg);
+    const fileWb = resolveWritebackConfigFromFile(fileCfg);
+    const nudgeShown = await engine.getConfig(AUTO_WRITEBACK_NOTICE_KEY).catch(() => null);
+    const audience = await classifyBrainAudience(engine, fileCfg);
+    const backstopVisibility = await resolveDefaultVisibility(engine).catch(() => 'private' as const);
+
+    const details: Record<string, unknown> = {
+      mode: wb.mode,
+      mode_valid: wb.mode_valid,
+      ...(wb.raw_mode && !wb.mode_valid ? { raw_mode: wb.raw_mode } : {}),
+      transient_ttl: wb.transient_ttl,
+      ttl_valid: wb.ttl_valid,
+      instruction_visibility: wb.visibility,
+      backstop_visibility: backstopVisibility,
+      visibility_note: 'world = readable by agents authorized on THIS brain, not the public internet',
+      audience: audience.audience,
+      audience_reasons: audience.reasons,
+      nudge_shown: nudgeShown === 'true',
+      ...(wb.read_error ? { read_error: true } : {}),
+      ...(wb.plane_drift ? { plane_drift: true } : {}),
+      capture_lanes: captureLaneStates(await resolveWritebackConfig(engine, fileCfg, { gate: true })),
+      counters_note: `local, append-only, loss-tolerant observability over the last ${COUNTER_WINDOW_DAYS}d — never a source of truth`,
+    };
+
+    // #5888: capture-lane exact duplicates dropped (every capture lane runs
+    // whether or not writeback is on) and near duplicates counted in shadow
+    // mode only (kept, never dropped).
+    try {
+      const cutoff = Date.now() - COUNTER_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+      const dedup = (await readHeartbeatTail(2000)).filter((e) => e.event === 'writeback_dedup' && Date.parse(e.ts) >= cutoff);
+      details.cross_lane_duplicates_7d = dedup.reduce((n, e) => n + (e.duplicate ?? 0), 0);
+      details.near_duplicates_shadow_7d = dedup.reduce((n, e) => n + (e.near_duplicate ?? 0), 0);
+    } catch { /* heartbeat unreadable — counters stay absent */ }
+
+    // Plane comparison (the dual-write design's promised surfacing): the DB
+    // row is authoritative at runtime; a disagreeing file mirror means a
+    // failed dual-write, a foreign writer, or another machine's `config set`
+    // on a shared Postgres brain — the Stop hook (file-gated) and the serve
+    // gate (DB-gated) are now acting on DIFFERENT truths.
+    const planeDrifted = !wb.read_error && (fileWb.raw_mode ?? '') !== (wb.raw_mode ?? '');
+    if (planeDrifted) {
+      details.file_mirror_mode = fileWb.raw_mode ?? '(unset)';
+    }
+
+    // #5671: an explicit private default on a personal brain read over MCP is
+    // write-only memory for those readers. A declared-shared brain keeps
+    // private-for-remote on purpose — no warn there.
+    let privateRemoteProblem: string | null = null;
+    if (!wb.read_error && wb.visibility_explicit_private && audience.audience !== 'shared') {
+      const readers = await remoteFactReaders(engine);
+      if (readers.length) {
+        details.private_default_remote_readers = readers;
+        privateRemoteProblem = `facts.default_visibility is private but this brain is read remotely (${readers.join('; ')}) — ${PRIVATE_DEFAULT_REMOTE_CONSEQUENCE}`;
+      }
+    }
+
+    if (!wb.enabled) {
+      const offProblems: string[] = [];
+      if (wb.read_error) {
+        offProblems.push('the writeback config could not be read (fail-closed off THIS run — the real state is unknown; re-run with the database reachable)');
+      } else if (!wb.mode_valid) {
+        offProblems.push(`memory.auto_writeback='${wb.raw_mode}' is unrecognized (expected off|salient|all) — resolved to off. Fix: gbrain config set memory.auto_writeback salient`);
+      }
+      if (planeDrifted && !wb.read_error) {
+        offProblems.push(`DB plane resolves '${wb.raw_mode ?? 'unset'}' but the file mirror says '${fileWb.raw_mode ?? 'unset'}' — planes diverged (banked turns are held, not extracted, until re-synced). Fix: gbrain config set memory.auto_writeback <off|salient|all> (dual-writes both planes)`);
+      }
+      // Off-but-still-instructing (red-team review, this wave): an installed
+      // block keeps directing every NEW session to save via `remember` (an
+      // ungated write op) — the off switch is incomplete until converged.
+      const lingering: string[] = [];
+      for (const c of ambientBlockCandidatePaths()) {
+        try {
+          if (!existsSync(c.path)) continue;
+          const probe = probeAmbientBlock(readFileSync(c.path, 'utf8'));
+          if (probe.state !== 'absent') lingering.push(`${c.host} (${c.path})`);
+        } catch { /* per-path probe is best-effort */ }
+      }
+      if (lingering.length) {
+        details.lingering_instruction_blocks = lingering;
+        offProblems.push(`ambient writeback is off but instruction blocks are still installed for ${lingering.join(', ')} — new sessions keep saving. Remove: gbrain bootstrap harness --yes (converges on off)`);
+      }
+      if (privateRemoteProblem) offProblems.push(privateRemoteProblem);
+      const explicitOff = wb.raw_mode === 'off';
+      // Unset (default) off still extracts SessionEnd and compaction files; explicit off retires them.
+      const offHoldProblem = explicitOff ? null : await corpusSourceHoldProblem(engine, fileCfg, details).catch(() => null);
+      if (offHoldProblem) offProblems.push(offHoldProblem);
+      const offCompactProblem = explicitOff ? null : await openclawCompactionProblem(details).catch(() => null);
+      if (offCompactProblem) offProblems.push(offCompactProblem);
+      const offFailureProblem = explicitOff ? null : await corpusFailureProblem(engine, fileCfg, details).catch(() => null);
+      if (offFailureProblem) offProblems.push(offFailureProblem);
+      if (explicitOff) details.restart_after_off = WRITEBACK_RESTART_AFTER_OFF;
+      return {
+        name: MEMORY_WRITEBACK_CHECK_NAME,
+        ...(offFailureProblem && !lingering.length ? { fix: CORPUS_RETRY_FIX } : {}),
+        status: offProblems.length ? 'warn' : 'ok',
+        message: offProblems.length
+          ? `ambient writeback off: ${offProblems.join('; ')}`
+          : explicitOff
+            ? 'ambient writeback off (explicit): every capture lane, SessionEnd transcripts included, retires banked session text. Enforcement is incomplete until workers started on an older gbrain restart (details.restart_after_off). Enable: gbrain config set memory.auto_writeback salient'
+            : 'ambient writeback off (default): Stop-hook turn capture is off, but the compaction harvest and SessionEnd transcripts still extract (installing the harness hooks opted into them; stop them: gbrain config set memory.auto_writeback off). Enable: gbrain config set memory.auto_writeback salient',
+        details,
+      };
+    }
+
+    const problems: string[] = [];
+    const corpusProblem = await corpusBacklogProblem(engine, fileCfg, details).catch(() => null);
+    if (corpusProblem) problems.push(corpusProblem);
+    const holdProblem = await corpusSourceHoldProblem(engine, fileCfg, details).catch(() => null);
+    if (holdProblem) problems.push(holdProblem);
+    const compactProblem = await openclawCompactionProblem(details).catch(() => null);
+    if (compactProblem) problems.push(compactProblem);
+    const failureProblem = await corpusFailureProblem(engine, fileCfg, details).catch(() => null);
+    if (failureProblem) problems.push(failureProblem);
+    if (!wb.ttl_valid) {
+      problems.push(`memory.auto_writeback_transient_ttl is invalid — using '${wb.transient_ttl}'`);
+    }
+    if (privateRemoteProblem) problems.push(privateRemoteProblem);
+    if (planeDrifted) {
+      problems.push(`file mirror says '${fileWb.raw_mode ?? 'unset'}' while the DB plane resolves '${wb.raw_mode}' — the engine-free Stop hook is acting on the wrong truth. Re-sync: gbrain config set memory.auto_writeback ${wb.raw_mode}`);
+    }
+
+    // Harness instruction blocks: receipt (installed) vs live probe (present)
+    // vs drift compare (current). All engine-free local reads.
+    const blocks: Array<Record<string, unknown>> = [];
+    try {
+      const receipt = readHarnessReceiptState(resolveGbrainHome());
+      if (receipt.state === 'ok') {
+        // Both hosts render the identical body today — computed once.
+        const expectedBody = renderAmbientInstructionBlock({
+          mode: wb.mode as 'salient' | 'all',
+          transientTtl: wb.transient_ttl,
+          visibility: wb.visibility,
+          serveUrl: receipt.receipt.url,
+        });
+        for (const t of receipt.receipt.targets) {
+          if (t.kind !== 'instructions' || !t.path) continue;
+          const entry: Record<string, unknown> = { host: t.host, path: t.path, receipt_state: t.state };
+          // A FAILED receipt target is a standing warn regardless of what the
+          // live probe says (codex re-review): the one physical-survival path
+          // — a strip that THREW during smoke rollback — leaves a
+          // healthy-looking block on disk directing sessions at a rolled-back
+          // endpoint, and only this receipt state knows.
+          if (t.state === 'failed') {
+            problems.push(`${t.host} instruction block target previously FAILED (${t.error ?? 'unknown reason'}) — converge: gbrain bootstrap harness --yes (or --remove)`);
+          }
+          if (!existsSync(t.path)) {
+            entry.probe = 'missing';
+            problems.push(`${t.host} instruction block missing at ${t.path} — after the user agrees, reinstall: gbrain bootstrap harness --yes`);
+          } else {
+            const probe = probeAmbientBlock(readFileSync(t.path, 'utf8'));
+            if (probe.state === 'absent' || probe.state === 'damaged') {
+              entry.probe = probe.state === 'damaged' ? 'damaged' : 'missing';
+              problems.push(`${t.host} instruction block ${probe.state === 'damaged' ? 'has damaged markers' : 'missing'} at ${t.path} — after the user agrees, reinstall: gbrain bootstrap harness --yes`);
+            } else if (probe.interior !== expectedBody) {
+              entry.probe = 'drift';
+              // The combo converges even when the file-plane posture stamp is
+              // stale (e.g. facts.default_visibility flipped on ANOTHER
+              // machine of a shared Postgres brain): the config set re-stamps
+              // the mirror from DB truth, then the harness re-renders from it.
+              problems.push(`${t.host} instruction block is stale (config changed since install) — after the user agrees, refresh: gbrain config set memory.auto_writeback ${wb.mode} && gbrain bootstrap harness --yes`);
+            } else {
+              entry.probe = 'current';
+            }
+          }
+          if (t.host === 'codex') {
+            try {
+              if (existsSync(codexAgentsOverridePath())) {
+                entry.override_blocked = true;
+                problems.push('codex ignores AGENTS.md while AGENTS.override.md exists — the installed block is dead (merge it into the override file or remove the override)');
+              }
+            } catch { /* env-dependent — best effort */ }
+          }
+          blocks.push(entry);
+        }
+      }
+      details.instruction_blocks = blocks;
+    } catch { /* receipt probe is best-effort */ }
+
+    // Validity-lapsed facts (read-time TTL, WP5) — informational.
+    try {
+      const rows = await engine.executeRaw<{ n: number | string }>(
+        `SELECT count(*)::int AS n FROM facts WHERE valid_until <= now() AND expired_at IS NULL`,
+      );
+      details.validity_lapsed_facts = Number(rows[0]?.n ?? 0);
+    } catch { /* pre-facts brains */ }
+
+    // remember outcomes over MCP (ALL callers) — verbs usage sidecar.
+    try {
+      const events = await readVerbUsage({ days: COUNTER_WINDOW_DAYS });
+      const remembers = events.filter((e) => e.verb === 'remember');
+      const c = { inserted: 0, duplicate: 0, superseded: 0, failed: 0 };
+      for (const e of remembers) {
+        if (!e.ok) { c.failed++; continue; }
+        const s = (e as { remember_status?: string }).remember_status;
+        if (s === 'inserted') c.inserted++;
+        else if (s === 'duplicate') c.duplicate++;
+        else if (s === 'superseded') c.superseded++;
+      }
+      details.remember_over_mcp_7d = { ...c, note: 'all MCP callers — ambient and explicit saves are indistinguishable on the wire' };
+    } catch { /* sidecar unreadable — counters stay absent */ }
+
+    // Backstop lanes — persisted serve-side results + hook-side gate skips.
+    try {
+      const cutoff = Date.now() - COUNTER_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+      const tail = (await readHeartbeatTail(2000)).filter((e) => {
+        const t = Date.parse(e.ts);
+        return Number.isFinite(t) && t >= cutoff;
+      });
+      const harvest = tail.filter((e) => e.event === 'writeback');
+      const bank = tail.filter((e) => e.event === 'writeback-bank');
+      details.backstop_7d = {
+        inserted: harvest.reduce((n, e) => n + (e.inserted ?? 0), 0),
+        duplicate: harvest.reduce((n, e) => n + (e.duplicate ?? 0), 0),
+        superseded: harvest.reduce((n, e) => n + (e.superseded ?? 0), 0),
+        // 'degraded' bank events are INFRA faults only (IPC down, stale
+        // serve, parse/scan failures) — by-design gate skips ride
+        // outcome:'ok' since this wave, so this bucket no longer counts
+        // every "Thanks" as a skip.
+        skipped: harvest.filter((e) => e.outcome === 'ok' && e.reason && e.inserted === undefined).length
+          + bank.filter((e) => e.outcome === 'degraded').length,
+        failed: harvest.filter((e) => e.outcome === 'error').length,
+        // flush_skip_* = the turn IS banked; only the prompt-harvest enqueue
+        // was declined (cap/queue policy) — the sweep extracts it later.
+        turns_banked: bank.filter((e) => e.reason === 'wb_scheduled' || e.reason === 'wb_banked' || e.reason?.startsWith('flush_skip_')).length,
+        last_ok_at: harvest.filter((e) => e.outcome === 'ok').map((e) => e.ts).sort().at(-1) ?? null,
+      };
+      const failures = harvest.filter((e) => e.outcome === 'error');
+      const finished = failures.length + harvest.filter((e) => e.outcome === 'ok').length;
+      if (finished >= HARVEST_FAILURE_MIN_FINISHED && failures.length / finished > HARVEST_FAILURE_WARN_SHARE) {
+        const counts = new Map<string, number>();
+        for (const e of failures) counts.set(e.reason ?? 'error', (counts.get(e.reason ?? 'error') ?? 0) + 1);
+        const [topReason, topN] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]!;
+        problems.push(`${failures.length}/${finished} writeback harvests failed in ${COUNTER_WINDOW_DAYS}d (top: ${topReason} x${topN}); `
+          + 'failed turns wait for the next serve sweep or corpus drain; clear them now with gbrain sweep --once --budget-ms 600000; '
+          + 'serve\'s stderr names the first failure of each reason');
+      }
+    } catch { /* heartbeat unreadable — counters stay absent */ }
+
+    const mutedDecisions = await mutedFirstRunDecisionsNotice(engine).catch(() => null);
+    if (mutedDecisions) details.first_run_decisions_muted = { why: mutedDecisions.why, unmute: mutedDecisions.fix?.argv };
+    return {
+      name: MEMORY_WRITEBACK_CHECK_NAME,
+      status: problems.length ? 'warn' : 'ok',
+      message: (problems.length
+        ? `ambient writeback ${wb.mode}: ${problems.join('; ')}`
+        : `ambient writeback ${wb.mode} (ttl ${wb.transient_ttl}, template visibility ${wb.visibility}, audience ${audience.audience})`)
+        + (mutedDecisions ? '; first-run decisions are open but muted (`gbrain notices unmute first_run_decisions` shows them again)' : ''),
+      details,
+      ...(problems.some((p) => p.includes('gbrain bootstrap harness'))
+        ? { fix: {
+          argv: ['gbrain', 'bootstrap', 'harness', '--yes'], consent: ['persistent_install'] as Effect[], actor: 'agent' as const, requires_exclusive: false,
+          why: 'Rewrites the gbrain memory instruction block in each harness config from the current writeback settings.',
+          user_message: "gbrain's memory instructions in your agent app's config are missing or out of date. OK if I reinstall them?",
+          verify: { argv: ['gbrain', 'doctor', '--only', MEMORY_WRITEBACK_CHECK_NAME, '--json'] } } }
+        : failureProblem ? { fix: CORPUS_RETRY_FIX }
+        : problems.length ? { fix_unavailable_reason: 'operator_judgement' as const } : {}),
+    };
+  } catch (e) {
+    return {
+      name: MEMORY_WRITEBACK_CHECK_NAME,
+      status: 'warn',
+      message: `memory_writeback check failed: ${e instanceof Error ? e.message : String(e)}`,
+      details: {},
+    };
+  }
+}

@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "secrets": {
+    "liveToken": "gbrain-legacy-fixture-live-token",
+    "revokedToken": "gbrain-legacy-fixture-revoked-token",
+    "oauthAccess": "gbrain-legacy-fixture-oauth-access",
+    "oauthClientSecret": "gbrain-legacy-fixture-oauth-client-secret"
+  },
+  "source": {
+    "counts": {
+      "pages": 9,
+      "page_versions": 2,
+      "facts": 4,
+      "fact_withdrawals": 5,
+      "takes": 2,
+      "timeline_entries": 2,
+      "tags": 3,
+      "content_chunks": 7,
+      "page_projection_jobs": 3,
+      "persistence_requests": 4,
+      "persistence_effects": 6,
+      "minion_jobs": 1,
+      "access_tokens": 2,
+      "oauth_clients": 2,
+      "oauth_tokens": 1,
+      "persistence_local_writers": 3,
+      "persistence_worktrees": 1,
+      "persistence_host_bindings": 1,
+      "persistence_source_bindings": 1,
+      "sources": 3,
+      "raw_data": 1,
+      "files": 2,
+      "loop_suppressions": 2,
+      "open_loops": 1,
+      "decide_proposals": 2,
+      "gbrain_cycle_locks": 1,
+      "persistence_counters": 3,
+      "chronicle_page_state": 0
+    },
+    "pages": {
+      "people/alice-example": { "source_id": "default", "generation": 3, "deleted": false, "attributed": false, "projection_queued": true },
+      "people/alice_example": { "source_id": "default", "generation": 2, "deleted": false, "attributed": false, "projection_queued": true },
+      "people/älice-example": { "source_id": "default", "generation": 3, "deleted": false, "attributed": false, "projection_queued": true },
+      "companies/acme-example": { "source_id": "default", "generation": 4, "deleted": false, "attributed": false, "projection_queued": false },
+      "notes/legacy-deleted": { "source_id": "default", "generation": 5, "deleted": true, "attributed": false, "projection_queued": false },
+      "notes/archived-note": { "source_id": "legacy-archive", "generation": 6, "deleted": false, "attributed": false, "projection_queued": false },
+      "notes/managed-0": { "source_id": "managed-wiki", "generation": -1, "deleted": false, "attributed": true, "projection_queued": false },
+      "notes/managed-1": { "source_id": "managed-wiki", "generation": -1, "deleted": false, "attributed": true, "projection_queued": false },
+      "notes/managed-2": { "source_id": "managed-wiki", "generation": -1, "deleted": false, "attributed": true, "projection_queued": false }
+    },
+    "facts": {
+      "Alice-example prefers green tea.": { "expired_at": "2026-02-01T00:00:00.000Z", "superseded_by_fact": null, "attributed": false },
+      "Alice-example works at acme-example.": { "expired_at": null, "superseded_by_fact": null, "attributed": false },
+      "Acme-example raised a seed round from fund-a.": { "expired_at": null, "superseded_by_fact": null, "attributed": false },
+      "Acme-example is pre-seed.": { "expired_at": "2026-01-10T00:00:00.000Z", "superseded_by_fact": "Acme-example raised a seed round from fund-a.", "attributed": false }
+    },
+    "takes": [
+      { "row_num": 1, "active": false, "superseded_by": 2 },
+      { "row_num": 2, "active": true, "superseded_by": null }
+    ],
+    "withdrawal_subjects_c_order": ["People/Alice-Example", "people/alice-example", "people/alice_example", "people/älice-example", "*"],
+    "config_keys_c_order": ["graduation_fixture.Mixed-Key", "graduation_fixture.mixed-key", "graduation_fixture.mixed_key", "graduation_fixture.mïxed-key"],
+    "projection_slugs_c_order": ["people/alice-example", "people/alice_example", "people/älice-example"],
+    "oauth_client_ids_c_order": ["Legacy-Fixture-Client", "legacy-fixture-client"],
+    "overlay": {
+      "slug": "people/alice-example",
+      "stored_contains": ["| 2 | Alice-example prefers green tea. | fact | 1.0 | private | medium | 2025-11-05 |  | legacy-import |  |"],
+      "snapshot_contains": ["~~Alice-example prefers green tea.~~", "forgotten: memory withdrawn", "| 1 | Alice-example works at acme-example. |"],
+      "snapshot_excludes": ["| 2 | Alice-example prefers green tea. |"]
+    },
+    "effects": {
+      "failed": { "state": "failed", "attempts": 3, "error_code": "embedding_provider_failed", "execution_token": null, "claim_expires_at": null },
+      "delayed": { "state": "queued", "attempts": 1, "next_attempt_at": "2099-01-01T00:00:00.000Z", "execution_token": null, "claim_expires_at": null },
+      "orphan_running": { "state": "running", "attempts": 1, "execution_token": "00000000-0000-4000-8000-0000000000c1", "claim_expires_at": "2026-03-10T00:05:00.000Z" }
+    },
+    "stale_job": { "status": "active", "claim_generation": 1, "lock_token": "legacy-fixture-stale-lease", "lock_until": "2026-03-10T00:00:00.000Z" },
+    "queued_request": { "request_id": "00000000-0000-4000-8000-0000000000a1", "state": "queued", "slug": "notes/queued-request", "source_id": "managed-wiki" },
+    "managed_requests": { "state": "committed", "count": 3 },
+    "tokens": {
+      "legacy-fixture-live": { "revoked": false },
+      "legacy-fixture-revoked": { "revoked": true }
+    },
+    "local_writers": { "live": 2, "revoked": 1 },
+    "bytes": { "raw_data_min": 2097152, "files_metadata_min": 262144, "minion_data_min": 524288, "frontmatter_min": 65536 },
+    "cycle_locks": 1,
+    "embeddings": { "chunks": 1, "facts": 1 },
+    "brain": { "enabled": true }
+  },
+  "target": {
+    "counts": {
+      "pages": 10,
+      "persistence_requests": 4,
+      "fact_withdrawals": 5,
+      "facts": 4,
+      "takes": 2,
+      "access_tokens": 2,
+      "oauth_clients": 2,
+      "oauth_tokens": 1,
+      "persistence_local_writers": 3,
+      "minion_jobs": 1,
+      "gbrain_cycle_locks": 0
+    },
+    "absent_tables": ["gbrain_cycle_locks"],
+    "effects": {
+      "failed": { "state": "failed", "attempts": 3, "execution_token": null, "claim_expires_at": null },
+      "delayed": { "state": "queued", "attempts": 1, "next_attempt_at": "2099-01-01T00:00:00.000Z", "execution_token": null, "claim_expires_at": null },
+      "orphan_running": { "state": "queued", "attempts": 1, "execution_token": null, "claim_expires_at": null }
+    },
+    "stale_job": { "status": "waiting", "claim_generation": 1, "lock_token": null, "lock_until": null },
+    "worktree_heartbeat_at": null,
+    "queued_request": { "state": "committed", "replay_creates_row": false },
+    "tokens_authorize": {
+      "liveToken": true,
+      "revokedToken": false,
+      "oauthAccess": true
+    },
+    "brain": { "enabled": true, "brain_id_equals_source": true },
+    "unchanged_tables": [
+      "page_versions", "facts", "fact_withdrawals", "takes", "timeline_entries", "tags", "access_tokens", "oauth_clients",
+      "oauth_tokens", "raw_data", "files", "loop_suppressions", "open_loops", "decide_proposals", "persistence_local_writers"
+    ]
+  }
+}

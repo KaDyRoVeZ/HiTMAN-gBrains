@@ -1,0 +1,164 @@
+/**
+ * gbrain code-refs <symbol>
+ *
+ * v0.19.0 Layer 7 — find all usage sites of a named symbol among the
+ * brain's code pages. The DX "magical moment" for v0.19.0: an agent
+ * asks "what uses BrainEngine" and gets back a JSON array of
+ * {file, line, snippet} tuples in one CLI call.
+ *
+ * Implementation: bypasses the standard searchKeyword path (which uses
+ * DISTINCT ON (slug) to collapse to one result per page — wrong for
+ * code-refs where a single file typically has many usage sites). Uses
+ * a direct ILIKE scan over content_chunks + JOIN pages, returning every
+ * matching chunk.
+ *
+ * Scope: simple substring match. Word-boundary precision is a follow-up
+ * (would require either tsvector or regex). For v0.19.0 the heuristic
+ * is good enough: symbol names are distinctive by design, and noisy
+ * matches (e.g. 'foo' matching 'food') are rare in well-written code.
+ */
+
+import type { BrainEngine } from '../core/engine.ts';
+import { errorFor, serializeError } from '../core/errors.ts';
+import { resolveCodeReadiness, readinessHint } from '../core/code-graph-readiness.ts';
+import { resolveCliCodeScope, positionalArgs, parseFlag } from './code-scope.ts';
+import { codeReadFilter, type CodeReadScope } from '../core/code-intel/read-scope.ts';
+import { legacyNestedErrorDocument } from '../core/agent-output.ts';
+
+export interface CodeRefResult {
+  slug: string;
+  source_id: string;
+  file: string | null;
+  language: string | null;
+  symbol_name: string | null;
+  symbol_type: string | null;
+  start_line: number | null;
+  end_line: number | null;
+  snippet: string;
+}
+
+export async function findCodeRefs(
+  engine: BrainEngine,
+  symbol: string,
+  opts: { limit?: number; language?: string } & CodeReadScope = {},
+): Promise<CodeRefResult[]> {
+  const limit = opts.limit ?? 50;
+  const params: unknown[] = [`%${symbol}%`];
+  let whereLang = '';
+  if (opts.language) {
+    params.push(opts.language);
+    whereLang = `AND cc.language = $${params.length}`;
+  }
+  const whereSource = `AND ${codeReadFilter(params, opts)}`;
+  params.push(limit);
+  const rows = await engine.executeRaw<{
+    slug: string; source_id: string; file: string | null; language: string | null;
+    symbol_name: string | null; symbol_type: string | null;
+    start_line: number | null; end_line: number | null;
+    chunk_text: string;
+  }>(
+    `SELECT p.slug, p.source_id, (p.frontmatter->>'file') AS file, cc.language,
+            cc.symbol_name, cc.symbol_type, cc.start_line, cc.end_line,
+            cc.chunk_text
+     FROM content_chunks cc
+     JOIN pages p ON p.id = cc.page_id
+     WHERE p.page_kind = 'code'
+       AND cc.chunk_text ILIKE $1
+       ${whereLang}
+       ${whereSource}
+     ORDER BY p.slug, cc.start_line NULLS LAST, p.source_id
+     LIMIT $${params.length}`,
+    params,
+  );
+  return rows.map((r) => ({
+    slug: r.slug,
+    source_id: r.source_id,
+    file: r.file,
+    language: r.language,
+    symbol_name: r.symbol_name,
+    symbol_type: r.symbol_type,
+    start_line: r.start_line,
+    end_line: r.end_line,
+    snippet: r.chunk_text.slice(0, 500),
+  }));
+}
+
+function shouldEmitJson(args: string[]): boolean {
+  if (args.includes('--json')) return true;
+  if (args.includes('--no-json')) return false;
+  return !process.stdout.isTTY;
+}
+
+export async function runCodeRefs(engine: BrainEngine, args: string[]): Promise<void> {
+  const positional = positionalArgs(args);
+  const sym = positional[0];
+  if (!sym) {
+    const err = errorFor({
+      class: 'UsageError',
+      code: 'code_refs_requires_symbol',
+      message: 'code-refs requires a symbol name',
+      hint: 'gbrain code-refs <symbol> [--source S | --all-sources] [--lang <language>] [--json]',
+    });
+    if (shouldEmitJson(args)) {
+      console.log(JSON.stringify(legacyNestedErrorDocument(err.envelope, ['gbrain', 'code-refs', '--help'])));
+    } else {
+      console.error(err.message);
+    }
+    process.exit(2);
+  }
+  const limit = parseInt(parseFlag(args, '--limit') || '50', 10);
+  const language = parseFlag(args, '--lang');
+  // Outside the try, matching code-callers / code-callees: the helper signals
+  // usage failures with process.exit(2), and a surrounding catch would
+  // reclassify them as a generic exit-1 failure.
+  const { allSources, sourceId, scope, envelopeSourceId } = await resolveCliCodeScope(engine, {
+    sourceId: parseFlag(args, '--source'),
+    allSources: args.includes('--all-sources'),
+    jsonMode: shouldEmitJson(args),
+    command: 'code-refs',
+  });
+  try {
+    const results = await findCodeRefs(engine, sym, { limit, language, sourceId, allSources });
+    // Readiness is 'symbol' grain, scoped to the same source as the lookup.
+    // remote: false — direct CLI invocation is the trusted local caller.
+    const readiness = await resolveCodeReadiness(engine, {
+      kind: 'symbol', count: results.length, sourceId, allSources, remote: false,
+    });
+    const hint = readinessHint(readiness);
+    if (shouldEmitJson(args)) {
+      console.log(JSON.stringify({
+        symbol: sym,
+        source_id: envelopeSourceId,
+        scope,
+        count: results.length,
+        status: readiness.status,
+        ready: readiness.ready,
+        ...(hint ? { hint } : {}),
+        ...(readiness.scoped_source_id ? { scoped_source_id: readiness.scoped_source_id } : {}),
+        results,
+      }, null, 2));
+    } else {
+      if (results.length === 0) {
+        console.log(!allSources && sourceId
+          ? `No references found for "${sym}" in source '${sourceId}'.${!['projection_pending', 'unknown'].includes(readiness.status) ? ' Try --all-sources to search every source.' : ''}`
+          : `No references found for "${sym}"`);
+      } else {
+        console.log(`Found ${results.length} reference(s) to "${sym}":`);
+        for (const r of results) {
+          const loc = r.start_line != null ? `:${r.start_line}` : '';
+          const sig = r.symbol_name ? ` in ${r.symbol_name}` : '';
+          console.log(`  ${r.file || r.slug}${loc}${sig}`);
+        }
+      }
+      if (hint) console.log(hint);
+    }
+  } catch (e: unknown) {
+    const env = serializeError(e);
+    if (shouldEmitJson(args)) {
+      console.log(JSON.stringify({ error: env }));
+    } else {
+      console.error(`code-refs failed: ${env.message}`);
+    }
+    process.exit(1);
+  }
+}

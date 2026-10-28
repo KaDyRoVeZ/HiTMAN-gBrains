@@ -1,0 +1,362 @@
+# MCP surface runbook
+
+Operator moves for the remote MCP surface (honest per-token tools/list,
+per-client surfaces, strict-params grace period, STARTER_OPS). Current
+behavior only; release history lives in `CHANGELOG.md` + git. Companion references: the generated
+[`docs/TOOL_CATALOG.md`](../TOOL_CATALOG.md) (every non-localOnly op with
+scope/starter/gate), `docs/protocol/MEMORY_VERBS_v1.md` (surface modes),
+`docs/protocol/MCP_META_CHANNELS.md` (`_meta` conventions).
+
+The moves below assume `gbrain serve --http` (the OAuth transport); stdio
+surfaces come first.
+tools/list is recomputed **per request** — none of these moves needs a
+server restart unless it says so.
+
+## Stdio surfaces (the owner's pipe)
+
+A stdio `gbrain serve` resolves its surface once at start, then a session may
+widen it:
+
+| Precedence | Source | `surface_source` |
+|---|---|---|
+| 1 | `GBRAIN_SURFACE` in the server's env (`verbs`, `starter` or `full`) | `env` |
+| 2 | `--surface <verbs\|starter\|full>` | `flag` |
+| 3 | config `mcp_surface` | `config` |
+| 4 | `full` | `default` |
+
+`serve` prints `surface=<x> (source: …)` on stderr at start; `whoami`,
+`gbrain://capabilities` and the status-only `gbrain_status` report `surface`
+and `surface_source`. An invalid `GBRAIN_SURFACE` never stops the server: it
+is ignored with a stderr line, and the first successful tool result carries
+one `surface_env_invalid` info notice naming the surface actually served.
+`serve --http` ignores `GBRAIN_SURFACE` (its ceiling widens only through an
+explicit `--surface` restart; `GBRAIN_MCP_FORCE_SURFACE` narrows it).
+
+**Registrations.** Every stdio registration gbrain writes pins `starter`
+(`REGISTRATION_SURFACE` in `src/core/mcp-registration.ts`): readiness's
+`harness_wiring` fix, `gbrain init`'s quickstart line, `gbrain bootstrap
+hooks` for Claude Code, Codex and opencode, and the plugins.
+`gbrain init --surface` and `gbrain bootstrap hooks --surface` pick another.
+`bootstrap hooks` never narrows an existing install: a matching registration
+is kept untouched, and a replaced one keeps its form (a pinned `--surface x`
+stays `x`, a bare `serve` stays bare). The OpenClaw plugin manifest runs a
+bare `serve`, so config `mcp_surface` decides there.
+
+**Bootstrap starter gaps.** The tools bootstrap's workspace instructions name
+that `starter` lacks, with their CLI equivalents:
+
+| Tool | CLI equivalent |
+|---|---|
+| `get_timeline` | `gbrain timeline <slug>` |
+| `extract_facts` | `gbrain call extract_facts '<params_json>'` |
+
+A call to either on a starter session gets the hidden-tool hint below.
+
+**Session widening.** On the owner's stdio pipe, `request_tools {surface}`
+widens this session's tool set (never past `--access read-only` or
+`GBRAIN_MCP_FORCE_SURFACE`), sends `tools/list_changed`, and returns the new
+tools' schemas so a client that ignores `list_changed` can call them by name.
+Nothing is written; a new session starts at the registered surface. Each widen
+writes a `surface_widened from=<x> to=<y> op=request_tools` line on stderr.
+`gbrain config set mcp.allow_session_widen false` turns widening off; the
+hidden-tool hint then names the lasting route instead.
+
+```text
+→ tools/call get_health {}
+← unknown_tool: get_health exists, but this session serves the starter tool surface, which does not include it.
+  fix: request_tools {"surface":"full"}   next: run
+→ tools/call request_tools {"surface":"full"}
+← {"persisted":false,"scope":"session","surface":"full","previous":"starter","tools":[{"name":"get_health",…},…],
+   "note":"This session now serves 'full' (tools/list_changed was sent). Call the new tools by name now; …"}
+← notifications/tools/list_changed
+→ tools/call get_health {}
+← { …health report… }
+```
+
+For a lasting change, put `GBRAIN_SURFACE=full` in the harness's per-server
+env block (`claude mcp add gbrain -e GBRAIN_SURFACE=full -- …`, the `env`
+table of the Codex server entry, or the plugin's `GBRAIN_SURFACE` setting),
+never a shell profile: an inherited `GBRAIN_SURFACE` overrides every pinned
+`--surface` on the machine.
+
+## Move 1 — flip a publish gate
+
+Gated ops (`Operation.publishGateKey`): `list_skills` / `get_skill` /
+`list_brain_skillpack` (`mcp.publish_skills`) and `advisor`
+(`mcp.publish_advisor`). Both gates default OFF for remote HTTP callers: the
+ops are hidden from remote tools/list AND denied at call time. The read-only
+advisor defaults ON for the owner's local stdio server (an explicit `false`
+hides it there too).
+
+```bash
+gbrain config set mcp.publish_skills true      # or mcp.publish_advisor
+```
+
+**Expected outcome:** the very next tools/list from any token includes the
+gated ops (dual-plane read, DB > file, per request — no restart). Flipping
+back to `false` hides them again on the next list; the call-time backstop
+denies immediately with the machine-readable detail
+`config_key=mcp.publish_skills`. A failed gate READ during tools/list
+resolves to hidden (fail-closed consent posture), never a failed list.
+
+## Move 2 — rescope a client's surface
+
+```bash
+gbrain auth clients --usage            # who needs it? (op counts, surface, last seen)
+gbrain auth rescope-client <client_id> --surface starter   # verbs | starter | full | clear
+```
+
+Usage counts only successful calls (`success` / `success_with_warnings`) —
+a client flooding denials or errors shows zero usage, so denied traffic can
+never argue its way into a wider surface or the starter derivation.
+
+**Expected outcomes:**
+- The client's NEXT request resolves the new surface (per-request
+  ceiling-bounded resolution: `min(server --surface ceiling, client row)`)
+  — the client must re-issue tools/list to see the change; cached tool
+  lists in a long-lived session go stale until it does.
+- An audit row lands in `mcp_request_log` (`operation='surface_change'`,
+  params carrying actor/old/new/via) — every surface mutation writes one
+  (rescope CLI, admin endpoint, request_tools persist):
+
+```sql
+SELECT created_at, params FROM mcp_request_log
+ WHERE operation = 'surface_change' ORDER BY created_at DESC LIMIT 10;
+```
+
+- A CLI rescope sets `surface_set_by='operator'` — the operator lock:
+  `request_tools` persist cannot override it. (The persist itself is
+  rate-limited per client and meters actual writes only — `dry_run`
+  previews are free.)
+- The advisor's `mcp-client-fit` collector proposes exactly this command
+  for full-surface clients whose 30d usage fits STARTER_OPS.
+
+**Default for NULL-surface clients** (including future DCR
+self-registrations):
+
+```bash
+gbrain config set mcp.default_surface_dcr starter   # verbs | starter | full
+```
+
+Dual-plane read (DB > file), applied on each client's next request,
+ceiling-bounded like everything else; unset means NULL-surface clients
+resolve to the server ceiling. Pre-seed important
+clients with an explicit `rescope-client --surface full` before flipping it.
+
+## Move 3 — flip strict params from warn to reject
+
+`mcp.strict_params` governs unknown-argument handling at dispatch:
+`warn` (default) accepts the call, surfaces `_meta.warnings` + a
+model-visible notice block, and logs the success as
+`status='success_with_warnings'`; `reject` returns `invalid_params` with
+did-you-mean suggestions. The mode governs reads only: a write
+(`mutating: true`, such as `add_timeline_entry`, `put_page`, `remember`)
+rejects an unknown parameter in every mode, because the warn grace period
+would commit the row with the misnamed field dropped.
+
+**Flip criterion (evidence-based):** near-zero
+`success_with_warnings` rows over 30 days of production traffic —
+
+```sql
+SELECT count(*) FROM mcp_request_log
+ WHERE status = 'success_with_warnings'
+   AND created_at > now() - interval '30 days';
+```
+
+When that count is ~0, clients have adapted; flip:
+
+```bash
+gbrain config set mcp.strict_params reject
+```
+
+**Expected outcome (schema emission change):** besides rejecting unknown
+args, tools/list schemas change shape — each `inputSchema` closes with
+`additionalProperties: false` and declares the `_meta`/`dry_run`
+passthrough keys (D14.1), keeping schema-validating clients aligned with
+the server's reject posture. Read per request; flipping back to `warn`
+reopens the schemas on the next list. A transient config-read failure
+cannot re-open the grace period: dispatch holds the last successfully
+read mode per process, so a reject-mode server stays reject through a
+config outage. `test/mcp-tool-defs.test.ts` pins
+both emission states; the default stays `warn` until the project-level
+flip (see TODOS.md, strict_params reject-flip).
+
+## Move 4 — change STARTER_OPS
+
+```bash
+bun run scripts/derive-starter-ops.ts [--days 30]
+```
+
+reads production `mcp_request_log` through the shared usage reader
+(automation-shaped clients excluded, per-client DISTINCT-op sets weighted
+by client count), prints a proposed daily-driver block with a provenance
+header. Paste it into `src/mcp/surface.ts` (replacing
+`FALLBACK_DAILY_OPS`) — the script never edits files. Then:
+
+```bash
+bun test test/mcp-surface.test.ts        # membership + monotonicity: verbs ⊆ starter ⊆ full
+bun run scripts/generate-tool-catalog.ts # refresh the Starter column; freshness guard fails CI otherwise
+```
+
+`VERB_NAMES` + `whoami` + `request_tools` + the agent lane are composed in
+`surface.ts` and always included — the derivation only proposes the daily
+slice. The advisor's drift finding (`mcp_starter_ops_drift`) is the
+standing prompt to re-run this move.
+
+## Move 5 — expose `visibility: private` pages to remote callers (opt-out)
+
+Pages carrying `visibility: private` frontmatter are hidden from every
+remote/untrusted read path by default (fail-closed; trusted local CLI —
+`ctx.remote === false` — always sees everything). The gate covers search +
+recall's query arm, entity cards / context_pack / delta, and the page read
+ops: `get_page` / `fetch` / `list_pages`, `get_chunks` / `get_versions` /
+`get_timeline` / `get_raw_data`, `resolve_slugs`,
+`get_links` / `get_backlinks` / `traverse_graph`, and the list-style
+analytics ops `find_orphans` / `get_recent_salience` / `find_anomalies` /
+`find_experts`. Concrete rows and contributing pages are authorized inside
+the database before limits and aggregate calculations. A gated page reads exactly
+like a missing one (no existence oracle), and link/graph output never
+enumerates private slugs.
+
+Single-user brains where every connected agent is equally trusted can opt
+out:
+
+```bash
+gbrain config set search.remote_private_pages visible   # also accepts true / 1
+```
+
+**Expected outcome:** remote reads of private pages resolve again within
+~30s (the trust resolver caches the config per engine for 30s; no restart).
+Clearing the key (`gbrain config set search.remote_private_pages ''`)
+restores enforcement on the same schedule. Resolver:
+`src/core/search/private-visibility.ts`; a failed config read counts as
+"not opted out" (enforce).
+
+Page-visibility opt-outs do not change protected-body filtering: remote page
+and history bodies retain only world Facts and omit every Takes fence. History
+also checks snapshot visibility while page privacy is enforced. Malformed
+protected sections are omitted; unterminated or interleaved sections discard
+the remaining tail. Restricted salience counts only permitted active takes and
+ignores stored emotional weight; its recent window uses `updated_at` rather
+than take-driven salience touches.
+
+Semantic result caching is temporarily disabled even when configuration enables
+it. Searches run fresh, so repeated requests may cost more and take longer.
+Stored rows and cache maintenance remain available. Remote callers of
+`find_contradictions` get only findings whose two sides they can read now, each
+side re-read live with its source and trust tier; stored report text never
+leaves (docs/contradictions.md, "Trust posture").
+
+## Served instruction settings
+
+Three brain config keys change the text of the initialize instructions. Every
+transport reads them when a client initializes (a read error serves the
+defaults); the static contract, bootstrap's GBRAIN-INSTRUCTIONS.md and the SDK
+constructor fallback are always the defaults rendering.
+
+| Key | Default | Effect on the instructions |
+|---|---|---|
+| `entity.names_references` | `true` | Found `entity names` rows (and siblings) carry `referenced_by_count` and a row-level `next` to the full card; the brief clause says "a `names` row's `next` opens the card". `false` drops both. |
+| `entity.record_types` | empty | Comma-separated canonical page types whose referring pages a `names` row lists as `records`; when set, the brief clause says a `names` row lists `records` by type. |
+| `mcp.instructions_governing_rule` | `in_effect` | Instruction 7: the record whose terms are in effect on the date asked about governs, and a page's `date`/`effective_date` is when it was written. `newest` serves the earlier "prefer the newest governing source" sentence, for measuring the rule. |
+
+```bash
+gbrain config set entity.record_types contract,amendment
+gbrain config set mcp.instructions_governing_rule newest   # measurement arm only
+```
+
+Clients read the new text at their next initialize (reconnect the harness).
+
+## Incident levers
+
+- **`GBRAIN_REMOTE_PRIVATE_PAGES=1`** — operator escape hatch for the
+  private-pages gate (Move 5): the serving process exposes private pages to
+  remote callers regardless of config. Env wins over the config key; unset
+  it to restore the fail-closed default. Use it when the gate itself
+  misbehaves (e.g. a probe error blanking legitimate remote reads) while
+  you diagnose.
+- **`GBRAIN_MCP_FORCE_SURFACE=verbs|starter|full`** — narrow-only clamp
+  (FOV-6a): it `min()`s into every resolved surface and can NEVER widen
+  past the configured ceiling; widening requires an explicit `--surface`
+  restart. Use it to clamp a misbehaving deployment down to verbs without
+  touching client rows.
+- **`GBRAIN_SEARCH_SALVAGE=off`** — switches to all-or-nothing
+  retrieval (no allSettled salvage, strict budget, no minKeep failsafe)
+  if the fail-loud retrieval behavior itself misbehaves.
+
+**Total embed outage, what to expect (ENG-6):** semantic result caching
+remains disabled for both complete and partial degradations; neither reads
+nor writes a cached response. New searches report caching as disabled, while
+`gbrain search stats` can retain historical hits within its reporting window.
+Expect keyword-only degraded results carrying `_meta.retrieval.degraded`
+stages plus the model-visible block on empty results.
+
+## The honest-catalog metric (trend to zero)
+
+The working metric: op-level call-time denials the
+tools/list filter should have made impossible. serve-http logs them as
+`status='denied_after_list'` — scope denials, publish-gate backstop
+denials (`config_key=...`), and bound-client fence OP-level denials
+(`fence=op`). Argument-level slug-fence denials are legitimate for a
+listed op and excluded (D10).
+
+```sql
+SELECT count(*) FROM mcp_request_log
+ WHERE status = 'denied_after_list'
+   AND created_at > now() - interval '30 days';
+```
+
+A non-zero trend means list-time and call-time predicates drifted (a bug)
+or a client is calling ops it was never shown (staleness/guessing) —
+either way, worth a look at the offending rows' `token_name` + `operation`.
+
+## First 5 minutes after a deploy
+
+Migrate-then-serve is atomic per process (initSchema runs before listen).
+Post-deploy checks, in order:
+
+1. **tools/list count per token class** — for each token class you run
+   (admin/full, read/starter, agent-only, slug-bound): list tools and eyeball
+   the count (starter ≈ the STARTER_OPS size, full ≈ the TOOL_CATALOG count,
+   agent-only = its minimal lane). Counts are also queryable:
+   `SELECT token_name, params->>'tool_count' FROM mcp_request_log WHERE operation='tools/list' ORDER BY created_at DESC LIMIT 10;`
+2. **Empty-query probe shows the degraded block** — call `search` with a
+   nonsense query; the empty result must carry a second content block
+   ("0 results. … clean miss." or degraded stages) + `_meta.retrieval`.
+3. **Workerless submit warns** — `submit_agent` while no worker runs must
+   still succeed and carry `queue_state.warning` (worker_alive false).
+4. **put_page lint fields present** — put an uncited page; the response
+   must carry `writer_lint.top_findings` (or the zero-findings shape).
+
+### As a smoke-tests.d drop-in
+
+The smoke-test skill runs user scripts from `~/.gbrain/smoke-tests.d/*.sh`.
+Save the four checks as a drop-in (fill in URL + token):
+
+```bash
+#!/usr/bin/env bash
+# ~/.gbrain/smoke-tests.d/check-remote-mcp.sh — truthful-surface deploy checks
+set -euo pipefail
+URL="${GBRAIN_MCP_URL:?set GBRAIN_MCP_URL}"; TOK="${GBRAIN_MCP_TOKEN:?set GBRAIN_MCP_TOKEN}"
+call() { curl -sf "$URL" -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -d "$1"; }
+# 1. tools/list responds and reports a sane count
+N=$(call '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | grep -o '"name"' | wc -l)
+[ "$N" -gt 0 ] && echo "OK tools/list: $N tools" || { echo "FAIL tools/list"; exit 1; }
+# 2. empty search carries the model-visible degradation block
+call '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"query":"zzqx-no-such-thing-xkcd"}}}' \
+  | grep -q '0 results' && echo 'OK empty-result loudness' || { echo 'FAIL empty-result block'; exit 1; }
+# 3+4 need write/agent scopes — run only when the token has them:
+#   submit_agent → response contains "queue_state"; put_page → "writer_lint".
+```
+
+
+## Temporary code-inspection availability
+
+`code_def`, `code_refs`, `code_callers`, `code_callees`, `code_blast`, and
+`code_flow` are temporarily restricted to explicitly trusted local callers.
+Remote and unset-trust calls receive an availability error before code storage
+or traversal caches are read. Remote search also omits optional code-graph
+expansion. Rebuilding search chunks restores ordinary chunk retrieval; it does
+not lift this separate code-tool restriction. No remote permission override is
+available. Trusted local code commands retain their existing behavior.

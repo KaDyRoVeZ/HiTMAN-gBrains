@@ -1,0 +1,682 @@
+/**
+ * Contract tests for the v0.28 sources_* MCP ops.
+ *
+ * - Op metadata: pins scope, localOnly, mutating, and that each op exists in
+ *   the registered `operations` array (auto-flows through tool-defs).
+ * - Functional: invokes each op handler against a PGLite engine to confirm
+ *   the expected return shape.
+ * - Scope-enforcement smoke test: simulates the serve-http.ts:673 hasScope
+ *   gate so we know read-only tokens get insufficient_scope on sources_add.
+ *   Full HTTP-transport coverage lives in test/e2e/serve-http-oauth.test.ts.
+ */
+
+import { test, expect, describe, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { mkdirSync, writeFileSync, rmSync, chmodSync, existsSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { operations, OperationError } from '../src/core/operations.ts';
+import type { OperationContext, AuthInfo, Operation } from '../src/core/operations.ts';
+import { hasScope } from '../src/core/scope.ts';
+import { assertSourceInCallerScope, assertSourceInCallerWriteScope } from '../src/core/ops/context.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { withEnv } from './helpers/with-env.ts';
+
+let engine: PGLiteEngine;
+const FAKE_GIT_DIR = join(tmpdir(), `gbrain-sources-mcp-test-${process.pid}`);
+const GBRAIN_HOME = join(FAKE_GIT_DIR, 'gbrain-home');
+
+function writeFakeGit(): void {
+  mkdirSync(FAKE_GIT_DIR, { recursive: true });
+  const script = `#!/usr/bin/env bash
+has_clone=0
+has_remote_get_url=0
+for ((i=1; i<=$#; i++)); do
+  arg="\${!i}"
+  next_idx=$((i+1))
+  next="\${!next_idx:-}"
+  if [ "$arg" = "clone" ]; then has_clone=1; fi
+  if [ "$arg" = "remote" ] && [ "$next" = "get-url" ]; then has_remote_get_url=1; fi
+done
+if [ "$has_clone" = "1" ]; then
+  dest="\${@: -1}"
+  mkdir -p "$dest/.git"
+  echo "ref: refs/heads/main" > "$dest/.git/HEAD"
+  exit 0
+fi
+if [ "$has_remote_get_url" = "1" ]; then
+  echo "https://github.com/example/repo"
+  exit 0
+fi
+exit 0
+`;
+  const path = join(FAKE_GIT_DIR, 'git');
+  writeFileSync(path, script);
+  chmodSync(path, 0o755);
+}
+
+const fakePath = (): string => `${FAKE_GIT_DIR}:${process.env.PATH ?? ''}`;
+
+beforeAll(async () => {
+  writeFakeGit();
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+});
+
+afterAll(async () => {
+  await engine.disconnect();
+  rmSync(FAKE_GIT_DIR, { recursive: true, force: true });
+});
+
+beforeEach(async () => {
+  await resetPgliteState(engine);
+  rmSync(GBRAIN_HOME, { recursive: true, force: true });
+  mkdirSync(GBRAIN_HOME, { recursive: true });
+});
+
+/** Drop the write-source axis entirely — an explicit `sourceId: undefined` is not the same shape as an absent key. */
+function withoutSourceId(ctx: OperationContext): OperationContext {
+  const { sourceId: _drop, ...rest } = ctx;
+  void _drop;
+  return rest as OperationContext;
+}
+
+function findOp(name: string): Operation {
+  const op = operations.find(o => o.name === name);
+  if (!op) throw new Error(`op not found: ${name}`);
+  return op;
+}
+
+function ctxRemote(scopes: string[], allowedSources?: string[]): OperationContext {
+  const auth: AuthInfo = {
+    token: 'gbrain_at_xxx',
+    clientId: 'gbrain_cl_test',
+    clientName: 'test-client',
+    scopes,
+    expiresAt: Math.floor(Date.now() / 1000) + 3600,
+    ...(allowedSources ? { allowedSources } : {}),
+  };
+  return {
+    engine: engine as any,
+    config: { engine: 'pglite' } as any,
+    logger: { info() {}, warn() {}, error() {} },
+    dryRun: false,
+    remote: true,
+    auth,
+    sourceId: 'default',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Op metadata pins (auto-flow through tool-defs)
+// ---------------------------------------------------------------------------
+
+describe('sources_* op metadata', () => {
+  const expected: Array<{
+    name: string;
+    scope: NonNullable<Operation['scope']>;
+    mutating: boolean;
+    localOnly: boolean;
+  }> = [
+    { name: 'sources_add',    scope: 'sources_admin', mutating: true,  localOnly: false },
+    { name: 'sources_list',   scope: 'read',          mutating: false, localOnly: false },
+    { name: 'sources_remove', scope: 'sources_admin', mutating: true,  localOnly: false },
+    { name: 'sources_status', scope: 'read',          mutating: false, localOnly: false },
+  ];
+  for (const e of expected) {
+    test(`${e.name}: scope=${e.scope}, mutating=${e.mutating}, localOnly=${e.localOnly}`, () => {
+      const op = findOp(e.name);
+      expect(op.scope).toBe(e.scope);
+      expect(!!op.mutating).toBe(e.mutating);
+      expect(!!op.localOnly).toBe(e.localOnly);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Functional handler shape
+// ---------------------------------------------------------------------------
+
+describe('sources_* handlers — happy path', () => {
+  test('sources_add (with --url) clones, INSERTs, returns row', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const op = findOp('sources_add');
+      const ctx = ctxRemote(['sources_admin']);
+      const row = (await op.handler(ctx, {
+        id: 'mcp-add-test',
+        url: 'https://github.com/example/repo',
+        federated: true,
+      })) as any;
+      expect(row.id).toBe('mcp-add-test');
+      expect(row.config.remote_url).toBe('https://github.com/example/repo');
+      expect(row.config.federated).toBe(true);
+      expect(existsSync(join(row.local_path, '.git'))).toBe(true);
+    });
+  });
+
+  test('sources_list returns array with remote_url', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const addOp = findOp('sources_add');
+      await addOp.handler(ctxRemote(['sources_admin']), {
+        id: 'mcp-list-test',
+        url: 'https://github.com/example/repo',
+      });
+      const listOp = findOp('sources_list');
+      // #4433 wave-L: sources_list confines remote callers to their scope,
+      // so the listing caller needs a grant covering the source it asserts on.
+      const result = (await listOp.handler(ctxRemote(['read'], ['mcp-list-test']), {})) as any;
+      expect(Array.isArray(result.sources)).toBe(true);
+      const found = result.sources.find((s: any) => s.id === 'mcp-list-test');
+      expect(found).toBeDefined();
+      expect(found.remote_url).toBe('https://github.com/example/repo');
+    });
+  });
+
+  test('sources_status returns clone_state', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const addOp = findOp('sources_add');
+      await addOp.handler(ctxRemote(['sources_admin']), {
+        id: 'mcp-status-test',
+        url: 'https://github.com/example/repo',
+      });
+      const statusOp = findOp('sources_status');
+      // #4433 wave-L posture: every untrusted caller is confined through the
+      // canonical ladder, so the reader needs a grant covering the source it
+      // diagnoses (scalar-floor naming was superseded — see the negatives
+      // below).
+      const result = (await statusOp.handler(ctxRemote(['read'], ['mcp-status-test']), {
+        id: 'mcp-status-test',
+      })) as any;
+      expect(result.id).toBe('mcp-status-test');
+      expect(result.clone_state).toBe('healthy');
+      expect(result.remote_url).toBe('https://github.com/example/repo');
+    });
+  });
+
+  test('sources_status: FEDERATED grant confines — out-of-grant EXISTING id answers exactly like a nonexistent id', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const addOp = findOp('sources_add');
+      await addOp.handler(ctxRemote(['sources_admin']), {
+        id: 'mcp-fed-test',
+        url: 'https://github.com/example/repo',
+      });
+      const statusOp = findOp('sources_status');
+      // #4433 wave-L: any untrusted scope (federated grant here; scalar in
+      // the sibling test below) confines sources_status. Out-of-scope ids
+      // must answer not_found — indistinguishable from a nonexistent source
+      // (anti-enumeration).
+      const base = ctxRemote(['read']);
+      const fedCtx: OperationContext = {
+        ...base,
+        auth: { ...base.auth!, allowedSources: ['other-src'] },
+      };
+      const errFor = async (id: string): Promise<OperationError> => {
+        try {
+          await statusOp.handler(fedCtx, { id });
+        } catch (e) {
+          expect(e).toBeInstanceOf(OperationError);
+          return e as OperationError;
+        }
+        throw new Error(`expected sources_status(${id}) to throw for the federated caller`);
+      };
+      const existing = await errFor('mcp-fed-test');       // exists, out of grant
+      const nonexistent = await errFor('no-such-source');  // genuinely missing
+      expect(existing.code).toBe('not_found');
+      expect(nonexistent.code).toBe('not_found');
+      // Anti-enumeration pin: the two messages are IDENTICAL after id
+      // substitution — the error shape cannot be used as an existence oracle.
+      expect(existing.message.replaceAll('mcp-fed-test', '<id>'))
+        .toBe(nonexistent.message.replaceAll('no-such-source', '<id>'));
+    });
+  });
+
+  test('sources_status: SCALAR-bound remote caller is confined too (wave-L); trusted local never is', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const addOp = findOp('sources_add');
+      await addOp.handler(ctxRemote(['sources_admin']), {
+        id: 'mcp-scalar-test',
+        url: 'https://github.com/example/repo',
+      });
+      const statusOp = findOp('sources_status');
+      // ctxRemote pins sourceId 'default' with no federated grant — the
+      // wave-L ladder confines the caller to 'default', so an existing
+      // out-of-scope source answers not_found.
+      let threw: OperationError | null = null;
+      try {
+        await statusOp.handler(ctxRemote(['read']), { id: 'mcp-scalar-test' });
+      } catch (e) {
+        threw = e as OperationError;
+      }
+      expect(threw).toBeInstanceOf(OperationError);
+      expect(threw!.code).toBe('not_found');
+      // Trusted local keeps the full operator view regardless of sourceId.
+      const local: OperationContext = { ...ctxRemote(['read']), remote: false };
+      const res = (await statusOp.handler(local, { id: 'mcp-scalar-test' })) as any;
+      expect(res.id).toBe('mcp-scalar-test');
+      expect(res.clone_state).toBe('healthy');
+    });
+  });
+
+  test('sources_remove deletes row + clone (with confirm_destructive)', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const addOp = findOp('sources_add');
+      const row = (await addOp.handler(ctxRemote(['sources_admin']), {
+        id: 'mcp-remove-test',
+        url: 'https://github.com/example/repo',
+      })) as any;
+      const removeOp = findOp('sources_remove');
+      // Removal is WRITE authority: the caller's write source must BE the
+      // target (a federated read grant naming it does not count — see the
+      // fence test below). A freshly added source is outside the caller's
+      // authority until the operator rescopes the client's write source
+      // onto it (`gbrain auth rescope-client <id> --source mcp-remove-test`).
+      const result = (await removeOp.handler({ ...ctxRemote(['sources_admin']), sourceId: 'mcp-remove-test' }, {
+        id: 'mcp-remove-test',
+        confirm_destructive: true,
+      })) as any;
+      expect(result.clone_removed).toBe(true);
+      expect(existsSync(row.local_path)).toBe(false);
+    });
+  });
+
+  test('sources_remove: an UNBOUND remote sources_admin caller (no write source, no federated grant) keeps full authority', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const row = (await findOp('sources_add').handler(ctxRemote(['sources_admin']), {
+        id: 'mcp-remove-unbound',
+        url: 'https://github.com/example/repo',
+      })) as any;
+      // Operator-registered client with neither axis set: the pre-O4-1
+      // authority is unchanged (the fence is about BOUND callers).
+      const unbound: OperationContext = withoutSourceId(ctxRemote(['sources_admin']));
+      const result = (await findOp('sources_remove').handler(unbound, {
+        id: 'mcp-remove-unbound',
+        confirm_destructive: true,
+      })) as any;
+      expect(result.clone_removed).toBe(true);
+      expect(existsSync(row.local_path)).toBe(false);
+    });
+  });
+
+  test('sources_remove: untrusted caller is confined to its source scope; out-of-scope → not_found, nothing removed', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const addOp = findOp('sources_add');
+      const row = (await addOp.handler(ctxRemote(['sources_admin']), {
+        id: 'mcp-remove-fenced',
+        url: 'https://github.com/example/repo',
+      })) as any;
+      const removeOp = findOp('sources_remove');
+      const errFor = async (ctx: OperationContext, id: string): Promise<OperationError> => {
+        try {
+          await removeOp.handler(ctx, { id, confirm_destructive: true });
+        } catch (e) {
+          expect(e).toBeInstanceOf(OperationError);
+          return e as OperationError;
+        }
+        throw new Error(`expected sources_remove(${id}) to throw for the confined caller`);
+      };
+      // Scalar-bound remote caller (sourceId 'default', no federated grant):
+      // an existing out-of-scope source answers not_found and survives.
+      const scalar = await errFor(ctxRemote(['sources_admin']), 'mcp-remove-fenced');
+      expect(scalar.code).toBe('not_found');
+      // Federated grant that does not name the id: same answer.
+      const fed = await errFor(ctxRemote(['sources_admin'], ['other-src']), 'mcp-remove-fenced');
+      expect(fed.code).toBe('not_found');
+      // O4-1: a federated READ grant that DOES name the id is still not
+      // removal authority — federation is read-only by contract (contract.ts
+      // AuthInfo.allowedSources), so a client bound to write 'default' with
+      // federated_read [default, mcp-remove-fenced] cannot cascade-delete the
+      // sibling. Same not_found (stays hidden until the operator rescopes the
+      // WRITE source, not the read grant).
+      const fedNamed = await errFor(ctxRemote(['sources_admin'], ['default', 'mcp-remove-fenced']), 'mcp-remove-fenced');
+      expect(fedNamed.code).toBe('not_found');
+      expect(existsSync(row.local_path)).toBe(true);
+      // ...while that very grant still READS it: sources_status keeps the
+      // read ladder, so the two helpers diverge exactly on write authority.
+      const fedStatus = (await findOp('sources_status').handler(ctxRemote(['read'], ['default', 'mcp-remove-fenced']), { id: 'mcp-remove-fenced' })) as any;
+      expect(fedStatus.id).toBe('mcp-remove-fenced');
+      // A bound caller with a federated grant but NO write source removes nothing.
+      const noWrite = await errFor(withoutSourceId(ctxRemote(['sources_admin'], ['mcp-remove-fenced'])), 'mcp-remove-fenced');
+      expect(noWrite.code).toBe('not_found');
+      // Anti-enumeration: a genuinely missing id yields the IDENTICAL message
+      // after id substitution, so the error cannot be used as an existence oracle.
+      const missing = await errFor(ctxRemote(['sources_admin']), 'no-such-source');
+      expect(missing.code).toBe('not_found');
+      expect(fed.message.replaceAll('mcp-remove-fenced', '<id>'))
+        .toBe(missing.message.replaceAll('no-such-source', '<id>'));
+      // `remote: undefined` is untrusted too (fail-closed), same fence.
+      const undef = await errFor({ ...ctxRemote(['sources_admin']), remote: undefined as any }, 'mcp-remove-fenced');
+      expect(undef.code).toBe('not_found');
+      // The source and its clone are untouched.
+      expect(existsSync(row.local_path)).toBe(true);
+      const local: OperationContext = { ...ctxRemote(['read']), remote: false };
+      const status = (await findOp('sources_status').handler(local, { id: 'mcp-remove-fenced' })) as any;
+      expect(status.id).toBe('mcp-remove-fenced');
+      // Trusted local CLI keeps the full operator view and can remove it.
+      const result = (await removeOp.handler(
+        { ...ctxRemote(['sources_admin']), remote: false },
+        { id: 'mcp-remove-fenced', confirm_destructive: true },
+      )) as any;
+      expect(result.clone_removed).toBe(true);
+      expect(existsSync(row.local_path)).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scope-enforcement smoke test
+// Simulates serve-http.ts:673's hasScope gate. The full HTTP path (real
+// bearer auth + middleware) lives in test/e2e/serve-http-oauth.test.ts.
+// ---------------------------------------------------------------------------
+
+describe('sources_* scope enforcement (simulates serve-http gate)', () => {
+  function gate(op: Operation, grantedScopes: string[]): { allowed: boolean; required: string } {
+    const required = op.scope || 'read';
+    return { allowed: hasScope(grantedScopes, required), required };
+  }
+
+  test('read-only token is REJECTED for sources_add (sources_admin required)', () => {
+    const r = gate(findOp('sources_add'), ['read']);
+    expect(r.required).toBe('sources_admin');
+    expect(r.allowed).toBe(false);
+  });
+
+  test('read-only token is REJECTED for sources_remove', () => {
+    expect(gate(findOp('sources_remove'), ['read']).allowed).toBe(false);
+  });
+
+  test('read-only token is ALLOWED for sources_list (read-scoped)', () => {
+    expect(gate(findOp('sources_list'), ['read']).allowed).toBe(true);
+  });
+
+  test('read-only token is ALLOWED for sources_status (read-scoped)', () => {
+    expect(gate(findOp('sources_status'), ['read']).allowed).toBe(true);
+  });
+
+  test('sources_admin token is ALLOWED for all sources_* ops', () => {
+    const granted = ['sources_admin'];
+    expect(gate(findOp('sources_add'), granted).allowed).toBe(true);
+    expect(gate(findOp('sources_list'), granted).allowed).toBe(false); // sources_admin doesn't imply read (sibling axes)
+    expect(gate(findOp('sources_remove'), granted).allowed).toBe(true);
+    expect(gate(findOp('sources_status'), granted).allowed).toBe(false);
+  });
+
+  test('admin token is ALLOWED for all sources_* ops (admin implies all)', () => {
+    const granted = ['admin'];
+    expect(gate(findOp('sources_add'), granted).allowed).toBe(true);
+    expect(gate(findOp('sources_list'), granted).allowed).toBe(true);
+    expect(gate(findOp('sources_remove'), granted).allowed).toBe(true);
+    expect(gate(findOp('sources_status'), granted).allowed).toBe(true);
+  });
+
+  test('gstack /setup-gbrain Path 4 token (read + sources_admin) covers everything', () => {
+    const granted = ['read', 'sources_admin'];
+    expect(gate(findOp('sources_add'), granted).allowed).toBe(true);
+    expect(gate(findOp('sources_list'), granted).allowed).toBe(true);
+    expect(gate(findOp('sources_remove'), granted).allowed).toBe(true);
+    expect(gate(findOp('sources_status'), granted).allowed).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SSRF rejection at the op layer
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// v0.28.1 codex hardening: remote callers cannot override path/clone_dir
+// (those are local-CLI-only — remote sources_admin is for managing federated
+// remote URLs, not arbitrary host-path writes).
+// ---------------------------------------------------------------------------
+
+// The READ scope→allowed→not_found ladder sources_status uses (#4433 wave-L;
+// sources_remove moved to the write twin below), as a unit: the four caller
+// shapes that decide it.
+describe('assertSourceInCallerScope (shared confinement helper)', () => {
+  const base = (): OperationContext => ({
+    engine: engine as any,
+    config: { engine: 'pglite' } as any,
+    logger: { info() {}, warn() {}, error() {} },
+    dryRun: false,
+    remote: true,
+    sourceId: 'alpha',
+  });
+
+  test('scalar-bound remote caller: only its own source passes; anything else is not_found', () => {
+    const ctx = base();
+    expect(() => assertSourceInCallerScope(ctx, 'alpha')).not.toThrow();
+    let err: unknown;
+    try { assertSourceInCallerScope(ctx, 'beta'); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(OperationError);
+    expect((err as OperationError).code).toBe('not_found');
+    expect((err as OperationError).message).toBe('Unknown source: beta');
+  });
+
+  test('federated grant wins over the scalar bind: every granted id passes, the bound-but-ungranted one does not', () => {
+    const ctx: OperationContext = { ...base(), auth: { ...ctxRemote(['read'], ['beta', 'gamma']).auth! } };
+    expect(() => assertSourceInCallerScope(ctx, 'beta')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'gamma')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'alpha')).toThrow('Unknown source: alpha');
+    expect(() => assertSourceInCallerScope(ctx, 'ghost')).toThrow('Unknown source: ghost');
+  });
+
+  test('remote: undefined is untrusted (fail-closed) — confined exactly like remote: true', () => {
+    const ctx = { ...base(), remote: undefined as unknown as boolean };
+    expect(() => assertSourceInCallerScope(ctx, 'alpha')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'beta')).toThrow('Unknown source: beta');
+  });
+
+  test('trusted local (remote === false) passes unconditionally — even an id that exists nowhere', () => {
+    const ctx = { ...base(), remote: false };
+    expect(() => assertSourceInCallerScope(ctx, 'alpha')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'beta')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'does-not-exist')).not.toThrow();
+  });
+});
+
+// The WRITE-authority twin sources_remove uses (O4-1): federation is read
+// authority by contract, so the destructive op keys on the write source only.
+describe('assertSourceInCallerWriteScope (destructive-op confinement helper)', () => {
+  const base = (): OperationContext => ({
+    engine: engine as any,
+    config: { engine: 'pglite' } as any,
+    logger: { info() {}, warn() {}, error() {} },
+    dryRun: false,
+    remote: true,
+    sourceId: 'alpha',
+  });
+  const notFound = (ctx: OperationContext, id: string): void => {
+    let err: unknown;
+    try { assertSourceInCallerWriteScope(ctx, id); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(OperationError);
+    expect((err as OperationError).code).toBe('not_found');
+    expect((err as OperationError).message).toBe(`Unknown source: ${id}`);
+  };
+
+  test('scalar-bound remote caller: only its write source passes; anything else is not_found', () => {
+    const ctx = base();
+    expect(() => assertSourceInCallerWriteScope(ctx, 'alpha')).not.toThrow();
+    notFound(ctx, 'beta');
+    notFound(ctx, 'ghost');
+  });
+
+  test('a federated READ grant naming the id confers nothing — the read helper passes it, the write helper does not', () => {
+    const ctx: OperationContext = { ...base(), auth: { ...ctxRemote(['sources_admin'], ['beta', 'gamma']).auth! } };
+    // Read ladder (sources_status): granted ids pass, the bound-but-ungranted write source does not.
+    expect(() => assertSourceInCallerScope(ctx, 'beta')).not.toThrow();
+    expect(() => assertSourceInCallerScope(ctx, 'alpha')).toThrow('Unknown source: alpha');
+    // Write ladder (sources_remove): ONLY the write source passes.
+    expect(() => assertSourceInCallerWriteScope(ctx, 'alpha')).not.toThrow();
+    notFound(ctx, 'beta');
+    notFound(ctx, 'gamma');
+    notFound(ctx, 'ghost');
+  });
+
+  test('write authority is ctx.auth.sourceId, falling back to ctx.sourceId (same notion as delete_page/restore_page)', () => {
+    const ctx: OperationContext = { ...base(), auth: { ...ctxRemote(['sources_admin']).auth!, sourceId: 'beta' } };
+    expect(() => assertSourceInCallerWriteScope(ctx, 'beta')).not.toThrow();
+    notFound(ctx, 'alpha');
+  });
+
+  test('bound by a federated grant with NO write source: nothing is removable', () => {
+    const ctx: OperationContext = withoutSourceId({ ...base(), auth: { ...ctxRemote(['sources_admin'], ['alpha', 'beta']).auth! } });
+    notFound(ctx, 'alpha');
+    notFound(ctx, 'beta');
+    // An empty federated array is still a binding (fail-closed), not "unbound".
+    const empty: OperationContext = withoutSourceId({ ...base(), auth: { ...ctxRemote(['sources_admin']).auth!, allowedSources: [] } });
+    notFound(empty, 'alpha');
+  });
+
+  test('the __all__ sentinel is never a write source for an untrusted caller', () => {
+    const ctx: OperationContext = { ...base(), sourceId: '__all__' };
+    notFound(ctx, 'alpha');
+    notFound(ctx, '__all__');
+  });
+
+  test('UNBOUND remote caller (no write source, no federated grant) keeps full authority — unchanged', () => {
+    const ctx: OperationContext = withoutSourceId(base());
+    expect(() => assertSourceInCallerWriteScope(ctx, 'alpha')).not.toThrow();
+    expect(() => assertSourceInCallerWriteScope(ctx, 'anything')).not.toThrow();
+    const withAuth: OperationContext = { ...ctx, auth: { ...ctxRemote(['sources_admin']).auth! } };
+    expect(() => assertSourceInCallerWriteScope(withAuth, 'anything')).not.toThrow();
+  });
+
+  test('remote: undefined is untrusted (fail-closed) — confined exactly like remote: true', () => {
+    const ctx = { ...base(), remote: undefined as unknown as boolean };
+    expect(() => assertSourceInCallerWriteScope(ctx, 'alpha')).not.toThrow();
+    notFound(ctx, 'beta');
+  });
+
+  test('trusted local (remote === false) passes unconditionally', () => {
+    const ctx = { ...base(), remote: false };
+    expect(() => assertSourceInCallerWriteScope(ctx, 'alpha')).not.toThrow();
+    expect(() => assertSourceInCallerWriteScope(ctx, 'beta')).not.toThrow();
+    expect(() => assertSourceInCallerWriteScope(ctx, 'does-not-exist')).not.toThrow();
+  });
+});
+
+describe('sources_add — remote callers ignore path/clone_dir overrides', () => {
+  test('remote sources_admin: clone_dir override is silently ignored', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const op = findOp('sources_add');
+      const ctx = ctxRemote(['sources_admin']);
+      const row = (await op.handler(ctx, {
+        id: 'attack-clone-dir',
+        url: 'https://github.com/example/repo',
+        clone_dir: '/etc/gbrain-pwned',  // attacker-supplied
+      })) as any;
+      // Clone landed at the SAFE default, not /etc/gbrain-pwned.
+      expect(row.local_path).not.toBe('/etc/gbrain-pwned');
+      // defaultCloneDir → gbrainPath('clones', id) → join, so '\' on win32.
+      expect(row.local_path).toContain(join('clones', 'attack-clone-dir'));
+      // /etc/gbrain-pwned was never written.
+      expect(existsSync('/etc/gbrain-pwned')).toBe(false);
+    });
+  });
+
+  test('remote sources_admin: path override (without url) is rejected with an error', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const op = findOp('sources_add');
+      const ctx = ctxRemote(['sources_admin']);
+      // Remote callers must not silently succeed when passing path — the call
+      // should fail so the client knows the source was NOT registered with a
+      // usable local_path. Silent success + null local_path means sync --all
+      // skips the source forever (#3645).
+      await expect(op.handler(ctx, {
+        id: 'attack-path',
+        path: '/etc',
+      })).rejects.toThrow(/path.*clone_dir.*not honored|confinement/i);
+    });
+  });
+
+  test('local CLI caller (ctx.remote=false) keeps clone_dir override', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const op = findOp('sources_add');
+      // Simulate trusted local CLI: ctx.remote = false, no auth needed.
+      const ctxLocal: OperationContext = {
+        engine: engine as any,
+        config: { engine: 'pglite' } as any,
+        logger: { info() {}, warn() {}, error() {} },
+        dryRun: false,
+        remote: false,
+        sourceId: 'default',
+      };
+      const customDir = join(GBRAIN_HOME, 'custom-clones', 'local-override');
+      const row = (await op.handler(ctxLocal, {
+        id: 'local-override',
+        url: 'https://github.com/example/repo',
+        clone_dir: customDir,
+      })) as any;
+      // Local CLI is trusted: the override took effect.
+      expect(row.local_path).toBe(customDir);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.28.1 codex hardening: listSources honors include_archived flag
+// ---------------------------------------------------------------------------
+
+describe('sources_list — include_archived honored (was silently leaking)', () => {
+  test('default: archived sources are NOT returned', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      // Add source then archive it.
+      const addOp = findOp('sources_add');
+      await addOp.handler(ctxRemote(['sources_admin']), {
+        id: 'archived-src',
+        url: 'https://github.com/example/repo',
+      });
+      await engine.executeRaw(
+        `UPDATE sources SET archived = true WHERE id = $1`,
+        ['archived-src'],
+      );
+
+      const listOp = findOp('sources_list');
+      // #4433 wave-L: grant covers the archived source, so the absence below
+      // pins the archived filter itself rather than the scope confinement.
+      const result = (await listOp.handler(ctxRemote(['read'], ['archived-src']), {})) as any;
+      const found = result.sources.find((s: any) => s.id === 'archived-src');
+      expect(found).toBeUndefined();
+    });
+  });
+
+  test('include_archived: true returns archived sources', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const addOp = findOp('sources_add');
+      await addOp.handler(ctxRemote(['sources_admin']), {
+        id: 'archived-included',
+        url: 'https://github.com/example/repo',
+      });
+      await engine.executeRaw(
+        `UPDATE sources SET archived = true WHERE id = $1`,
+        ['archived-included'],
+      );
+
+      const listOp = findOp('sources_list');
+      const result = (await listOp.handler(ctxRemote(['read'], ['archived-included']), {
+        include_archived: true,
+      })) as any;
+      const found = result.sources.find((s: any) => s.id === 'archived-included');
+      expect(found).toBeDefined();
+    });
+  });
+});
+
+describe('sources_add SSRF gate (delegated to parseRemoteUrl)', () => {
+  test('rejects RFC1918 192.168.x.x with structured error', async () => {
+    await withEnv({ GBRAIN_HOME, PATH: fakePath() }, async () => {
+      const op = findOp('sources_add');
+      try {
+        await op.handler(ctxRemote(['sources_admin']), {
+          id: 'ssrf-bad',
+          url: 'https://192.168.1.1/x.git',
+        });
+        throw new Error('expected throw');
+      } catch (e) {
+        // The handler raises SourceOpError(invalid_remote_url). At the
+        // dispatch layer this gets serialized as a normal error response.
+        expect((e as Error).name).toBe('SourceOpError');
+        expect((e as any).code).toBe('invalid_remote_url');
+      }
+    });
+  });
+});

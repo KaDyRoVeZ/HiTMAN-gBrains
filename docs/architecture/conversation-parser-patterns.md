@@ -1,0 +1,221 @@
+# Conversation parser patterns
+
+The conversation parser turns exported chat and meeting transcripts into a
+common message stream without requiring an LLM call for known formats. This
+document describes the built-in pattern contract and the checks required when
+adding or changing a format.
+
+## Data flow
+
+`parseConversation` uses this sequence:
+
+1. Resolve the page date and timezone context.
+2. Score every enabled built-in and user pattern against the first ten
+   non-blank lines.
+3. Re-score the full body when the head score is inconclusive, or when a broad
+   pattern explicitly requires full-body scoring.
+4. Reject the winner when its acceptance score is below the false-positive
+   floor.
+5. Apply the winning pattern to every line and attach supported continuation
+   lines to the preceding message. Speaker-object transcripts instead reject
+   unsupported candidate regions rather than attributing their text to a speaker.
+6. Optionally run LLM polish or fallback when those features are enabled.
+
+Pattern order is only a tie-breaker. A new regex must be structurally distinct
+from neighboring formats; moving it earlier in the registry is not a valid
+non-shadowing strategy.
+
+## Built-in pattern contract
+
+Every `PatternEntry` in `builtins.ts` declares:
+
+- A stable, kebab-case `id`.
+- A hand-vetted line regex and explicit capture-group indexes.
+- Where the date comes from and how the time is represented.
+- A timezone policy.
+- Whether the format supports multi-line message bodies.
+- Positive and negative samples that run during module initialization.
+- A documentation pointer describing the source format.
+
+The registry refuses to load when a positive sample stops matching, a negative
+sample starts matching, or a capture map becomes invalid. This catches local
+regex mistakes before extraction can silently produce empty conversations.
+
+### Date and timezone rules
+
+Formats with an inline date should capture it from each message. Time-only
+formats use an explicit caller fallback first, then the page frontmatter date,
+then the page effective date. If none is available, the parser uses
+`1970-01-01` so the missing date remains visible instead of inventing a current
+date.
+
+Time-only formats normally use `utc_assumed_with_warn`. The parser constructs a
+UTC timestamp and returns a timezone warning when the page does not provide a
+timezone. A new pattern should not imply local-time precision that the source
+format does not contain.
+
+### Multi-line messages
+
+An anchor regex identifies the first line of a message. Subsequent non-anchor
+lines are appended to that message until another anchor appears. Set
+`multi_line: true` when continuation content is part of the documented format,
+such as Markdown bullets, blockquotes, or an exported message body on the next
+line.
+
+Tests for a multi-line format should assert the complete message text, including
+newlines. A message-count assertion alone will not detect lost bullets or a
+continuation attached to the wrong speaker.
+
+### Scoring and false positives
+
+The score compares matched anchors with the pattern's relevant candidate lines.
+The first pass uses the head of the page for speed. Low-confidence pages are
+re-scored across the full body before the parser accepts a winner.
+
+Multi-line formats may opt into `score_continuations_as_body` when their anchor
+grammar is distinctive. Candidate-only scoring activates only after two anchors
+match, or when the first non-blank line is an anchor. This evidence threshold
+lets a single long message keep its continuation body without turning one stray
+anchor in a prose page into a conversation. Candidate anchor lines that fail the
+full regex still lower the score. Other patterns continue to use all non-blank
+lines in their density score.
+
+If the anchor grammar is a plausible label in ordinary prose about the same
+subject (rather than distinctive like a bold name plus a valid timestamp),
+also set `score_continuations_min_distinct_speakers` to require that many
+DISTINCT captured speaker values before candidate-only scoring activates. This
+closes a narrower false-positive class than `score_full_body`: without it, a
+page that merely repeats one role's anchor label — or opens with a single
+anchor — gets the same density-exclusion immunity a genuine multi-party
+exchange gets, no matter how much surrounding prose exists.
+
+Distinct-speaker count alone still lets one genuine multi-party anchor group
+(all required roles present) through when it is merely embedded somewhere
+inside an otherwise unrelated long document. Also set
+`score_continuations_max_preamble_lines` to additionally require the FIRST
+fully-matching anchor line to land at or before that index in the scored
+lines. A short title or heading before the transcript starts still qualifies;
+an anchor group appearing well past the bound falls back to the ordinary
+flat-density score instead.
+
+Use `score_full_body: true` for a broad grammar that also occurs in ordinary
+prose. For example, `**Label:** text` can be either a transcript line or a bold
+label in meeting notes. Narrow formats with a timestamp and a distinctive
+separator generally do not need this override.
+
+`quick_reject` is a performance hint, not an acceptance rule. It should cheaply
+exclude obviously unrelated lines while admitting every string accepted by the
+main regex.
+
+## Normalized Slack Markdown
+
+The `bold-time-dash` pattern parses message anchors shaped like:
+
+```text
+**Alice Example** 09:15 — first message
+- supporting detail
+**Bob Example** 09:18 — second message
+```
+
+Its grammar is:
+
+```text
+**speaker** H:MM <dash> text
+```
+
+where:
+
+- `H:MM` is a valid 24-hour time from `0:00` through `23:59`.
+- `<dash>` may be an em dash (`—`), en dash (`–`), or ASCII hyphen (`-`).
+- The date comes from the resolved page date context.
+- Continuation lines belong to the preceding message.
+- The captured clock value is emitted with `Z`. Timezone metadata suppresses
+  the missing-timezone warning but is not currently used for IANA conversion.
+
+The required time and dash distinguish it from all existing bold-speaker
+formats:
+
+- `**Speaker** (09:15): text` uses `bold-paren-time`.
+- `**Speaker** (9:15 AM): text` uses `bold-paren-time-12h`.
+- `**Speaker:** text` uses `bold-name-no-time`. Its `repeat_speaker_min_turns: 3` structure gate returns no_match when three or more turns never repeat a speaker — a status note's `**Status:**`/`**Owner:**`/`**Next step:**` labels are not a conversation (gbrain-evals N12-1). A bold label that is exactly a meeting-note metadata label (`METADATA_LABELS` in `builtins.ts`: Attendees, Date, Location, Summary, Agenda, Action items and similar, case-insensitive) is never a speaker, so `**Attendees:**` / `**Date:**` header lines on meeting notes are not turns.
+- `**Speaker** (2026-04-09 9:15 AM): text` uses `imessage-slack`.
+
+Keeping these examples in both `test_negative` and parser regression tests makes
+the non-shadowing contract executable.
+
+## Email threads
+
+`email-thread-heading` reads gbrain's Gmail thread page
+(`src/core/google/google-render.ts`): one `## <From> · YYYY-MM-DD HH:MM` heading
+per message, `## → <From> · …` for a sent message, the message body below it.
+The speaker is the From display name (the `<address>` and quotes are dropped;
+a bare address stays as is) and the heading time is UTC. Because each anchor
+carries its own date, other headings in an email body are message text, not
+folded speakers. extract-conversation-facts treats a thread as one
+conversation: unless the page sets `conversation_segment_gap_minutes`, the
+segment gap is the 7-day maximum instead of 30 minutes.
+
+## Meeting notes and undated pages
+
+On a brain without managed persistence, a meeting or email page that yields no
+speaker turns and has the shape of meeting notes or a calendar event
+(`looksLikeMeetingNotes`: a bold metadata label line, or an Attendees /
+Participants / Agenda / Action items section) is recorded as scanned, not
+extractable, when no LLM fallback is configured, and so is a one-message email
+thread (an email, not a conversation); they leave the backlog until the page
+changes. Other speaker-less pages, and these pages on a managed brain, stay
+retryable. A time-only parse on a page with no date would place every turn on
+1970-01-01; extract-conversation-facts records it as not extractable instead
+(adding a `date:` reopens it). The parser itself still reports those
+timestamps.
+
+## Single-quoted speaker objects
+
+The `python-dict-utterance` pattern recognizes this narrow export shape without
+evaluating Python or guessing a person's identity:
+
+```text
+{'source': 'microphone', 'attribution': 'me'}: hello
+{'source': 'speaker', 'name': 'alice-example', 'attribution': 'them'}: hi
+```
+
+`source` and `attribution` must be `microphone`/`me` or `speaker`/`them`.
+An optional explicit `name` wins regardless of field order. Names are 1–80
+letters, digits, spaces, periods, underscores, or hyphens, starting with a
+letter or digit. Unknown or duplicate keys, conflicting pairs, nested values,
+escaped names, JSON-style quoting, and multiline utterances are not supported.
+
+A bare transcript must start with a complete supported speaker header, apart
+from date headings and blank or fenced-code lines. A dedicated `Transcript`
+heading may follow summary sections. Quoted/nested wrappers cannot open that
+section, and unsupported lines inside a candidate invalidate the candidate
+rather than exposing interior examples as speakers. Fenced and indented code
+cannot open speakers; excluded lines still count toward the density threshold.
+A following non-date heading ends the section without erasing its genuine
+turns. Dates use the existing page-date fallback and recognized date headings.
+
+**Say to your agent:** *"Preview this conversation and tell me whether its
+speakers can be read without guessing."* The agent can use
+`gbrain extract-conversation-facts --source-id default --slug conversations/example --dry-run`;
+the preview does not call a model or mark the page complete.
+
+## Adding a built-in format
+
+1. Collect multiple anonymized examples, including separator and timestamp
+   variants that occur in the same export family.
+2. Choose the narrowest grammar that represents the format. Constrain numeric
+   fields such as hours and minutes when possible.
+3. Add at least two positive module-load samples and negative samples for every
+   neighboring pattern that could plausibly overlap.
+4. Add parser tests that verify speakers, timestamps, text, continuation
+   handling, and non-shadowing behavior.
+5. Add a dedicated JSONL fixture and include the same cases in
+   `test/fixtures/conversation-formats/all.jsonl`.
+6. Run the focused parser tests and the fixture evaluator.
+7. Run the repository verification and full test suites before submission.
+8. Update `docs/architecture/KEY_FILES.md` when the registry count or supported
+   format inventory changes.
+
+Use generic fixture identities such as `Alice Example`, `Bob Example`, and
+`Summary Bot`. Never copy real transcript names or private content into source,
+tests, documentation, commits, or pull-request descriptions.

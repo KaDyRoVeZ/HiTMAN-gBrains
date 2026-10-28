@@ -1,0 +1,207 @@
+/**
+ * Shared helpers for schema migrations (src/core/schema-migrations/v<NNN>-*.ts).
+ *
+ * Leaf module: migration files and the runner in src/core/migrate.ts import
+ * from here; nothing under src/core/schema-migrations/ may import migrate.ts
+ * (ESM import cycle -> TDZ at module load, including in the compiled binary).
+ */
+import type { BrainEngine } from '../engine.ts';
+import { analyzeDeferred, lockTableForAnalyze } from '../analyze-lock.ts';
+import { migrationStatementTimeoutMs } from '../migration-timeout.ts';
+import { withSchemaLockTimeout } from '../postgres-engine/schema-lock-timeout.ts';
+
+/**
+ * When true, per-migration explanatory notices (e.g. the v123/v124 "here is
+ * what this migration changed" lines that specific handlers write to stderr)
+ * are suppressed. Set by runMigrations for a FRESH-install full replay — those
+ * notices are useful diagnostics on an UPGRADE but pure noise as a new user's
+ * first-run output. Module-level (not threaded through the Migration type)
+ * because only a couple of handlers emit them. Guarded via `migrationNotice`.
+ * Known limitation: concurrent runMigrations calls in one process (two engines
+ * migrating simultaneously) share this flag — worst case is a suppressed or
+ * extra stderr NOTICE line; migration execution/stamping is unaffected.
+ */
+let quietMigrationNotices = false;
+
+/** Write a per-migration explanatory notice unless fresh-install quiet mode is
+ *  on. Handlers should route their "what changed" lines through this. */
+export function migrationNotice(line: string): void {
+  if (quietMigrationNotices) return;
+  process.stderr.write(line);
+}
+
+/** Runner-only: toggles fresh-install quiet mode for `migrationNotice`. */
+export function setQuietMigrationNotices(quiet: boolean): void {
+  quietMigrationNotices = quiet;
+}
+
+/**
+ * Postgres-only: drops `indexName` iff it currently exists AND is invalid — the
+ * leftover of a `CREATE INDEX CONCURRENTLY` that failed partway through. Callers
+ * MUST already be inside an `engine.kind === 'postgres'` branch (PGLite has no
+ * concurrent-build invalid-index concept and no `pg_index` catalog in the same
+ * shape) and MUST run this before their own `CREATE INDEX CONCURRENTLY IF NOT
+ * EXISTS`, since a stale invalid entry blocks the create from ever landing.
+ *
+ * Deliberately does NOT wrap the drop in `DO $$ ... EXECUTE '...' END $$`
+ * (#1178): Postgres rejects `CONCURRENTLY` from any function/EXECUTE context —
+ * the guard condition works, but the EXECUTE that follows always throws
+ * "DROP INDEX CONCURRENTLY cannot be executed from a function". The validity
+ * probe runs as a plain application-level SELECT instead, and the DROP (when
+ * needed) runs as its own top-level `runMigration` call.
+ */
+export async function dropInvalidConcurrentIndex(
+  engine: BrainEngine,
+  version: number,
+  indexName: string,
+): Promise<boolean> {
+  // to_regclass() resolves the unqualified name through search_path — the same
+  // resolution the unqualified DROP below relies on — instead of matching
+  // pg_class.relname bare, which could hit a same-named index in a different
+  // schema on a non-default search_path (codex review, #1178).
+  const rows = await engine.executeRaw<{ invalid: boolean }>(
+    `SELECT NOT i.indisvalid AS invalid
+       FROM pg_index i
+      WHERE i.indexrelid = to_regclass($1)`,
+    [indexName],
+  );
+  const isInvalid = rows.some((r) => r.invalid);
+  if (isInvalid) {
+    await engine.runMigration(version, `DROP INDEX CONCURRENTLY IF EXISTS ${indexName};`);
+  }
+  return isInvalid;
+}
+
+/**
+ * Runs one migration statement outside a transaction: a `transaction: false` migration's SQL (runMigrationSQL), or a
+ * statement its handler runs on its own, such as a VALIDATE CONSTRAINT that must not hold the ALTER's lock. PGLite
+ * runs it as is.
+ *
+ * Postgres can't use SET LOCAL without a transaction or a plain SET on the
+ * pooled connection (it leaks to other queries), so this reserves a dedicated
+ * backend and sets session-level statement_timeout on just that connection.
+ * On Supabase (both PgBouncer 6543 and direct 5432) a server-level
+ * statement_timeout of ~2 min is enforced; without this override a CREATE
+ * INDEX CONCURRENTLY or a VALIDATE on a large table hits it and aborts.
+ * #5227 (W14 P1.6): the lock wait is bounded session-level on the same backend
+ * and restored after. #6543 (A4): the raised statement_timeout is restored too,
+ * so the connection does not carry the migration's budget back to the pool.
+ */
+export async function runMigrationStatement(engine: BrainEngine, version: number, sql: string): Promise<void> {
+  if (engine.kind !== 'postgres') { await engine.runMigration(version, sql); return; }
+  await engine.withReservedConnection(async (conn) => {
+    try {
+      await conn.executeRaw(`SET statement_timeout = '${migrationStatementTimeoutMs()}'`);
+    } catch {
+      // Non-fatal: some managed Postgres may restrict this GUC; the statement then runs with the server default.
+    }
+    try {
+      await withSchemaLockTimeout({ unsafe: (query: string) => conn.executeRaw(query) }, () => conn.executeRaw(sql), { step: `migration v${version}` });
+    } finally {
+      await conn.executeRaw('RESET statement_timeout').catch(() => {});
+    }
+  }, { selfContained: true });
+}
+
+export type OnlineIndexOutcome = 'present' | 'created' | 'rebuilt' | 'building';
+
+/**
+ * #5762: build one index without blocking writers. PGLite runs the plain
+ * `CREATE INDEX IF NOT EXISTS`. Postgres leaves a valid index alone, reports
+ * one another session is still building, drops an INVALID leftover of an
+ * interrupted concurrent build, then runs `CREATE INDEX CONCURRENTLY IF NOT
+ * EXISTS` (`CREATE UNIQUE INDEX CONCURRENTLY` for a unique one) on a dedicated connection under the session's startup timeouts, then
+ * confirms the index is valid. Callers build one index at a time;
+ * a lock timeout leaves an INVALID index that the next call drops and rebuilds.
+ * After a create or rebuild, `analyzeAfterIndexBuild` refreshes the table's
+ * planner statistics (lhf wave 2 item 6).
+ */
+export async function buildIndexOnline(
+  engine: BrainEngine,
+  version: number,
+  index: { name: string; table: string; sql: string },
+  opts: { notice?: (line: string) => void; rebuild?: string } = {},
+): Promise<OnlineIndexOutcome> {
+  if (engine.kind !== 'postgres') {
+    const [row] = await engine.executeRaw<{ present: boolean }>('SELECT to_regclass($1) IS NOT NULL AS present', [index.name]);
+    if (row?.present) return 'present';
+    opts.notice?.(`  building ${index.name} on ~${await tableRows(engine, index.table)} rows, then analyzing ${index.table}\n`);
+    await engine.runMigration(version, index.sql);
+    await analyzeAfterIndexBuild(engine, index);
+    return 'created';
+  }
+  const [row] = await engine.executeRaw<{ valid: boolean; building: boolean }>(
+    `SELECT i.indisvalid AS valid, EXISTS (SELECT 1 FROM pg_stat_progress_create_index p
+        WHERE p.relid=i.indrelid AND p.index_relid IN (i.indexrelid, 0)) AS building
+       FROM pg_index i WHERE i.indexrelid = to_regclass($1)`,
+    [index.name],
+  );
+  if (row?.valid) return 'present';
+  if (row?.building) return 'building';
+  if (row) await dropInvalidConcurrentIndex(engine, version, index.name);
+  opts.notice?.(`  building ${index.name} on ~${await tableRows(engine, index.table)} rows, then analyzing ${index.table}; `
+    + 'this can take minutes; it is safe to leave running; if interrupted, gbrain doctor names the rebuild command\n');
+  // No session SET: a reservation can fall back to a transaction-pooled connection, where a SET or RESET
+  // reaches another client's backend. The build runs under the session's startup timeouts; one that times
+  // out leaves an INVALID index, which the next call drops and rebuilds.
+  await engine.withReservedConnection(conn => conn.executeRaw(index.sql.replace(/CREATE (UNIQUE )?INDEX/, 'CREATE $1INDEX CONCURRENTLY')), { selfContained: true });
+  // IF NOT EXISTS also skips an INVALID index a concurrent caller's failed build left behind.
+  const [built] = await engine.executeRaw<{ valid: boolean }>('SELECT indisvalid AS valid FROM pg_index WHERE indexrelid = to_regclass($1)', [index.name]);
+  if (!built?.valid) {
+    const rebuild = opts.rebuild ?? (index.table === 'persistence_requests' ? 'gbrain repair request-indexes --apply' : 'gbrain apply-migrations --yes');
+    throw new Error(`Index ${index.name} is not valid after its concurrent build; rerun: ${rebuild}`);
+  }
+  await analyzeAfterIndexBuild(engine, index);
+  return row ? 'rebuilt' : 'created';
+}
+
+async function tableRows(engine: BrainEngine, table: string): Promise<number> {
+  const [size] = await engine.executeRaw<{ rows: number }>(
+    'SELECT GREATEST(reltuples, 0)::bigint AS rows FROM pg_class WHERE oid = to_regclass($1)', [table]);
+  return Number(size?.rows ?? 0);
+}
+
+/** The hot tables `gbrain repair planner-stats` analyzes (PLANNER_STATS_TABLES; this leaf does not import planner-stats). */
+const PLANNER_REPAIR_TABLES = new Set(['pages', 'links', 'facts', 'takes', 'content_chunks', 'timeline_entries']);
+
+/**
+ * #7083: one migration ANALYZE in its own transaction that never waits on the table's lock (`lockTableForAnalyze`):
+ * a vacuum, ANALYZE or index build holding the table defers it (returns false) instead of cancelling an autovacuum,
+ * which on a large table restarts its whole heap scan. `statementTimeoutMs` bounds it on Postgres; other errors throw.
+ */
+export async function analyzeYieldingToVacuum(engine: BrainEngine, table: string, columns = '', statementTimeoutMs?: number): Promise<boolean> {
+  try {
+    await engine.transaction(async tx => {
+      if (engine.kind === 'postgres' && statementTimeoutMs) await tx.executeRaw(`SET LOCAL statement_timeout = '${statementTimeoutMs}ms'`);
+      await lockTableForAnalyze(tx, table);
+      await tx.executeRaw(`ANALYZE ${table}${columns ? `(${columns})` : ''}`);
+    });
+    return true;
+  } catch (error) {
+    if (analyzeDeferred(error)) return false;
+    throw error;
+  }
+}
+
+/**
+ * lhf wave 2 item 6: a new index on an expression has no planner statistics until
+ * its table is analyzed, and PGLite runs no autovacuum (a 50-name `entity names`
+ * batch after v240 on a 55k-page PGLite brain: 5.4 s, 1.2 s after ANALYZE pages).
+ * Best effort: one whole-table ANALYZE (a column list collects no index
+ * statistics), Postgres bounded by a 60 s statement and deferred, never waiting,
+ * while another session holds the table (#7083). A failure or deferral prints the
+ * command that finishes the job and never fails the build of a valid index;
+ * doctor `planner_stats_stale` keeps reporting the index.
+ */
+export async function analyzeAfterIndexBuild(engine: BrainEngine, index: { name: string; table: string }): Promise<boolean> {
+  const fix = PLANNER_REPAIR_TABLES.has(index.table) ? 'gbrain repair planner-stats --apply' : `ANALYZE ${index.table} as the table owner`;
+  let why: string;
+  try {
+    if (await analyzeYieldingToVacuum(engine, index.table, '', 60_000)) return true;
+    why = 'another session (a vacuum, an ANALYZE or an index build) holds the table, and a migration never waits on it';
+  } catch (err) {
+    why = err instanceof Error ? err.message : String(err);
+  }
+  console.warn(`  [warn] ${index.name} is built and valid, but ANALYZE ${index.table} failed (${why}); the planner has no statistics for it yet. Run on the brain host: ${fix}`);
+  return false;
+}

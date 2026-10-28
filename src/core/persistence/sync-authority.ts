@@ -1,0 +1,150 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { SyncOpts } from '../../commands/sync.ts';
+import type { BrainEngine } from '../engine.ts';
+import type { OperationContext } from '../ops/contract.ts';
+import { OperationError, opError } from '../ops/contract.ts';
+import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
+import type { Action } from '../agent-output.ts';
+import { currentSubmissionAuthority, currentJobSignal, authorizeJobExecution, assertCurrentRemoteJobPrincipal, authorityDigest, type RemoteJobAuthority } from '../minions/submission-authority.ts';
+import { assertSourceFilesystemActive } from '../minions/source-filesystem.ts';
+import { throwIfAborted } from '../abort-check.ts';
+import { authorizePageVisibility } from './page-visibility.ts';
+import { submissionAuthority, authorizeWrite } from './authority.ts';
+import { currentVerifiedLocalWriter, withRegisteredLocalWriter } from './identity.ts';
+import { readManagedMode, readPersistenceBrain } from './managed-mode.ts';
+import { dispatchManagedMode, syncDispatchRow } from '../sync-dispatch-read.ts';
+import type { WriteAuthority } from './model.ts';
+import { writerAdminState } from './admin-intent.ts';
+
+const legacyDelegation = new AsyncLocalStorage<boolean>();
+/** The bulk sync of one source, which only the brain host's CLI may run. */
+const hostSyncFix = (sourceId: string, actor: 'user' | 'host_admin'): Action => ({
+  argv: ['gbrain', 'sync', '--no-pull', '--source', sourceId], consent: [], actor, requires_exclusive: false,
+  why: `Bulk filesystem sync of source ${sourceId} runs under the brain host's CLI writer, which reads its registered checkout without git pull.`,
+  user_message: actor === 'user'
+    ? `Syncing source ${sourceId} needs the gbrain CLI. Please run the command shown in a terminal on this machine.`
+    : `Syncing source ${sourceId} needs the gbrain CLI on the machine that hosts the brain. Please ask whoever runs that server to run the command shown.`,
+});
+/** A shared-secret caller never gains durable CLI authority across activation. */
+export function withLegacySyncDelegation<T>(run: () => T): T { return legacyDelegation.run(true, run); }
+function assertDurableSyncCaller(): void {
+  if (legacyDelegation.getStore()) throw trustedCliRequired('Managed sync requires a durable CLI registration; the shared-secret sync lane cannot supply it.');
+}
+
+export interface SyncAuthority { writer: WriteAuthority; remoteJob?: RemoteJobAuthority; remoteData?: Record<string, unknown>; }
+export interface SyncProcessingOptions { noEmbed: boolean; noExtract: boolean; noSchemaPack: boolean; }
+export function syncProcessingOptions(opts: SyncOpts): SyncProcessingOptions {
+  return { noEmbed: opts.noEmbed === true, noExtract: opts.noExtract === true, noSchemaPack: opts.noSchemaPack === true };
+}
+export const SYNC_PROCESSING_KEYS = ['noEmbed', 'noExtract', 'noSchemaPack'] as const;
+export function assertSyncDispatchActive(): void {
+  assertSourceFilesystemActive(true);
+  throwIfAborted(currentJobSignal());
+}
+export async function resolveSyncPersistenceMode(engine: BrainEngine, opts: SyncOpts): Promise<boolean> {
+  // GBRA-133: inside a CLI sync's routing scope the source's routing row answers the mode and the claim (sync-dispatch-read.ts).
+  const routing = await syncDispatchRow(engine, opts.sourceId ?? 'default');
+  const managed = routing ? dispatchManagedMode(routing) : await readManagedMode(engine);
+  assertSyncDispatchActive();
+  if (managed || opts.signal?.aborted) return managed;
+  const [source] = routing ? [routing.id === null ? undefined : routing] : await engine.executeRaw<{ claimed: boolean }>(`SELECT
+    EXISTS(SELECT 1 FROM persistence_source_bindings WHERE source_id=s.id AND source_incarnation=s.incarnation) AS claimed
+    FROM sources s WHERE s.id=$1`, [opts.sourceId ?? 'default']);
+  if (source?.claimed) throw await preActivationClaimRefusal(engine, opts.sourceId ?? 'default');
+  return false;
+}
+/**
+ * #6122: a source claimed while managed persistence was never activated. Classic sync must not run under the
+ * claim and nothing managed publishes it, so the user chooses: release the claim (classic sync resumes) or
+ * activate managed persistence. The fix is the state-bound release, behind ask_user; its preview changes nothing.
+ */
+async function preActivationClaimRefusal(engine: BrainEngine, sourceId: string): Promise<OperationError> {
+  const state = await writerAdminState(engine);
+  return opError('writer_coordinator_required', 'Claimed-source sync, including connectors, requires explicit persistence activation.',
+    `Source ${sourceId} is claimed by a managed writer, but managed persistence was never activated on this brain, so classic sync is fenced and nothing was synced. `
+      + 'This is a topology decision for the user: release the claim so classic sync resumes (the command in fix; preview it first with gbrain sources writer deactivate --dry-run --json), '
+      + 'or stop older writers on every host and activate managed persistence (gbrain sources writer activate --confirm-quiesced --admin-intent writer_activate --expected-state <admin_state>, see docs/architecture/topologies.md).',
+    { fix: { argv: ['gbrain', 'sources', 'writer', 'deactivate', '--admin-intent', 'writer_deactivate', '--expected-state', state],
+      preview_argv: ['gbrain', 'sources', 'writer', 'deactivate', '--dry-run', '--json'], consent: ['destructive'], actor: 'agent', requires_exclusive: false,
+      why: 'Releases every source claimed before activation (bindings removed, worktrees retired, a topology change recorded); the brain stays classic and the next gbrain sync runs in classic mode.',
+      user_message: `Source ${sourceId} was claimed for managed writes, but managed persistence was never turned on, so sync is blocked. Release the claim and go back to classic sync, or turn managed persistence on?`,
+      verify: { argv: ['gbrain', 'sources', 'status', sourceId, '--json'] }, docs: 'docs/architecture/topologies.md#deactivate-runbook' } });
+}
+const inactiveCoordinator = () => new OperationError('writer_coordinator_required', 'Sync cannot publish through an inactive persistence coordinator.',
+  'Stop older writers and review gbrain sources writer status, then explicitly activate persistence before retrying. Claiming a source alone does not exclude running legacy writers.');
+export async function assertManagedSyncActive(engine: BrainEngine, lock = false): Promise<void> {
+  if (!await readManagedMode(engine, lock ? { lock: 'share' } : {})) throw inactiveCoordinator();
+}
+/** #6712 PR 4b: `assertManagedSyncActive` that also returns the persistence identity (`managedSyncAuthority`'s `brainId`), one read. */
+export async function activeManagedBrainId(engine: BrainEngine): Promise<string> {
+  const brain = await readPersistenceBrain(engine);
+  if (!brain.enabled) throw inactiveCoordinator();
+  return brain.brain_id;
+}
+export async function managedSyncAuthority(engine: BrainEngine, sourceId: string, incarnation: string, repoPath: string, brainId?: string): Promise<SyncAuthority> {
+  assertDurableSyncCaller();
+  const current = currentSubmissionAuthority();
+  if (current?.kind === 'remote_agent') throw opError('permission_denied', 'Agent jobs cannot run bulk filesystem sync.',
+    `A job submitted by an agent connection cannot read the filesystem checkout of source ${sourceId}, so nothing was synced. The brain host's operator runs the sync with the command in fix.`,
+    { fix: hostSyncFix(sourceId, 'host_admin') });
+  if (current?.kind === 'remote_generic') {
+    const data = { repoPath, sourceId, noPull: true, noEmbed: true, noExtract: true, auto_embed_backfill: false };
+    await authorizeJobExecution(engine, { name: 'sync', data, submission_authority: current });
+    const ctx = { engine, remote: true, sourceId, auth: { principal: current.principal, scopes: current.grant.scopes,
+      sourceId, allowedOperations: current.grant.allowedOperations }, takesHoldersAllowList: ['world'] } as OperationContext;
+    return { writer: await submissionAuthority(ctx, 'submit_job', sourceId, incarnation, '__managed_sync_checkpoint__'),
+      remoteJob: structuredClone(current), remoteData: data };
+  }
+  const verified = currentVerifiedLocalWriter();
+  // A verified stdio writer retains its own lane and grant, even in the owner process.
+  if (verified?.remote) throw opError('permission_denied', 'Bulk sync requires the local CLI or an authenticated source-scoped admin job.',
+    `This stdio MCP writer cannot run bulk filesystem sync of source ${sourceId}, so nothing was synced. The user runs the command in fix in a terminal on this machine.`,
+    { fix: hostSyncFix(sourceId, 'user') });
+  const authorize = () => submissionAuthority({ engine, remote: verified?.remote ?? false, sourceId } as OperationContext,
+    'submit_job', sourceId, incarnation, '__managed_sync_checkpoint__');
+  // An unverified CLI caller registers its writer (if needed) and is verified from the same read.
+  const writer = verified ? await authorize() : await withRegisteredLocalWriter(engine, 'cli', authorize, brainId);
+  if (writer.slugPrefixes !== null) throw opError('permission_denied', 'Bulk sync requires a source-wide local grant.',
+    `This CLI writer's grant covers only some slug prefixes of source ${sourceId}, and bulk sync can touch any page, so nothing was synced. Review the grant with the command in fix; widening it (gbrain auth local-writer register cli --replace with the complete intended grant) is the user's decision.`,
+    { fix: readFix('Lists the local writer registrations with their sources, operations and slug-prefix grants, read-only.', { argv: ['gbrain', 'auth', 'local-writer', 'list', '--json'] }) });
+  return { writer };
+}
+export async function validateSyncAuthority(engine: BrainEngine, authority: SyncAuthority, slug: string): Promise<void> {
+  await authorizeWrite(engine, authority.writer, 'submit_job', slug);
+  await authorizePageVisibility(engine, authority.writer, slug);
+  if (!authority.remoteJob) return;
+  if (authority.remoteJob.grant.jobName !== 'sync' || authority.remoteJob.grant.sourceId !== authority.writer.sourceId ||
+      authorityDigest(authority.remoteData) !== authority.remoteJob.payloadHash ||
+      authorityDigest(authority.remoteJob.principal) !== authorityDigest(authority.writer.principal)) {
+    throw opError('permission_denied', 'Sync intent exceeds the original job grant.',
+      `The sync of source ${authority.writer.sourceId} no longer matches the job that was approved (its name, source, payload or principal changed), so it stopped before admitting anything more. Submit a new sync job for the source, or have the brain host's operator run the command in fix.`,
+      { fix: hostSyncFix(authority.writer.sourceId, 'host_admin') });
+  }
+  await assertCurrentRemoteJobPrincipal(engine, authority.remoteJob);
+  const [source] = await engine.executeRaw<{ created_at: string }>('SELECT created_at FROM sources WHERE id=$1', [authority.writer.sourceId]);
+  if (!source || new Date(source.created_at).toISOString() !== authority.remoteJob.grant.sourceCreatedAt) {
+    throw opError('source_changed', 'The original sync source was replaced.',
+      `Source ${authority.writer.sourceId} was removed and registered again after this sync job was approved, so the job no longer applies and it stopped before admitting anything more. Submit a new sync job for the current source.`,
+      { fix: readFix('Lists the registered sources with their IDs and creation times, read-only.', { argv: ['gbrain', 'sources', 'list', '--json'] }) });
+  }
+}
+
+/** Worker runtime fields are not an avenue to enlarge the accepted wire payload. */
+export function validateManagedSyncOptions(opts: SyncOpts): void {
+  assertDurableSyncCaller();
+  const current = currentSubmissionAuthority();
+  if (current?.kind !== 'remote_generic') return;
+  // #6706: the worker's own drain controls (never read from a remote job's data) bound the run; they cannot widen what it writes.
+  const allowed = new Set(['repoPath','sourceId','noPull','noEmbed','noExtract','drainHolder','signal','concurrency','onProgress','auto_embed_backfill',
+    'drain','deadlineAtMs','drainStartedAt','bulk','lanes','capacityPreflight']);
+  if (current.grant.jobName !== 'sync' || opts.repoPath !== current.grant.canonicalRoot || opts.sourceId !== current.grant.sourceId ||
+      opts.noPull !== true || opts.noEmbed !== true || opts.noExtract !== true ||
+      (opts.drain !== undefined && opts.drain !== true) || (opts.lanes !== undefined && opts.lanes !== 1) ||
+      (opts.deadlineAtMs !== undefined && !Number.isFinite(opts.deadlineAtMs)) ||
+      Object.entries(opts).some(([key,value]) => value !== undefined && !allowed.has(key)) ||
+      ((opts as Record<string,unknown>).auto_embed_backfill !== undefined && (opts as Record<string,unknown>).auto_embed_backfill !== false)) {
+    throw opError('permission_denied', 'Sync options exceed the originally accepted remote job.',
+      `A remote sync job of source ${current.grant.sourceId} runs only on its registered root with no_pull, no_embed and no_extract set and no other options; this run asked for more, so nothing was synced. Submit the job again with only those options, or have the brain host's operator run the command in fix.`,
+      { fix: hostSyncFix(current.grant.sourceId, 'host_admin') });
+  }
+}

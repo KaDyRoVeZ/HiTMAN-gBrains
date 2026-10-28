@@ -1,0 +1,35 @@
+{
+  "calibration": {
+    "note": "Report-only budgets at 3x the first calibration run's p50 (O-CEO-9). Written by `bun run test:scale -- --calibrate`. get_health is timed with its memo off (GBRAIN_HEALTH_CACHE_TTL_MS=0).",
+    "postgres:10000": "Ubicloud standard-8 (the scale-tier runner size), bun 1.4.2, pgvector/pgvector:pg16, seed 1, branch capy/f1-lane-f4c-scale-tier, 2026-10-03",
+    "pglite:10000": "Ubicloud standard-8 (the scale-tier runner size), bun 1.4.2, seed 1, dense scale vectors, branch capy/foundations-1 (planner stats on), 2026-10-03"
+  },
+  "budgets": {
+    "postgres:10000": {
+      "get_health": 597,
+      "list_pages": 22,
+      "search (keyword, local)": 77,
+      "search (MCP path, remote)": 151,
+      "search (MCP path, source-scoped grant)": 157,
+      "query (hybrid, injected vector)": 252,
+      "traverse_graph depth 3": 14,
+      "get_backlinks": 5,
+      "find_orphans": 86,
+      "cold-process first query (MCP path)": 1326,
+      "concurrent put_page x2 (receipts)": 1395
+    },
+    "pglite:10000": {
+      "get_health": 463,
+      "list_pages": 18,
+      "search (keyword, local)": 57,
+      "search (MCP path, remote)": 122,
+      "search (MCP path, source-scoped grant)": 115,
+      "query (hybrid, injected vector)": 74,
+      "traverse_graph depth 3": 11,
+      "get_backlinks": 3,
+      "find_orphans": 101,
+      "cold-process first query (MCP path)": 2172,
+      "concurrent put_page x2 (receipts)": 2394
+    }
+  }
+}

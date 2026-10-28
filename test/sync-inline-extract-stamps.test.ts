@@ -1,0 +1,255 @@
+/**
+ * CRITICAL regression (v0.42.7, #1696, CDX-6) — inline sync extract stamps the
+ * link-extraction watermark.
+ *
+ * `performSync`'s INCREMENTAL path runs link/timeline extraction inline for the
+ * changed pages (the `gbrain sync` default — see performSyncInner's auto-extract
+ * block). v0.42.7 adds a `stampExtracted` call at that call site (after
+ * extractLinksForSlugs/extractTimelineForSlugs) so a normal incremental sync
+ * marks the pages it just extracted as fresh — otherwise every synced page
+ * would show as stale forever in the links_extraction_lag doctor check.
+ *
+ * NOTE: a FULL / first sync routes to performFullSync which does NOT extract
+ * inline (pre-existing behavior — exactly the "imported ≠ curated" gap that
+ * `extract --stale` closes). So this regression test drives the INCREMENTAL
+ * path: full sync to seed, then edit + incremental sync.
+ *
+ * IRON RULE: pins (a) an incremental sync NOW stamps links_extracted_at for the
+ * pages it processed, and (b) the existing link extraction is unchanged. Plus
+ * --no-extract: the changed page stays unstamped AND no links are created.
+ *
+ * The last two tests pin the slug-is-not-a-path contract of the sync hooks: a
+ * page whose filename does not round-trip through slugification (`Widget
+ * Co.md` → `companies/widget-co`) must still be read from its REAL path, and a
+ * slug with no file behind it must be reported as unprocessed so the caller
+ * leaves it stale instead of stamping it fresh.
+ *
+ * Marked .serial.test.ts — spawns git subprocesses + shares one PGLite engine.
+ */
+
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
+import { execSync } from 'child_process';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
+
+let engine: PGLiteEngine;
+let repoPath: string;
+
+function git(cmd: string): void { execSync(cmd, { cwd: repoPath, stdio: 'pipe' }); }
+
+function writeAcme(body: string): void {
+  writeFileSync(join(repoPath, 'companies/acme.md'), [
+    '---', 'type: company', 'title: Acme', '---', '', body,
+  ].join('\n'));
+}
+
+async function stampOf(slug: string): Promise<string | null> {
+  const rows = await engine.executeRaw<{ links_extracted_at: string | null }>(
+    `SELECT links_extracted_at FROM pages WHERE slug = $1 AND source_id = 'default'`, [slug],
+  );
+  return rows[0]?.links_extracted_at ?? null;
+}
+
+describe('#1696 — inline sync extract stamps links_extracted_at', () => {
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+  }, 60_000);
+
+  afterAll(async () => {
+    if (engine) await engine.disconnect();
+  }, 60_000);
+
+  beforeEach(async () => {
+    await resetPgliteState(engine);
+    repoPath = mkdtempSync(join(tmpdir(), 'gbrain-stamp-'));
+    execSync('git init', { cwd: repoPath, stdio: 'pipe' });
+    execSync('git config user.email "t@t.com"', { cwd: repoPath, stdio: 'pipe' });
+    execSync('git config user.name "T"', { cwd: repoPath, stdio: 'pipe' });
+    // Never inherit the machine's global commit.gpgsign — a signing gpg-agent can
+    // OOM under full-suite memory pressure and fail the fixture commit (#1696).
+    execSync('git config commit.gpgsign false', { cwd: repoPath, stdio: 'pipe' });
+    mkdirSync(join(repoPath, 'people'), { recursive: true });
+    mkdirSync(join(repoPath, 'companies'), { recursive: true });
+    writeFileSync(join(repoPath, 'people/alice.md'), [
+      '---', 'type: person', 'title: Alice', '---', '', 'Alice is a founder.',
+    ].join('\n'));
+    writeAcme('Acme is a company.');
+    git('git add -A && git commit -m "initial"');
+
+    // Seed: full first sync imports both pages (no inline extract on this path).
+    const { performSync } = await import('../src/commands/sync.ts');
+    await performSync(engine, { repoPath, full: true, noPull: true, noEmbed: true });
+  });
+
+  afterEach(() => {
+    if (repoPath) rmSync(repoPath, { recursive: true, force: true });
+  });
+
+  test('(a) incremental sync stamps the watermark AND (b) still extracts the link', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Edit acme to add the link, commit → incremental sync processes it.
+    // Disk-relative link form (how real brain files reference each other on
+    // disk; the FS extractor resolves relative to the file's directory).
+    writeAcme('[Alice](../people/alice.md) is the CEO of Acme.');
+    git('git add -A && git commit -m "add link"');
+    const result = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
+    expect(['synced', 'first_sync']).toContain(result.status);
+
+    // (b) extraction unchanged — the CEO-of link is created.
+    const links = await engine.getLinks('companies/acme');
+    expect(links.some(l => l.to_slug === 'people/alice')).toBe(true);
+
+    // (a) the changed page sync extracted is now stamped (not stale).
+    expect(await stampOf('companies/acme')).not.toBeNull();
+  }, 60_000);
+
+  test('--no-extract: changed page is NOT stamped and no links are created', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // Disk-relative link form (how real brain files reference each other on
+    // disk; the FS extractor resolves relative to the file's directory).
+    writeAcme('[Alice](../people/alice.md) is the CEO of Acme.');
+    git('git add -A && git commit -m "add link"');
+    const result = await performSync(engine, { repoPath, noPull: true, noEmbed: true, noExtract: true });
+    expect(['synced', 'first_sync']).toContain(result.status);
+
+    expect(await engine.getLinks('companies/acme')).toHaveLength(0);
+    expect(await stampOf('companies/acme')).toBeNull();
+  }, 60_000);
+
+  test('a filename that does not round-trip through slugification still extracts', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    // `Widget Co.md` slugs to `widget-co`: the space becomes a hyphen and the
+    // capitals drop. Rebuilding the disk path from the slug looks for
+    // `companies/widget-co.md`, which does not exist on ANY filesystem — so
+    // the page used to be skipped without a word and stamped anyway.
+    writeFileSync(join(repoPath, 'companies/Widget Co.md'), [
+      '---', 'type: company', 'title: Widget Co', '---', '',
+      '[Alice](../people/alice.md) is the CEO of Widget Co.',
+    ].join('\n'));
+    git('git add -A && git commit -m "add widget co"');
+    const result = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
+    expect(['synced', 'first_sync']).toContain(result.status);
+
+    // The page imported under its slugified slug either way.
+    const pages = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE slug = 'companies/widget-co' AND source_id = 'default'`,
+    );
+    expect(pages).toHaveLength(1);
+
+    // The edge is what the reconstructed path lost.
+    const links = await engine.getLinks('companies/widget-co');
+    expect(links.some(l => l.to_slug === 'people/alice')).toBe(true);
+    expect(await stampOf('companies/widget-co')).not.toBeNull();
+  }, 60_000);
+
+  test('a slug with no file behind it is reported unprocessed, so it is never stamped', async () => {
+    const { extractLinksForSlugs, extractTimelineForSlugs, slugsSafeToStamp } =
+      await import('../src/commands/extract.ts');
+
+    const links = await extractLinksForSlugs(
+      engine, repoPath, ['companies/acme', 'companies/ghost'],
+    );
+    const timeline = await extractTimelineForSlugs(
+      engine, repoPath, ['companies/acme', 'companies/ghost'],
+    );
+
+    // companies/acme.md is on disk from the fixture; companies/ghost.md is not.
+    expect(links.processed).toEqual(['companies/acme']);
+    expect(timeline.processed).toEqual(['companies/acme']);
+    expect(slugsSafeToStamp(links, timeline)).toEqual(['companies/acme']);
+  }, 60_000);
+
+  // Pre-landing review of #4967: the slug index is built from
+  // walkMarkdownFiles, which drops `_`-prefixed filenames and hidden dirs —
+  // but sync ADMITS both (`_note.md` always; `.github/**` via includeHidden).
+  // An index miss must fall back to the legacy `slug + '.md'` path before the
+  // page is declared missing, or the page imports without its edges.
+  test('an admitted `_`-prefixed page still extracts and is stamped', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    writeFileSync(join(repoPath, '_note.md'), [
+      '---', 'type: note', 'title: Note', '---', '',
+      '[Alice](people/alice.md) is mentioned in this note.',
+    ].join('\n'));
+    git('git add -A && git commit -m "add underscore note"');
+    const result = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
+    expect(['synced', 'first_sync']).toContain(result.status);
+
+    const pages = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE slug = '_note' AND source_id = 'default'`,
+    );
+    expect(pages).toHaveLength(1);
+    const links = await engine.getLinks('_note');
+    expect(links.some(l => l.to_slug === 'people/alice')).toBe(true);
+    expect(await stampOf('_note')).not.toBeNull();
+  }, 60_000);
+
+  test('an includeHidden-admitted page under a dot-dir still extracts and is stamped', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    mkdirSync(join(repoPath, '.github'), { recursive: true });
+    writeFileSync(join(repoPath, '.github/note.md'), [
+      '---', 'type: note', 'title: Hidden Note', '---', '',
+      '[Alice](../people/alice.md) is mentioned in this hidden note.',
+    ].join('\n'));
+    git('git add -A && git commit -m "add hidden note"');
+    const result = await performSync(engine, {
+      repoPath, noPull: true, noEmbed: true, includeHidden: ['.github/**'],
+    });
+    expect(['synced', 'first_sync']).toContain(result.status);
+
+    const pages = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE slug = '.github/note' AND source_id = 'default'`,
+    );
+    expect(pages).toHaveLength(1);
+    const links = await engine.getLinks('.github/note');
+    expect(links.some(l => l.to_slug === 'people/alice')).toBe(true);
+    expect(await stampOf('.github/note')).not.toBeNull();
+  }, 60_000);
+
+  test('the legacy-path fallback reports only slugs with a file behind them as processed', async () => {
+    const { extractLinksForSlugs, extractTimelineForSlugs, slugsSafeToStamp } =
+      await import('../src/commands/extract.ts');
+    writeFileSync(join(repoPath, '_note.md'), '[Alice](people/alice.md) again.');
+    mkdirSync(join(repoPath, '.github'), { recursive: true });
+    writeFileSync(join(repoPath, '.github/note.md'), '[Alice](../people/alice.md) again.');
+
+    const slugs = ['_note', '.github/note', 'companies/ghost', 'companies/acme'];
+    const links = await extractLinksForSlugs(engine, repoPath, slugs);
+    const timeline = await extractTimelineForSlugs(engine, repoPath, slugs);
+
+    expect(links.processed).toEqual(['_note', '.github/note', 'companies/acme']);
+    expect(timeline.processed).toEqual(['_note', '.github/note', 'companies/acme']);
+    expect(slugsSafeToStamp(links, timeline)).toEqual(['_note', '.github/note', 'companies/acme']);
+  }, 60_000);
+  // #6954: the sync timeline hook used to swallow a failed entry write and stamp the page anyway.
+  test('a timeline write sync loses leaves the page due and reports it', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    writeAcme('Acme is a company.\n\n## Timeline\n- **2026-01-02** | Signed the term sheet');
+    git('git add -A && git commit -m "add timeline"');
+    await engine.executeRaw(`CREATE OR REPLACE FUNCTION test_lose_timeline() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'timeline write lost'; END $$ LANGUAGE plpgsql`);
+    await engine.executeRaw('CREATE TRIGGER test_lose_timeline BEFORE INSERT ON timeline_entries FOR EACH ROW EXECUTE FUNCTION test_lose_timeline()');
+    let result: Awaited<ReturnType<typeof performSync>>;
+    try {
+      result = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
+    } finally {
+      await engine.executeRaw('DROP TRIGGER IF EXISTS test_lose_timeline ON timeline_entries');
+      await engine.executeRaw('DROP FUNCTION IF EXISTS test_lose_timeline()');
+    }
+    expect(result.extract_error ?? '').toContain('timeline write lost');
+    expect(await stampOf('companies/acme')).toBeNull();
+
+    const { extractLinksForSlugs, extractTimelineForSlugs, slugsSafeToStamp } = await import('../src/commands/extract.ts');
+    const retried = slugsSafeToStamp(
+      await extractLinksForSlugs(engine, repoPath, ['companies/acme']),
+      await extractTimelineForSlugs(engine, repoPath, ['companies/acme']),
+    );
+    expect(retried).toEqual(['companies/acme']);
+    const [row] = await engine.executeRaw<{ n: number | string }>(
+      `SELECT count(*) AS n FROM timeline_entries t JOIN pages p ON p.id = t.page_id WHERE p.source_id = 'default' AND p.slug = 'companies/acme'`);
+    expect(Number(row!.n)).toBe(1);
+  }, 60_000);
+});

@@ -1,0 +1,262 @@
+/**
+ * Outbound HTTP probes for thin-client mode (multi-topology v1).
+ *
+ * Three pure functions covering the discovery + auth + smoke surface that
+ * `gbrain init --mcp-only` and the thin-client doctor both need. No SDK
+ * dependency; just `fetch`. Lane B's `src/core/mcp-client.ts` builds on
+ * these helpers (or supersedes them with the official SDK Client) but for
+ * Lane A's setup-flow smoke test, raw HTTP keeps the scope tight and avoids
+ * pulling the streamableHttp transport into the init path.
+ *
+ * Each function returns a discriminated `{ok: true, ...}` / `{ok: false, error}`
+ * so callers can render the error reason consistently. Network errors surface
+ * as `network` reason; HTTP non-2xx surfaces as `http` with status. Auth
+ * errors get their own `auth` reason for clean rendering, and a /token 429
+ * gets `rate_limited` with the server's Retry-After.
+ */
+
+import { anySignal } from './abort-check.ts';
+
+type ProbeFailure<Reason extends string> = {
+  ok: false;
+  reason: Reason;
+  status?: number;
+  kind?: 'timeout' | 'aborted';
+  /** Seconds the server asked the caller to wait (Retry-After), when it said. */
+  retry_after_s?: number;
+  /** A status-only `gbrain serve --http` answered 503: its `serve_status_only` envelope. */
+  status_only?: Record<string, unknown>;
+  message: string;
+};
+
+/**
+ * A 503 from a status-only `gbrain serve --http` carries a `serve_status_only`
+ * envelope (why, fix, user_message); any other body is not one. Consumes the
+ * body only for a 503.
+ */
+async function statusOnlyFailure(res: Response, label: string): Promise<ProbeFailure<'http'> | null> {
+  if (res.status !== 503) return null;
+  let body: unknown;
+  try { body = await res.json(); } catch { return null; }
+  if (!body || typeof body !== 'object' || (body as { code?: unknown }).code !== 'serve_status_only') return null;
+  const env = body as Record<string, unknown>;
+  const retryAfter = parseRetryAfterSeconds(res.headers.get('retry-after'));
+  return {
+    ok: false, reason: 'http', status: 503, status_only: env, ...(retryAfter !== undefined ? { retry_after_s: retryAfter } : {}),
+    message: `${label} answered 503: the gbrain server is in status-only mode. ${typeof env.why === 'string' ? env.why : ''}`.trim(),
+  };
+}
+
+/** Longest Retry-After honoured; a larger value is clamped to it. */
+const MAX_RETRY_AFTER_S = 24 * 60 * 60;
+
+/**
+ * Parse a Retry-After header (delta-seconds or HTTP-date, RFC 9110 §10.2.3)
+ * into whole seconds, clamped to [0, MAX_RETRY_AFTER_S]. Unparseable → undefined.
+ */
+export function parseRetryAfterSeconds(value: string | null, now = Date.now()): number | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const seconds = /^\d+$/.test(trimmed) ? Number(trimmed) : Math.ceil((Date.parse(trimmed) - now) / 1000);
+  if (Number.isNaN(seconds)) return undefined;
+  return Math.min(Math.max(seconds, 0), MAX_RETRY_AFTER_S);
+}
+
+function networkFailure(label: string, error: unknown, signal: AbortSignal): ProbeFailure<'network'> {
+  if (signal.aborted) {
+    const kind = signal.reason instanceof Error && signal.reason.name === 'TimeoutError'
+      ? 'timeout' : 'aborted';
+    return { ok: false, reason: 'network', kind, message: `${label} ${kind === 'timeout' ? 'timed out' : 'was aborted'}` };
+  }
+  return { ok: false, reason: 'network', message: `${label} network error: ${error instanceof Error ? error.message : String(error)}` };
+}
+
+export type ProbeResult<T = void> =
+  | { ok: true } & ({} extends T ? unknown : T extends void ? unknown : { value: T })
+  | { ok: false; reason: 'network' | 'http' | 'auth' | 'parse' | 'config'; status?: number; message: string };
+
+/**
+ * GET <issuer_url>/.well-known/oauth-authorization-server. Verifies the
+ * server reachable AND speaking OAuth before we hand it credentials.
+ * Returns the parsed metadata (token_endpoint etc) on success so callers
+ * don't have to re-hit the endpoint.
+ */
+export interface OAuthMetadata {
+  token_endpoint: string;
+  issuer?: string;
+  scopes_supported?: string[];
+  // The server may return many more fields; we only care about token_endpoint
+  // for the credentials flow. Carry the rest through for diagnostics.
+  [key: string]: unknown;
+}
+
+export async function discoverOAuth(
+  issuerUrl: string,
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<{ ok: true; metadata: OAuthMetadata } | ProbeFailure<'network' | 'http' | 'parse' | 'config'>> {
+  const trimmed = issuerUrl.replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return { ok: false, reason: 'config', message: `issuer_url must start with http:// or https:// — got: ${issuerUrl}` };
+  }
+  const url = `${trimmed}/.well-known/oauth-authorization-server`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException('OAuth request timed out', 'TimeoutError')), opts.timeoutMs ?? 10_000);
+  const signal = anySignal(controller.signal, opts.signal);
+  try {
+    const res = await fetch(url, { signal });
+    if (!res.ok) {
+      const statusOnly = await statusOnlyFailure(res, 'OAuth discovery');
+      if (statusOnly) return statusOnly;
+      await res.body?.cancel().catch(() => {});
+      return { ok: false, reason: 'http', status: res.status, message: `OAuth discovery returned ${res.status} for ${url}` };
+    }
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch (e) {
+      if (signal.aborted) return networkFailure('OAuth discovery', e, signal);
+      return { ok: false, reason: 'parse', message: `OAuth discovery returned non-JSON body: ${(e as Error).message}` };
+    }
+    if (!body || typeof body !== 'object' || typeof (body as OAuthMetadata).token_endpoint !== 'string') {
+      return { ok: false, reason: 'parse', message: `OAuth discovery missing token_endpoint at ${url}` };
+    }
+    return { ok: true, metadata: body as OAuthMetadata };
+  } catch (e) {
+    return networkFailure('OAuth discovery', e, signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * POST <token_endpoint> with grant_type=client_credentials. Returns the
+ * access_token + expires_in on success. 401 → reason=auth; 429 →
+ * reason=rate_limited (+ retry_after_s); other non-2xx → reason=http;
+ * network → reason=network.
+ */
+export interface TokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in?: number;
+  scope?: string;
+}
+
+export async function mintClientCredentialsToken(
+  tokenEndpoint: string,
+  clientId: string,
+  clientSecret: string,
+  opts: { scope?: string; timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<{ ok: true; token: TokenResponse } | ProbeFailure<'network' | 'http' | 'auth' | 'rate_limited' | 'parse' | 'config'>> {
+  if (!clientId) return { ok: false, reason: 'config', message: 'client_id is required' };
+  if (!clientSecret) return { ok: false, reason: 'config', message: 'client_secret is required' };
+
+  const body = new URLSearchParams();
+  body.set('grant_type', 'client_credentials');
+  body.set('client_id', clientId);
+  body.set('client_secret', clientSecret);
+  if (opts.scope) body.set('scope', opts.scope);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException('OAuth request timed out', 'TimeoutError')), opts.timeoutMs ?? 10_000);
+  const signal = anySignal(controller.signal, opts.signal);
+  try {
+    const res = await fetch(tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      signal,
+    });
+    if (res.status === 401 || res.status === 403) {
+      await res.body?.cancel().catch(() => {});
+      return { ok: false, reason: 'auth', status: res.status, message: `OAuth /token returned ${res.status} — check client_id and client_secret` };
+    }
+    if (res.status === 429) {
+      // The host's /token limiter spent this caller's mint budget. Discovery
+      // already answered, so this is neither a discovery nor a network fault.
+      await res.body?.cancel().catch(() => {});
+      const retryAfter = parseRetryAfterSeconds(res.headers.get('retry-after'));
+      return {
+        ok: false, reason: 'rate_limited', status: 429,
+        ...(retryAfter !== undefined ? { retry_after_s: retryAfter } : {}),
+        message: `OAuth /token returned 429 (rate-limited by the server${retryAfter !== undefined ? `; retry in ${retryAfter}s` : ''})`,
+      };
+    }
+    if (!res.ok) {
+      const statusOnly = await statusOnlyFailure(res, 'OAuth /token');
+      if (statusOnly) return statusOnly;
+      await res.body?.cancel().catch(() => {});
+      return { ok: false, reason: 'http', status: res.status, message: `OAuth /token returned ${res.status}` };
+    }
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch (e) {
+      if (signal.aborted) return networkFailure('OAuth /token', e, signal);
+      return { ok: false, reason: 'parse', message: `OAuth /token returned non-JSON: ${(e as Error).message}` };
+    }
+    if (!json || typeof json !== 'object' || typeof (json as TokenResponse).access_token !== 'string') {
+      return { ok: false, reason: 'parse', message: `OAuth /token response missing access_token` };
+    }
+    return { ok: true, token: json as TokenResponse };
+  } catch (e) {
+    return networkFailure('OAuth /token', e, signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Smoke-test the MCP endpoint with an `initialize` JSON-RPC call. Verifies
+ * (a) the URL is reachable, (b) the bearer token is accepted, (c) the
+ * server actually speaks MCP. Cheaper than `tools/list` and doesn't require
+ * a particular tool to exist. Used by init smoke + thin-client doctor.
+ *
+ * Note: This is a one-shot probe, not a long-lived session. We don't follow
+ * up with `notifications/initialized` because we tear down immediately.
+ * Servers that strictly require the full handshake will reject; gbrain's
+ * own `serve --http` accepts the bare initialize request and returns
+ * server info, which is exactly what we want for a connectivity check.
+ */
+export async function smokeTestMcp(
+  mcpUrl: string,
+  accessToken: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<{ ok: true } | { ok: false; reason: 'network' | 'http' | 'auth' | 'parse'; status?: number; message: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 15_000);
+  try {
+    const res = await fetch(mcpUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/event-stream',
+        'Authorization': `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'gbrain-init-smoke', version: '1' },
+        },
+      }),
+      signal: controller.signal,
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, reason: 'auth', status: res.status, message: `MCP smoke returned ${res.status} — token rejected at ${mcpUrl}` };
+    }
+    if (!res.ok) {
+      return { ok: false, reason: 'http', status: res.status, message: `MCP smoke returned ${res.status} from ${mcpUrl}` };
+    }
+    // Don't strictly parse the response body — different transports may use
+    // SSE framing or plain JSON. A 2xx with the bearer accepted is enough
+    // signal that the round-trip works.
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: 'network', message: `MCP smoke network error: ${(e as Error).message}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}

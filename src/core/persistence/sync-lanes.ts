@@ -1,0 +1,201 @@
+/**
+ * #5984 lanes: several bulk groups of one draining managed sync publish at once.
+ *
+ * The drain opens a lane policy for its worktree (`openLanes`): the run's id,
+ * the number of lanes it asked for and the number still in effect. While it
+ * is open, this process's consumer claims the head of the next admitted group
+ * of that run even when earlier groups of the same run are still publishing
+ * (`claimNextLaneHead` in journal.ts), up to the effective number of lanes.
+ * Lane publications share the worktree's native lock (worktree-lease.ts) and
+ * begin their transactions in manifest order. They apply concurrently but
+ * commit in manifest order: before a lane locks the counters it waits until
+ * the group before it (its members' `intent.after`) has committed. A failed
+ * earlier group cancels the later ones; a lock or statement timeout lowers
+ * the effective number of lanes for the rest of the drain (step-down).
+ * Other processes, and this one once the policy closes, claim lane rows
+ * under the ordinary per-worktree FIFO.
+ */
+import type { BrainEngine } from '../engine.ts';
+import type { WriteRequest } from './model.ts';
+import { leaseDraining, leaseWounded } from './worktree-lease.ts';
+
+export interface LanePolicy { run: string; asked: number; effective: number; stepDown: string | null;
+  /** Groups whose transaction began while the group before them was still publishing in this process. */
+  overlapped: number;
+  /** Lane groups that did not commit as a group (cancelled, released for the FIFO head, or published singly). */
+  fallbacks: number }
+export interface LaneState extends LanePolicy { coordinationPath: string | null; claimed: Set<string>; begun: Set<string>;
+  /** Lane tasks this process runs for the run, from the head's claim until the task settles; `closing` stops new claims. */
+  tasks: number; closing: boolean; timing: LaneTiming }
+/** Lane group transactions of a run in this process: how many are open, and where their time went. */
+interface LaneTiming { open: number; since: number; openArea: number; activeMs: number;
+  applyMs: number; appliedMembers: number; turnWaitMs: number; transactionMs: number;
+  /** Apply time per member of the recent lane groups (each new group weighs half), for group sizing. */
+  recentPerMember: number | null }
+/**
+ * #5984 lanes: what a drain's lanes did, for its report. `busy` is the mean number of lane transactions open
+ * while at least one was; `applyMsPerPage` the time from a group's transaction begin to its commit-turn wait,
+ * per member; `turnWaitShare` the share of lane transaction time spent waiting for the group before to commit.
+ */
+export interface LaneStats { busy: number | null; applyMsPerPage: number | null; turnWaitShare: number | null }
+const policies = new Map<string, LaneState>();
+let claiming = 0;
+
+/** The drain's lane policy for a worktree; replaces any earlier one. */
+export function openLanes(worktreeId: string, run: string, lanes: number, coordinationPath: string | null): void {
+  policies.set(worktreeId, { run, asked: lanes, effective: lanes, stepDown: null, overlapped: 0, fallbacks: 0, coordinationPath, claimed: new Set(), begun: new Set(), tasks: 0, closing: false,
+    timing: { open: 0, since: Date.now(), openArea: 0, activeMs: 0, applyMs: 0, appliedMembers: 0, turnWaitMs: 0, transactionMs: 0, recentPerMember: null } });
+}
+/**
+ * Ends a drain's lane run on every worktree it opened: no new lane claims, then waits (up to `maxMs`) for the
+ * consumer claims in flight and the lane tasks already running to settle, so a drain never reports while one of
+ * its groups is still publishing or aborting. Its unclaimed groups go back to the FIFO claim.
+ */
+export async function closeLaneRun(run: string, maxMs = 90_000): Promise<LaneStats | null> {
+  const open = [...policies].filter(([, state]) => state.run === run);
+  for (const [, state] of open) state.closing = true;
+  const started = Date.now();
+  while ((claiming > 0 || open.some(([, state]) => state.tasks > 0)) && Date.now() - started < maxMs) await sleep(20);
+  for (const [worktreeId, state] of open) if (policies.get(worktreeId) === state) policies.delete(worktreeId);
+  return open.length ? laneStats(open.map(([, state]) => state.timing)) : null;
+}
+function laneStats(timings: LaneTiming[]): LaneStats {
+  const sum = (key: Exclude<keyof LaneTiming, 'recentPerMember'>) => timings.reduce((total, timing) => total + timing[key], 0);
+  const round = (value: number, places: number) => Math.round(value * 10 ** places) / 10 ** places;
+  const active = sum('activeMs'), members = sum('appliedMembers'), transactions = sum('transactionMs');
+  return { busy: active > 0 ? round(sum('openArea') / active, 2) : null, applyMsPerPage: members > 0 ? Math.round(sum('applyMs') / members) : null,
+    turnWaitShare: transactions > 0 ? round(sum('turnWaitMs') / transactions, 3) : null };
+}
+function account(timing: LaneTiming, delta: number): void {
+  const now = Date.now();
+  if (timing.open > 0) { timing.openArea += timing.open * (now - timing.since); timing.activeMs += now - timing.since; }
+  timing.open += delta;
+  timing.since = now;
+}
+/**
+ * Times one lane group transaction: call at its begin, `turn()` when it starts waiting for the group before it
+ * to commit, `turned()` when that wait ends, and `end(members)` once the transaction has finished either way.
+ * Only a transaction that reached its turn counts toward the apply time per page.
+ */
+export function laneApplyBegin(state: LaneState): { turn(): void; turned(): void; end(members: number): void } {
+  const timing = state.timing, began = Date.now();
+  let turnAt: number | null = null, waited = 0, ended = false;
+  account(timing, 1);
+  return {
+    turn() { turnAt ??= Date.now(); },
+    turned() { if (turnAt !== null && !waited) waited = Date.now() - turnAt; },
+    end(members) {
+      if (ended) return;
+      ended = true;
+      account(timing, -1);
+      timing.transactionMs += Date.now() - began;
+      if (turnAt === null) return;
+      timing.applyMs += turnAt - began;
+      timing.appliedMembers += members;
+      const perMember = (turnAt - began) / Math.max(1, members);
+      timing.recentPerMember = timing.recentPerMember === null ? perMember : (timing.recentPerMember + perMember) / 2;
+      timing.turnWaitMs += waited || Date.now() - turnAt;
+    },
+  };
+}
+/**
+ * Counts a consumer claim that can take a lane row, from before its claim query until the claimed head's lane
+ * task is counted; returns the release. A head claimed while its run closes is already running before its task
+ * counts, so without this the drain could report before that head settles.
+ */
+export function laneClaim(): () => void {
+  claiming++;
+  let released = false;
+  return () => { if (!released) { released = true; claiming--; } };
+}
+/** The consumer claims `laneClaim` counts that have not released: a test that parks claims at `consumer:claiming` waits for the rest. */
+export function laneClaimsInFlight(): number { return claiming; }
+/** Counts a lane task from its head's claim until it settles; returns the release. */
+export function laneTask(state: LaneState): () => void {
+  state.tasks++;
+  let released = false;
+  return () => { if (!released) { released = true; state.tasks--; } };
+}
+export function lanePolicy(worktreeId: string): LanePolicy | null {
+  const state = policies.get(worktreeId);
+  return state ? { run: state.run, asked: state.asked, effective: state.effective, stepDown: state.stepDown, overlapped: state.overlapped, fallbacks: state.fallbacks } : null;
+}
+/** The recent apply time per member of a worktree's open lane run in this process; null before a lane group reached its turn. */
+export function laneApplyMsPerMember(worktreeId: string): number | null {
+  return policies.get(worktreeId)?.timing.recentPerMember ?? null;
+}
+/** The open lane runs and how many lanes each may run now (0 while the worktree's lease drains for an exclusive writer). */
+export function laneRoots(): Array<{ worktreeId: string; run: string; capacity: number }> {
+  return [...policies].map(([worktreeId, state]) => ({ worktreeId, run: state.run,
+    capacity: state.closing || (state.coordinationPath && leaseDraining(state.coordinationPath)) ? 0 : state.effective }));
+}
+/** The lane run a request belongs to, when its worktree's lane policy is open in this process. */
+export function laneOf(row: Pick<WriteRequest, 'worktree_id' | 'intent'>): LaneState | null {
+  const lane = (row.intent as Record<string, unknown> | null | undefined)?.lane;
+  const state = row.worktree_id ? policies.get(row.worktree_id) : undefined;
+  return typeof lane === 'string' && state?.run === lane && state.effective > 1 ? state : null;
+}
+/** A lane lock or statement timeout that survived its retry: one lane fewer for the rest of the drain. */
+export function stepDownLanes(worktreeId: string, reason: string): void {
+  const state = policies.get(worktreeId);
+  if (!state || state.effective <= 1) return;
+  state.effective--;
+  state.stepDown = reason;
+}
+
+/** The last member of a group is what the next group's `after` names. */
+function groupKey(rows: WriteRequest[]): string { return rows.at(-1)!.request_id; }
+export function laneClaimed(state: LaneState, rows: WriteRequest[]): void { state.claimed.add(groupKey(rows)); }
+export function laneFinished(state: LaneState, rows: WriteRequest[]): void { state.claimed.delete(groupKey(rows)); state.begun.delete(groupKey(rows)); }
+
+export class LaneAbort extends Error {
+  constructor(readonly reason: 'predecessor_requeued' | 'wounded' | 'order_timeout') { super(`lane ${reason}`); }
+}
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Lane transactions begin in manifest order: a group whose predecessor this
+ * process claimed but has not begun waits for it, so the oldest unfinished
+ * group always holds a connection first (transaction-mode poolers included).
+ * Returns the group's begun mark. The caller sets it inside its transaction,
+ * once BEGIN has run, so the next group's BEGIN always comes after this one's
+ * (marking before BEGIN let two lanes race it, #6574 CI).
+ */
+export async function awaitLaneBegin(state: LaneState, rows: WriteRequest[], maxMs = 10_000): Promise<() => void> {
+  const after = predecessorOf(rows);
+  const started = Date.now();
+  while (after && state.claimed.has(after) && !state.begun.has(after) && Date.now() - started < maxMs) await sleep(20);
+  if (after && state.claimed.has(after)) state.overlapped++;
+  const key = groupKey(rows);
+  return () => { state.begun.add(key); };
+}
+
+/**
+ * Inside the group transaction, after its members are applied and before the
+ * counters are locked: waits until the previous group ended. Each poll is a
+ * fresh read of the predecessor's receipt. #6712: a predecessor that ended
+ * without committing passes the turn like a committed one (its page's fate is
+ * its own). Throws LaneAbort when the predecessor went back to the queue, when
+ * an exclusive writer waits for the worktree's lease, or after `maxMs`.
+ */
+export async function awaitLaneTurn(tx: BrainEngine, state: LaneState, rows: WriteRequest[], maxMs = 60_000): Promise<void> {
+  const after = predecessorOf(rows);
+  if (!after) return;
+  const head = rows[0]!;
+  const started = Date.now();
+  for (let poll = 0; ; poll++) {
+    const [prior] = await tx.executeRaw<{ state: string }>('SELECT state FROM persistence_requests WHERE principal_kind=$1 AND principal_id=$2 AND request_id=$3::uuid',
+      [head.principal_kind, head.principal_id, after]);
+    if (prior && ['committed', 'failed', 'conflict', 'cancelled'].includes(prior.state)) return;
+    // A released (or not yet admitted) predecessor goes first: this lane gives its slot and claims back, rather than wait on it.
+    if (!prior || prior.state === 'queued') throw new LaneAbort('predecessor_requeued');
+    if (state.coordinationPath && leaseWounded(state.coordinationPath)) throw new LaneAbort('wounded');
+    if (Date.now() - started >= maxMs) throw new LaneAbort('order_timeout');
+    await sleep(Math.min(200, 25 * (poll + 1)));
+  }
+}
+
+function predecessorOf(rows: WriteRequest[]): string | null {
+  const after = (rows[0]?.intent as Record<string, unknown> | null | undefined)?.after;
+  return typeof after === 'string' ? after : null;
+}

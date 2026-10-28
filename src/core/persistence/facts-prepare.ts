@@ -1,0 +1,308 @@
+import type { BrainEngine, NewFact } from '../engine.ts';
+import { attributionCompatible } from '../facts/attribution.ts';
+import type { GBrainConfig } from '../config.ts';
+import { OperationError, opError } from '../ops/contract.ts';
+import { readFix } from '../ops/op-fix.ts';
+import type { Action } from '../agent-output.ts';
+import type { RegistryCode } from '../error-registry.ts';
+import { factsFenceEditor, factsFenceSection, parseFactsFence, formatFenceDate } from '../facts-fence.ts';
+import { serializePageToMarkdown } from '../markdown.ts';
+import { wholeBodySnapshot } from './segmented-apply.ts';
+import { assertFactNotWithdrawn, decideSingleFact, factWithdrawnRefusal, type FactCandidate } from '../facts/single-prepare.ts';
+import { supersededValidUntil } from '../facts/supersede-interval.ts';
+import { assertFactNotPurged, isFactWithdrawn } from '../facts/withdrawal.ts';
+import { samePageRewording, warnSamePageShadow } from '../facts/same-page-shadow.ts';
+import { extractFactsFromFenceText } from '../facts/extract-from-fence.ts';
+import { authorizeWrite } from './authority.ts';
+import { authorizePageVisibility } from './page-visibility.ts';
+import { authorizeFactsBackstop } from './effect-facts.ts';
+import { getWriteRequestById } from './journal.ts';
+import { preparePageMutation } from './page-prepare.ts';
+import { PageRevisionConflictError } from '../page-state/types.ts';
+import { FACTS_BATCH_INCOMPLETE_MESSAGE, FACTS_DEDUP_CHANGED_MESSAGE, FACTS_ENTITY_CHANGED_IN_PREPARATION_MESSAGE, FACTS_ENTITY_CHANGED_MESSAGE } from './verb-errors.ts';
+import type { PreparedMutation } from './coordinator.ts';
+import type { WriteRequest } from './model.ts';
+import type { ManagedFactIntent, FrozenExtractedFact } from './facts-maintenance.ts';
+import { assertManagedFactsEmbedding } from './facts-maintenance.ts';
+import { normalizeTargetFences } from '../fence-repair/import-step.ts';
+import { refuseUnparsedRewrite } from '../fence-repair/refusal.ts';
+import { fenceAppendPendingTier, withPendingFenceRows } from '../eligibility/fence-overlay.ts';
+import { withPageTierKept } from '../trust/fence-append.ts';
+import { pageFencesNormalized } from '../fence-repair/report.ts';
+import { declaredWriteTrust, derivedWriteTrust, readDerivationDeclaration, readTaintInputs, recordTaintEdges } from '../trust/taint.ts';
+import { minTrust, type TaintInput, type WriteTrust } from '../trust/tier.ts';
+import { applyGateDecision, derivedGateConfig, derivedGateInput, emptyGateTally } from '../trust/derived-gate.ts';
+import { decideFactWrite, recordFlaggedRow, type GatedRowDecision } from '../write-gate-store.ts';
+
+const requestFix = (row: WriteRequest): Action => row.principal_kind === 'local_cli'
+  ? readFix(`Reads fact request ${row.request_id}'s durable receipt: its state and recorded error, read-only.`, { argv: ['gbrain', 'write-request', '--', row.request_id] })
+  : readFix(`Shows source ${row.source_id}'s canonical owner with its pending, failed and recovering requests, read-only.`,
+    { argv: ['gbrain', 'sources', 'writer', 'status', '--source', row.source_id, '--json'] });
+
+/**
+ * A refused managed fact request. The journal keeps only code and message, so
+ * the suggestion stands alone: inspect the request, then extract again.
+ */
+function factsRefusal(code: RegistryCode, message: string, row: WriteRequest, cause: string,
+  next = 'once it is final, run extract_facts again for the same turn with a new request_id.', fix = requestFix(row)): OperationError {
+  return opError(code, message, `${cause} Fact request ${row.request_id} in source ${row.source_id} was refused; inspect it first and do not resubmit it, then ${next}`, { fix });
+}
+
+/** #5836: an inferred subject dedups exact text only, so a similar fact is never superseded or dropped for it. */
+function dedupEmbedding(fact: { embedding?: Float32Array | null; entity_inferred?: unknown }): Float32Array | null {
+  return fact.entity_inferred ? null : fact.embedding ?? null;
+}
+
+function thawFact(fact: FrozenExtractedFact): NewFact & { entity_slug: string | null; kind: NonNullable<NewFact['kind']>; visibility: NonNullable<NewFact['visibility']> } {
+  return { ...fact, entity_slug: fact.entity_slug ?? null, kind: fact.kind ?? 'fact', visibility: fact.visibility ?? 'private',
+    valid_from: new Date(fact.valid_from), valid_until: fact.valid_until ? new Date(fact.valid_until) : null,
+    embedding: fact.embedding ? new Float32Array(fact.embedding) : null };
+}
+
+/**
+ * #5575 I2: extracted facts publish at the extraction's declared taint, never
+ * above the source page's current tier (an intent queued before tiers derives
+ * from its origin page alone). Undefined when neither exists: the request's
+ * channel tier applies.
+ */
+async function managedFactsTrust(engine: BrainEngine, p: ManagedFactIntent): Promise<{ trust: WriteTrust; inputs: Array<Pick<TaintInput, 'table' | 'id'>> } | undefined> {
+  const declaration = readDerivationDeclaration(p.derivation);
+  if (!declaration && !p.origin) return undefined;
+  const page = p.origin ? await readTaintInputs(engine, [{ table: 'pages', id: p.origin.pageId }]) : [];
+  const live = derivedWriteTrust({ channel: declaration?.origin.channel ?? 'derive:facts_backstop', inputs: page, requestId: p.originalRequestId });
+  if (!declaration) return { trust: live, inputs: page };
+  const declared = declaredWriteTrust(declaration);
+  return { trust: { tier: minTrust(declared.tier, live.tier), origin: declared.origin }, inputs: declaration.inputs };
+}
+
+/**
+ * #6898 follow-up: a later part of a split entity group (facts-maintenance.ts entityParts) targets the
+ * revision the batch read, which its own earlier part changed. The revision the latest committed earlier
+ * part of the same batch, entity and writer left is accepted too; anything else changed the page.
+ */
+async function predecessorPartRevision(engine: BrainEngine, row: WriteRequest, p: ManagedFactIntent): Promise<string | null | undefined> {
+  if (!p.part || p.part.index <= 1) return undefined;
+  const [earlier] = await engine.executeRaw<{ revision: string | null }>(`SELECT outcome->>'revision' AS revision FROM persistence_requests
+    WHERE operation='extract_facts' AND source_id=$1 AND source_incarnation=$2::uuid AND principal_kind=$3 AND principal_id=$4
+      AND COALESCE(intent->>'batchKey',outcome->>'batch_key')=$5 AND slug=$6 AND state='committed'
+      AND COALESCE(intent->'part'->>'index',outcome->'part'->>'index')::int < $7 ORDER BY sequence DESC LIMIT 1`,
+  [row.source_id, row.source_incarnation, row.principal_kind, row.principal_id, p.batchKey, row.slug, p.part.index]);
+  return earlier ? earlier.revision : undefined;
+}
+
+export async function prepareManagedFactsMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
+  const p = row.intent as ManagedFactIntent | null;
+  if (!p || !['managed_facts_entity', 'managed_facts_complete'].includes(p.kind) || row.operation !== 'extract_facts'
+    || row.authority.slugPrefixes !== null || row.authority.restrictedNamespace || row.authority.delegated) {
+    throw factsRefusal('permission_denied', 'Unsupported fact extraction intent or confined authority.', row,
+      'Managed fact extraction runs only for an extract_facts intent under an unconfined writer, and this request is limited to slug prefixes, a restricted namespace or a delegation, or carries another intent.',
+      'record single facts with remember instead, or ask the user to run the extraction from a writer whose grant is not confined.');
+  }
+  const embedded = p.facts?.some(fact => fact.embedding !== null && fact.embedding !== undefined);
+  const validate = async (tx: BrainEngine, lock = false) => {
+    if (embedded) {
+      await assertManagedFactsEmbedding(tx, config, p.embedding, lock);
+      if (p.facts!.some(fact => fact.embedding && (fact.embedding.length !== p.embedding!.dimensions || !fact.embedding.every(Number.isFinite)))) {
+        throw factsRefusal('embedding_configuration', 'Retained fact vectors do not match their embedding signature.', row,
+          `A retained fact vector is not a finite ${p.embedding!.dimensions}-dimension vector of ${p.embedding!.model}, so none of these facts were installed.`);
+      }
+    }
+    if (p.originalRequestId) {
+      const original = await getWriteRequestById(tx, p.originalRequestId);
+      if (!original || original.state !== 'committed' || original.source_id !== row.source_id || original.source_incarnation !== row.source_incarnation
+        || original.principal_kind !== row.principal_kind || original.principal_id !== row.principal_id) {
+        throw factsRefusal('permission_denied', 'The original fact extraction authority is unavailable.', row,
+          'The committed page write that started this extraction is gone, not committed, or belongs to another source or writer, so its authority cannot back these facts.');
+      }
+      await authorizeFactsBackstop(tx, original, true);
+    }
+    if (p.origin) {
+      await authorizeWrite(tx, row.authority, 'extract_facts', p.origin.slug);
+      await authorizePageVisibility(tx, row.authority, p.origin.slug);
+      const origin = await tx.readPageSnapshot(p.origin.slug, { sourceId: row.source_id });
+      if (!origin || origin.page.id !== p.origin.pageId) throw factsRefusal('page_identity_changed', 'The source page was removed or replaced during fact extraction.', row,
+        `Page ${p.origin.slug}, which these facts were extracted from, was deleted or replaced during extraction.`);
+      if (origin.revision !== p.origin.revision) {
+        const own = await tx.executeRaw(`SELECT id FROM persistence_requests WHERE operation='extract_facts' AND source_id=$1
+          AND source_incarnation=$2::uuid AND principal_kind=$3 AND principal_id=$4
+          AND (COALESCE(intent->>'batchKey',outcome->>'batch_key')=$5 OR COALESCE(intent->>'inputDigest',outcome->>'input_digest')=$8)
+          AND slug=$6 AND state='committed' AND outcome->>'revision'=$7`,
+        [row.source_id, row.source_incarnation, row.principal_kind, row.principal_id, p.batchKey, p.origin.slug, origin.revision, p.inputDigest ?? null]);
+        if (!own.length) throw factsRefusal('revision_conflict', 'The source page changed during fact extraction.', row,
+          `Page ${p.origin.slug} changed after its facts were extracted, so facts from the older text were not published.`,
+          `once it is final, run extract_facts again on the current text of ${p.origin.slug} with a new request_id.`);
+      }
+    }
+  };
+  await validate(engine);
+  const additionalPageKeys = p.origin ? [{ sourceId: row.source_id, slug: p.origin.slug }] : [];
+  if (p.kind === 'managed_facts_complete') return { observedRevision: null, noop: true, additionalPageKeys, validate, apply: async tx => {
+    const children = p.children ?? [];
+    const done = await tx.executeRaw<{ outcome: { inserted?: number; duplicate?: number; fact_ids?: number[]; withdrawn_skipped?: number; would_dedup_same_page?: number } }>(`SELECT outcome FROM persistence_requests WHERE id=ANY($1::uuid[]) AND source_incarnation=$2::uuid
+      AND state='committed' AND COALESCE(intent->>'batchKey',outcome->>'batch_key')=$3 AND operation='extract_facts'`, [children, row.source_incarnation, p.batchKey]);
+    if (done.length !== children.length) throw factsRefusal('revision_conflict', FACTS_BATCH_INCOMPLETE_MESSAGE, row,
+      `${children.length - done.length} of the batch's ${children.length} per-entity fact requests have not committed, so the extraction cannot be recorded as complete.`,
+      'once the entity requests are final, run extract_facts again for the same turn with a new request_id only if facts are still missing.');
+    const withdrawnSkipped = done.reduce((sum, item) => sum + Number(item.outcome.withdrawn_skipped ?? 0), 0);
+    const wouldDedupSamePage = done.reduce((sum, item) => sum + Number(item.outcome.would_dedup_same_page ?? 0), 0);
+    return { status: 'completed', entity_requests: children.length, kind: p.kind, batch_key: p.batchKey, input_digest: p.inputDigest,
+      inserted: done.reduce((sum, item) => sum + Number(item.outcome.inserted ?? 0), 0),
+      duplicate: done.reduce((sum, item) => sum + Number(item.outcome.duplicate ?? 0), 0),
+      ...(withdrawnSkipped ? { withdrawn_skipped: withdrawnSkipped } : {}),
+      ...(wouldDedupSamePage ? { would_dedup_same_page: wouldDedupSamePage } : {}),
+      fact_ids: done.flatMap(item => item.outcome.fact_ids ?? []) };
+  } };
+  const stored = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id, includeDeleted: true });
+  if (stored?.page.deleted_at || (stored?.page.id ?? null) !== row.page_id || (stored?.revision ?? null) !== (p.expected_revision ?? null)
+    && (stored?.revision ?? null) !== await predecessorPartRevision(engine, row, p)) {
+    throw factsRefusal('revision_conflict', FACTS_ENTITY_CHANGED_MESSAGE, row,
+      `Entity page ${row.slug} changed or was deleted after these facts were admitted, so none were published.`);
+  }
+  const facts = (p.facts ?? []).map(fact => ({ ...thawFact(fact), embedding_model: fact.embedding ? p.embedding?.model ?? null : null }));
+  // writeSingleFact's opt-in: an unattributed row keeps its fallback entity slug, database-only.
+  const fallback = (fact: { entity_slug: string | null }) => p.attribute_fallback === true && row.slug === 'memory/unattributed'
+    && fact.entity_slug !== null && fact.entity_slug !== row.slug;
+  if (!facts.length || facts.some(fact => !fallback(fact) && (fact.entity_slug !== null && fact.entity_slug !== row.slug || fact.entity_slug !== null && !stored))) {
+    throw factsRefusal('invalid_params', 'The prepared facts do not match their entity.', row,
+      `The request holds no facts, or facts attributed to a page other than ${row.slug}, so none were published.`);
+  }
+  // Wave B: a segmented entity page within 24 MiB is read back whole and its fence written as a normal put; a larger one refuses.
+  const snapshot = await wholeBodySnapshot(engine, stored, 'facts fence write');
+  // #6188 (D20): the entity's stored fence is normalized in this same write; a residual refuses typed `target_fence_malformed`.
+  const target = snapshot ? await normalizeTargetFences(engine, { sourceId: row.source_id, slug: row.slug, kind: 'facts', page: snapshot.page }) : null;
+  // #6686: the fence is edited in the section it lives in (a lone timeline fence stays below the sentinel); the other section is kept byte for byte.
+  const fenced = { compiled_truth: target?.page.compiled_truth ?? '', timeline: target?.page.timeline ?? '' };
+  const section = factsFenceSection(fenced);
+  // #6898 follow-up: the fence is parsed once and rendered once for the whole group, not once per fact.
+  const fence = factsFenceEditor(fenced, section);
+  const [maximum] = await engine.executeRaw<{ n: number }>('SELECT COALESCE(MAX(row_num),0)::int AS n FROM facts WHERE source_id=$1 AND source_markdown_slug=$2', [row.source_id, row.slug]);
+  let nextRow = Math.max(maximum?.n ?? 0, ...[fenced.compiled_truth, fenced.timeline].flatMap(text => parseFactsFence(text).facts.map(fact => fact.rowNum))) + 1;
+  const entries: Array<{ fact: typeof facts[number]; duplicateId: number | null; rowNum?: number; duplicateOf?: number; supersedes?: FactCandidate; gate?: GatedRowDecision }> = [];
+  const seen = new Map<string, number[]>();
+  // #5575 B3: a new row passes the write gate at the extraction's declared tier (ENG-18) before it reaches the fence;
+  // held rows are recorded at publication, rejected rows are counted and skipped.
+  const taint = await managedFactsTrust(engine, p);
+  const gateCfg = taint ? await derivedGateConfig(engine) : null;
+  const blocked: GatedRowDecision[] = [];
+  // #6506: automatic extraction skips a forgotten claim and keeps the rest of the group; a purge tombstone still
+  // refuses the group, as it does for every writer; explicit writers (no flag) refuse the forgotten claim.
+  let withdrawnSkipped = 0;
+  // #6333 shadow (managed mirror of the backstop's counter): a same-page rewording is counted on the entity outcome
+  // and named on stderr; nothing is dropped. The count is frozen in the receipt, so a replay reports it, not recounts it.
+  let wouldDedupSamePage = 0;
+  for (const fact of facts) {
+    if (p.withdrawn === 'skip') {
+      await assertFactNotPurged(engine, row.source_id, fact);
+      if (await isFactWithdrawn(engine, row.source_id, fact.visibility, fact.fact, fact.entity_slug)) { withdrawnSkipped++; continue; }
+    } else await assertFactNotWithdrawn(engine, row.source_id, fact);
+    const key = JSON.stringify([fact.fact, fact.visibility, fact.entity_slug]);
+    const earlier = (seen.get(key) ?? []).find(i => attributionCompatible(entries[i].fact.attributed_to, fact.attributed_to));
+    if (earlier !== undefined) { entries.push({ fact, duplicateId: null, duplicateOf: earlier }); continue; }
+    seen.set(key, [...(seen.get(key) ?? []), entries.length]);
+    const decision = await decideSingleFact(engine, row.source_id, fact, dedupEmbedding(fact), fact.embedding_model, fact.source);
+    const shadow = decision.candidate ? null : await samePageRewording(engine, row.source_id, fact, dedupEmbedding(fact));
+    if (shadow) { wouldDedupSamePage++; warnSamePageShadow(fact.source_session ?? null, shadow.id, shadow.score); }
+    const supersedes = p.supersede === true && decision.status === 'superseded' ? decision.candidate! : undefined;
+    if (decision.candidate && !supersedes) { entries.push({ fact, duplicateId: decision.candidate.id }); continue; }
+    const gate = taint ? decideFactWrite(fact, { sourceId: row.source_id, slug: row.slug, payload: { ...fact, embedding: null },
+      input: derivedGateInput(taint.trust, row.id), cfg: gateCfg! }) : undefined;
+    if (gate && gate.action !== 'insert') { blocked.push(gate); continue; }
+    const rowNum = fact.entity_slug !== null && !fallback(fact) ? nextRow++ : undefined;
+    // #6385 R12: an entity fence that does not parse cleanly refuses typed instead of losing the rows it skipped.
+    if (rowNum !== undefined) refuseUnparsedRewrite(fenced, row.slug, row.source_id, () => fence.append({
+      rowNum, claim: fact.fact, kind: fact.kind, visibility: fact.visibility,
+      confidence: fact.confidence ?? 1, notability: fact.notability ?? 'medium', source: fact.source, context: fact.context ?? undefined,
+      validFrom: formatFenceDate(fact.valid_from!), validUntil: fact.valid_until ? formatFenceDate(fact.valid_until) : undefined,
+      claimMetric: fact.claim_metric ?? undefined, claimValue: fact.claim_value ?? undefined,
+      claimUnit: fact.claim_unit ?? undefined, claimPeriod: fact.claim_period ?? undefined,
+      ...(fact.attributed_to ? { attributedTo: fact.attributed_to } : {}) }));
+    // Strike the superseded row in this page's fence, as the remember mutation does (#6686: in the section that holds it).
+    if (supersedes && rowNum !== undefined && supersedes.source_markdown_slug === row.slug && supersedes.row_num != null) {
+      const until = supersededValidUntil(supersedes, fact.valid_from!);
+      fence.strike(Number(supersedes.row_num), rowNum, until ? formatFenceDate(until) : undefined);
+    }
+    entries.push({ fact, duplicateId: null, rowNum, supersedes, gate });
+  }
+  const next = fence.page();
+  const canonicalFacts = extractFactsFromFenceText(parseFactsFence(next[section]).facts, row.slug, row.source_id);
+  for (const entry of entries) {
+    if (entry.rowNum === undefined) continue;
+    const canonical = canonicalFacts.find(fact => fact.row_num === entry.rowNum);
+    if (!canonical) throw factsRefusal('invalid_params', 'An extracted fact could not be represented in its canonical fence.', row,
+      `An extracted fact did not round-trip through the ## Facts table of page ${row.slug}, so none were published.`);
+    entry.fact = { ...entry.fact, ...canonical, kind: canonical.kind ?? entry.fact.kind,
+      visibility: canonical.visibility ?? entry.fact.visibility, entity_slug: row.slug,
+      embedding: entry.fact.embedding, source_session: entry.fact.source_session };
+  }
+  let page: PreparedMutation | undefined;
+  if (snapshot && entries.some(entry => entry.rowNum !== undefined)) {
+    // #5575 ENG-1: the appended rows have no facts rows yet; their chunks are cut at the append's tier.
+    const rowNums = entries.flatMap(entry => entry.rowNum === undefined ? [] : [entry.rowNum]);
+    const moved = () => factsRefusal('revision_conflict', FACTS_ENTITY_CHANGED_IN_PREPARATION_MESSAGE, row,
+      `Entity page ${row.slug} changed while its ## Facts table was being prepared, so none of these facts were published.`);
+    page = await withPendingFenceRows({ sourceId: row.source_id, slug: row.slug, rowNums, tier: fenceAppendPendingTier(taint?.trust.tier) },
+      () => preparePageMutation(engine, { ...row, intent: { ...p, expected_revision: snapshot.revision,
+        content: serializePageToMarkdown({ ...snapshot.page, ...next }, snapshot.tags) } }, config)).catch(error => {
+      // #7602: the page preparation refuses a move before the check below sees it.
+      throw error instanceof PageRevisionConflictError && error.code === 'revision_conflict' ? moved() : error;
+    });
+    if (page.observedRevision !== snapshot.revision) throw moved();
+  }
+  return { observedRevision: snapshot?.revision ?? null, file: page?.file, ...(page?.exclusiveSources ? { exclusiveSources: page.exclusiveSources } : {}), noop: entries.every(entry => entry.duplicateId !== null || entry.duplicateOf !== undefined),
+    ...(taint ? { trust: taint.trust } : {}),
+    additionalPageKeys, validate: async tx => {
+      await validate(tx, true);
+      for (const entry of entries) {
+        // #6506 (R15): under `withdrawn: 'skip'` a claim forgotten between preparation and this locked validation is a
+        // terminal revision_conflict whose detail names the withdrawal (the fence body is already rendered, and an
+        // extract_facts request is never re-prepared); an input-keyed batch recovers through its follow-up batch.
+        if (p.withdrawn !== 'skip') await assertFactNotWithdrawn(tx, row.source_id, entry.fact);
+        else {
+          await assertFactNotPurged(tx, row.source_id, entry.fact);
+          if (await isFactWithdrawn(tx, row.source_id, entry.fact.visibility, entry.fact.fact, entry.fact.entity_slug)) {
+            const refusal = factsRefusal('revision_conflict', 'A claim was forgotten after these facts were prepared.', row,
+              `A claim in this group was forgotten in source ${row.source_id} after the facts were prepared, so none of these facts were published; the forgotten claim stays withdrawn.`);
+            refusal.withdrawn = (await factWithdrawnRefusal(tx, row.source_id, entry.fact)).withdrawn;
+            throw refusal;
+          }
+        }
+        if (entry.duplicateOf !== undefined) continue;
+        const current = await decideSingleFact(tx, row.source_id, entry.fact, dedupEmbedding(entry.fact), entry.fact.embedding_model, entry.fact.source);
+        if ((current.candidate?.id ?? null) !== (entry.duplicateId ?? entry.supersedes?.id ?? null)) throw factsRefusal('revision_conflict', FACTS_DEDUP_CHANGED_MESSAGE, row,
+          `A matching fact in source ${row.source_id} was added or retired before publication, so the deduplication decision for ${row.slug} is stale and none of these facts were published.`);
+      }
+      await page?.validate?.(tx);
+    }, apply: async tx => {
+      if (page) await withPageTierKept(tx, { sourceId: row.source_id, slug: row.slug }, () => page!.apply(tx));
+      const ids: number[] = [];
+      let inserted = 0;
+      let superseded = 0;
+      for (const entry of entries) {
+        if (entry.duplicateOf !== undefined) { ids.push(ids[entry.duplicateOf]); continue; }
+        if (entry.duplicateId !== null) { ids.push(entry.duplicateId); continue; }
+        if (entry.rowNum !== undefined) {
+          const result = await tx.insertFacts([{ ...entry.fact, row_num: entry.rowNum, source_markdown_slug: row.slug }], { source_id: row.source_id });
+          if (result.ids.length !== 1) throw factsRefusal('storage_error', 'The canonical extracted fact was not indexed.', row,
+            `A fact row written into the ## Facts table of ${row.slug} was not indexed, so the publication transaction rolled back.`);
+          ids.push(result.ids[0]);
+        } else ids.push((await tx.insertFact(entry.fact, { source_id: row.source_id })).id);
+        inserted++;
+        if (taint) await recordTaintEdges(tx, { table: 'facts', id: ids[ids.length - 1], sourceId: row.source_id }, taint.inputs);
+        if (entry.gate) await recordFlaggedRow(tx, entry.gate, { table: 'facts', id: ids[ids.length - 1], sourceId: row.source_id });
+        if (entry.supersedes) {
+          await tx.executeRaw('UPDATE facts SET expired_at=COALESCE(expired_at,now()),superseded_by=$3,valid_until=COALESCE($4::timestamptz,valid_until) WHERE id=$1 AND source_id=$2',
+            [entry.supersedes.id, row.source_id, ids[ids.length - 1], supersededValidUntil(entry.supersedes, entry.fact.valid_from!)]);
+          superseded++;
+        }
+      }
+      const write_gate = emptyGateTally();
+      for (const gate of blocked) await applyGateDecision(tx, gate, { table: 'facts', sourceId: row.source_id }, async () => null, write_gate);
+      return { status: 'completed', inserted, duplicate: entries.length - inserted, superseded, fact_ids: ids, ...(blocked.length ? { write_gate } : {}),
+        ...(withdrawnSkipped ? { withdrawn_skipped: withdrawnSkipped } : {}),
+        ...(wouldDedupSamePage ? { would_dedup_same_page: wouldDedupSamePage } : {}),
+        fenced: page !== undefined, kind: p.kind, batch_key: p.batchKey, input_digest: p.inputDigest,
+        ...(p.part ? { publication: p.part.deferred_facts ? 'partial' : 'final_part', part: p.part } : {}),
+        ...(page && target?.fixes.length ? { fences_normalized: pageFencesNormalized({ sourceId: row.source_id, slug: row.slug, fixes: target.fixes,
+          writer: row.principal_kind, path: snapshot?.page.source_path ?? null, remote: row.authority.remote }) } : {}) };
+    } };
+}

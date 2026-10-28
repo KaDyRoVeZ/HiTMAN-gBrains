@@ -1,0 +1,405 @@
+/**
+ * google/types — shared shapes for the google source kind.
+ *
+ * The clients module (google-clients.ts) normalizes raw Gmail/Calendar/People
+ * API payloads into these; the renderer (google-render.ts) and the loop
+ * detector (loop-detect.ts) consume them. Pure data, no I/O.
+ */
+
+export type GoogleService = 'gmail' | 'calendar' | 'contacts';
+
+export const ALL_GOOGLE_SERVICES: readonly GoogleService[] = ['gmail', 'calendar', 'contacts'];
+
+/** The Google Cloud API behind each service: the name the console enables and its title. */
+export const GOOGLE_SERVICE_API: Record<GoogleService, { api: string; title: string }> = {
+  gmail: { api: 'gmail.googleapis.com', title: 'Gmail API' },
+  calendar: { api: 'calendar-json.googleapis.com', title: 'Google Calendar API' },
+  contacts: { api: 'people.googleapis.com', title: 'People API' },
+};
+
+/**
+ * #7073: a service the credential cannot reach because its API is disabled
+ * for the OAuth client's project (`api_not_enabled`, with the project and the
+ * enable link Google returned) or its scope was not granted (`scope_missing`).
+ */
+export interface GoogleApiProblem {
+  service: GoogleService;
+  code: 'api_not_enabled' | 'scope_missing';
+  api: string;
+  api_title: string;
+  project: string | null;
+  enable_url: string | null;
+}
+
+/** The account's primary calendar — the Calendar API's own alias, and the default a google source sweeps. */
+/** Where a Google source renders its contact pages unless `g_contacts_dir` says otherwise. */
+export const DEFAULT_CONTACTS_DIR = 'people';
+export const DEFAULT_CALENDAR_ID = 'primary';
+
+export interface GoogleSourceConfig {
+  /** Account email — vault credential pointer in vault mode; identity only
+   *  (From/To matching, deep-link authuser) in command/env modes. */
+  account: string;
+  services: GoogleService[];
+  /** Backfill/reconcile window in days (default 90). */
+  historyDays: number;
+  /**
+   * How far ahead calendar pages are kept, in days (`g_future_days`, 1..3650).
+   * Present only when the source sets it, so an unset knob leaves every
+   * existing source's connector identity unchanged; the sweep falls back to
+   * CALENDAR_HORIZON_DAYS.
+   */
+  futureDays?: number;
+  /**
+   * Gmail label names or ids whose threads the open-loop engine leaves alone
+   * (`g_loops_exclude_labels`, comma-separated; #5445). Present only when the
+   * source sets it; the brain-wide `loops.extraction_exclude_labels` is the
+   * fallback. Not part of the connector identity: it changes what is
+   * extracted, not which pages exist.
+   */
+  loopsExcludeLabels?: string[];
+  /** Calendar swept by this source (default DEFAULT_CALENDAR_ID). One calendar per
+   *  source so each keeps its own sync token — point a second source at a
+   *  secondary calendar id to ingest it too. */
+  calendarId: string;
+  /**
+   * Directory (relative to `dir`) the contact pages render under
+   * (`g_contacts_dir`, default DEFAULT_CONTACTS_DIR = `people`; #4845). A brain
+   * that maintains its own `people/` pages points its Google source at
+   * `contacts` so the two namespaces never collide. Contact pages are found
+   * by `google_contact_id`, not by directory, so changing it moves them.
+   */
+  contactsDir: string;
+  /** Managed dir where pages are materialized. */
+  dir: string;
+  /**
+   * How the sweep obtains a Google access token (default 'vault'):
+   *  - 'vault'   — gbrain's credential vault (BYO OAuth / hosted relay).
+   *  - 'command' — run `tokenCommand`, expect a token on stdout (gog,
+   *                gcloud, a credential gateway's mint command).
+   *  - 'env'     — read a live token from the env var named `tokenEnv`
+   *                (refreshed by something outside gbrain).
+   */
+  access: 'vault' | 'command' | 'env';
+  tokenCommand?: string;
+  tokenEnv?: string;
+}
+
+/** Cursor state persisted at <dir>/.google-source.json. */
+export interface GoogleSourceState {
+  /** Gmail delta cursor (history.list startHistoryId). */
+  gmail_history_id: string | null;
+  /**
+   * Backfill floor, epoch MILLISECONDS: everything strictly newer than this
+   * within the window is already imported. Moves DOWNWARD during the initial
+   * backfill (newest→oldest, batch-committed) so a killed backfill resumes
+   * where it stopped instead of restarting (outside-voice F7a).
+   */
+  gmail_backfill_floor_ms: number | null;
+  gmail_backfill_done: boolean;
+  /**
+   * #5438 (adopted from #5581): lower bound (epoch ms) the completed backfill
+   * actually covered. A later, WIDER g_history_days reopens the backfill below
+   * it instead of silently leaving the extra history unimported; absent on
+   * legacy state (no reopen).
+   */
+  gmail_backfill_cutoff_ms?: number | null;
+  /**
+   * #5581: history-expired gap: `[gmail_gap_after_ms,
+   * gmail_gap_floor_ms)` is drained newest→oldest with the same resumable floor
+   * walk as the backfill. Both null when no gap is open.
+   */
+  gmail_gap_after_ms?: number | null;
+  gmail_gap_floor_ms?: number | null;
+  /**
+   * #5581: delta threads flagged by an already-consumed history window but
+   * not yet landed (capped: 1,000 ids or 64 KB). An aborted delta drain
+   * advances `gmail_history_id` and parks the remainder here.
+   */
+  gmail_pending_thread_ids?: string[];
+  /** Bookmark for the history-expired fallback: newest internalDate imported. */
+  gmail_newest_ms: number | null;
+  /**
+   * Pre-wave-4 poison-thread ledger (consecutive failures per thread id). Read
+   * once and carried into `item_holds`; never written again.
+   */
+  gmail_fail_counts?: Record<string, number>;
+  /** Fix wave 4: connector item holds (src/core/connectors/item-holds.ts). */
+  item_holds?: unknown;
+  /**
+   * #5868: threads whose loop a grace window withheld, keyed by thread id
+   * (src/core/google/loop-catchup.ts). Separate from `item_holds`: never a
+   * failure, never counted by doctor `connector_held_items` or `waiting`.
+   */
+  loop_grace_holds?: Record<string, LoopGraceHold>;
+  /** #5868: one-shot 14-day grace-hold backfill done (set after a non-aborted sweep). */
+  loop_grace_backfill_done?: boolean;
+  /** #5867: managed-source 30-day loops_extract catch-up progress. */
+  loops_catchup?: LoopsCatchupState;
+  /**
+   * #5012: the record of reply-owed loops the detector withheld, per sender
+   * (src/core/google/loop-catchup.ts, capped). A sender leaves it when a later
+   * thread of theirs opens a loop. `gbrain waiting` counts the open loops
+   * from these senders that the rule would not have opened.
+   */
+  loop_withheld_senders?: Record<string, LoopWithheldSender>;
+  /** #5012: one-shot re-check of the senders behind open reply-owed loops (set when seeded). */
+  loop_automated_backfill_done?: boolean;
+  /**
+   * #5012 item 9: set when `events.list` on the configured calendar returned
+   * 403 or 404 (the account cannot read it), cleared by the next successful
+   * list. `gbrain doctor` and `gbrain google status --no-probe` read it.
+   */
+  calendar_unreadable?: CalendarUnreadable | null;
+  /**
+   * #7073: services the last sweep could not reach (API disabled, scope not
+   * granted). A service leaves it when its sweep reaches the API again.
+   * `gbrain doctor` (google_api_access) reads it with no network call.
+   */
+  api_access?: { problems: GoogleApiProblem[]; at: string } | null;
+  calendar_sync_token: string | null;
+  /**
+   * Calendar id `calendar_sync_token` was minted for. A token is only valid
+   * against its own calendar: when g_calendar_id changes, the sweep discards
+   * the token and re-lists windowed instead of pairing the new calendar with
+   * the old cursor. Absent on legacy state, which predates secondary
+   * calendars and was therefore always primary's.
+   */
+  calendar_id?: string | null;
+  /**
+   * Ceiling (epoch ms) of the last calendar list that reached the window's
+   * leading edge. Deltas omit unchanged events, so once the edge is a day
+   * past this value the sweep lists the gap (calendar-window.ts). Missing on
+   * state saved before it existed, which is listed from now instead.
+   */
+  calendar_horizon_ms?: number | null;
+  contacts_sync_token: string | null;
+  /**
+   * #6324: the `personFields` mask `contacts_sync_token` was minted under
+   * (`CONTACT_PERSON_FIELDS` at the time). Written together with the token
+   * after a successful sweep and never on its own: People rejects a token
+   * reused with different request parameters, so a mask that differs from
+   * the current constant means the token is unusable and the sweep lists
+   * fully. Absent on state saved before the mask grew (legacy = the old mask).
+   */
+  contacts_person_fields?: string | null;
+  /**
+   * #6324: contact-group directory cache (resource name → display name) from
+   * the last successful `contactGroups` read; the fallback when the directory
+   * cannot be read during a sweep. Never authoritative on its own.
+   */
+  contact_groups?: Record<string, string>;
+  last_full_at: string | null;
+  gmail_attachment_backfill?: {
+    version: 1;
+    account: string;
+    afterPageId: number;
+    throughPageId: number;
+    inspected: number;
+    unavailable?: number;
+    unavailableMessages?: number;
+    complete: boolean;
+  };
+}
+
+/**
+ * Derive the suggested/created source id for a connected account. Shared by
+ * `gbrain google setup` (which creates it) and connect's next-step hint
+ * (which prints it) so the two can never diverge — SOURCE_ID_RE rejects
+ * dots, so a dotted Gmail local part must be sanitized identically in both.
+ */
+export function deriveSourceId(account: string): string {
+  const local = account.split('@')[0] ?? 'gmail';
+  const id = `gmail-${local}`
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .slice(0, 32)
+    .replace(/-+$/, '');
+  return id || 'gmail';
+}
+
+/**
+ * #5868: one grace-held thread. `spec` is the loop its last detection would
+ * open at `due_ms`; `rev` is the page's newest message id it was computed
+ * from. A backfill seed has neither and is re-fetched once due.
+ */
+export interface LoopGraceHold {
+  due_ms: number;
+  slug: string | null;
+  rev: string | null;
+  spec: {
+    loopType: 'unanswered_inbound' | 'unanswered_outbound';
+    counterpartyEmail: string;
+    summary: string;
+    evidence: Array<{ message_id?: string; page_slug?: string; quote?: string }>;
+    lastActivityMs: number;
+    openedMs: number;
+  } | null;
+}
+
+/** #5012: one sender whose reply-owed loops the detector withheld. */
+export interface LoopWithheldSender {
+  reason: 'automated_mail' | 'updates_without_reciprocity';
+  count: number;
+  last_ms: number;
+}
+
+/** #5012 item 9: the configured calendar could not be read. */
+export interface CalendarUnreadable {
+  code: 'calendar_unreadable';
+  calendar_id: string;
+  http_status: 403 | 404;
+  at: string;
+}
+
+/** #5867: the managed catch-up's window floor, its one-retry set and its done marker. */
+export interface LoopsCatchupState {
+  version: 1;
+  floor_ms: number;
+  retried: string[];
+  done: boolean;
+}
+
+export interface GmailMessageMeta {
+  id: string;
+  threadId: string;
+  from: string;
+  /** Lowercased bare addresses. */
+  fromAddress: string;
+  to: string[];
+  cc: string[];
+  subject: string;
+  dateIso: string;
+  internalDateMs: number;
+  labelIds: string[];
+  listUnsubscribe: boolean;
+  /** RFC 3834 `Auto-Submitted` other than `no` (tracker notices, auto-replies); absent means human mail. */
+  autoSubmitted?: boolean;
+  /** #5012: the `Precedence` header, trimmed and lowercased (`bulk`, `list`, `junk`); absent or '' when not sent. */
+  precedence?: string;
+  /** #5012: an RFC 2919 `List-Id` header was present (mailing-list or list-manager mail). */
+  listId?: boolean;
+  /** #5012: bare lowercased `Reply-To` addresses; absent or empty when not sent. */
+  replyTo?: string[];
+  /**
+   * iCalendar method when the message carries a `text/calendar` part or an
+   * `.ics` attachment — 'REQUEST' | 'REPLY' | 'CANCEL' | 'COUNTER' | '' when a
+   * calendar part is present without an explicit method. `null`/absent means
+   * no calendar part was seen. Google Calendar attaches one to every
+   * invitation, update, response and cancellation, which is what makes this a
+   * structural signal rather than a subject guess.
+   */
+  calendarMethod?: string | null;
+  /** Extracted, HTML-stripped, quote-trimmed, capped body text. */
+  bodyText: string;
+  attachmentInspection?: GmailAttachmentInspection;
+}
+
+export interface GmailAttachmentReceipt {
+  id: string;
+  account: string;
+  messageId: string;
+  partId: string;
+  filename: string;
+  mimeType: string;
+  size: number | null;
+  attachmentId: string | null;
+  kind: 'document' | 'inline' | 'calendar';
+  fetched: false;
+  indexed: false;
+}
+
+export interface GmailAttachmentInspection {
+  state: 'not_inspected' | 'incomplete' | 'none' | 'present';
+  attachments: GmailAttachmentReceipt[];
+  reason?: 'missing_payload' | 'malformed_part' | 'depth_limit' | 'part_limit' | 'receipt_bytes_limit';
+}
+
+export interface GmailThreadAttachmentReceipts {
+  version: 1;
+  account: string;
+  threadId: string;
+  unavailable?: 'thread_not_found';
+  messages: Array<{
+    messageId: string;
+    inspection: GmailAttachmentInspection;
+    unavailable?: 'thread_not_found' | 'message_not_found';
+  }>;
+}
+
+export interface GmailThreadData {
+  threadId: string;
+  /** The connected account (authuser for deep links). */
+  account: string;
+  /** Chronological (oldest first). */
+  messages: GmailMessageMeta[];
+}
+
+export interface CalendarEventData {
+  /** Recurrence-instance id when expanded (singleEvents=true). */
+  id: string;
+  /** The event's revision: a held event whose etag changed upstream is re-attempted (GBRA-130 A-3). */
+  etag?: string;
+  summary: string;
+  description: string;
+  startIso: string;
+  endIso: string;
+  allDay: boolean;
+  organizer: string | null;
+  attendees: Array<{ email: string; displayName: string | null; self: boolean; responseStatus: string | null }>;
+  location: string | null;
+  hangoutLink: string | null;
+  htmlLink: string | null;
+  status: string;
+  account: string;
+  /** Google marks the event `private` or `confidential`: its page is `visibility: private`. */
+  private?: boolean;
+}
+
+export interface ContactData {
+  resourceName: string;
+  /** The person's revision: a held contact whose etag changed upstream is re-attempted (GBRA-130 A-3). */
+  etag?: string;
+  displayName: string | null;
+  emails: string[];
+  /** #6324: E.164 `canonicalForm` when Google supplies it, else the entered value; deduplicated. */
+  phones: string[];
+  organization: string | null;
+  title: string | null;
+  /**
+   * #6324: user-created contact groups (system groups dropped). The client
+   * fills `id` (`contactGroups/<id>`); the sweep resolves `name` from the
+   * group directory and leaves null for a group it could not resolve, which
+   * the page then carries as the raw id.
+   */
+  groups: Array<{ id: string; name: string | null }>;
+  deleted: boolean;
+}
+
+/**
+ * GBRA-130 A-3: connector item-hold keys of the Contacts and Calendar sweeps.
+ * A Gmail hold keeps its bare (hex) thread id, so the prefixes never collide.
+ */
+export const contactHoldKey = (resourceName: string): string => `contact:${resourceName}`;
+export const eventHoldKey = (calendarId: string, eventId: string): string => `event:${calendarId}:${eventId}`;
+export const isGmailHoldKey = (key: string): boolean => !key.startsWith('contact:') && !key.startsWith('event:');
+
+/** Extract the bare lowercase address from "Name <a@b.c>" or "a@b.c". */
+export function bareAddress(raw: string): string {
+  const m = raw.match(/<([^>]+)>/);
+  const addr = (m ? m[1] : raw).trim().toLowerCase();
+  return addr;
+}
+
+/** Split a To:/Cc: header into bare lowercase addresses. */
+export function splitAddressList(raw: string): string[] {
+  if (!raw.trim()) return [];
+  // Commas inside display names ("Doe, Jane" <j@x.co>) hide behind quotes;
+  // strip quoted segments before splitting.
+  const unquoted = raw.replace(/"[^"]*"/g, '');
+  return unquoted
+    .split(',')
+    .map((part) => bareAddress(part))
+    .filter((a) => a.includes('@'));
+}

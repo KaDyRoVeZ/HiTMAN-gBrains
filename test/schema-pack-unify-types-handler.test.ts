@@ -1,0 +1,328 @@
+// v0.42 Type Unification (T33) — unify-types handler lifecycle tests.
+//
+// Coverage: preflight rejects missing mapping_rules; dry-run no mutation;
+// apply runs all 4 phases (retype-explicit, retype-catch-all, page-to-link,
+// page-to-alias) + final sync; active-pack flip (D13); celebration summary;
+// gbrain-unify lock held; verify-step thresholds.
+
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
+import { withEnv } from './helpers/with-env.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { runUnifyTypes as runUnifyTypesRaw } from '../src/core/schema-pack/unify-types-handler.ts';
+import { _resetPackCacheForTests } from '../src/core/schema-pack/registry.ts';
+import { ALLOWED_TYPES } from '../src/core/facts/conversation-types.ts';
+import { parseSchemaPackManifest, parseYamlMini } from '../src/core/schema-pack/index.ts';
+
+let engine: PGLiteEngine;
+let fileHome: string;
+
+// apply:true flips the active pack with saveConfig() into $GBRAIN_HOME. The
+// preload's GBRAIN_HOME is shared by every file in the bun process, so a
+// leaked schema_pack there changes the active pack for later files
+// (link-source-namespaced-regex saw gbrain-base-v2 instead of gbrain-base).
+// Every call in this file therefore runs against a file-private home.
+function runUnifyTypes(...args: Parameters<typeof runUnifyTypesRaw>) {
+  return withEnv({ GBRAIN_HOME: fileHome }, () => runUnifyTypesRaw(...args));
+}
+
+beforeAll(async () => {
+  fileHome = mkdtempSync(join(tmpdir(), 'gbrain-unify-file-home-'));
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+});
+
+afterAll(async () => {
+  await engine.disconnect();
+  rmSync(fileHome, { recursive: true, force: true });
+  _resetPackCacheForTests();
+});
+
+// runUnifyTypes(apply) flips the active pack in ~/.gbrain/config.json. Each
+// test gets its own GBRAIN_HOME so that flip never reaches later test files
+// sharing the process (they would resolve gbrain-base-v2's vocabulary).
+let unifyHome: string;
+beforeEach(async () => {
+  await resetPgliteState(engine);
+  _resetPackCacheForTests();
+  unifyHome = mkdtempSync(join(tmpdir(), 'gbrain-unify-home-'));
+});
+afterEach(() => { rmSync(unifyHome, { recursive: true, force: true }); });
+
+function unify(input: Parameters<typeof runUnifyTypes>[1]) {
+  return withEnv({ GBRAIN_HOME: unifyHome }, () => runUnifyTypes(ctxOf(), input));
+}
+
+function ctxOf() {
+  return {
+    engine,
+    config: {},
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+    dryRun: false,
+    remote: false,
+  } as never;
+}
+
+async function seed(slug: string, type: string, fm: Record<string, unknown> = {}, body = 'body that is sufficiently long for any backstop guards we have in the codebase') {
+  await engine.putPage(slug, {
+    title: slug,
+    type: type as never,
+    compiled_truth: body,
+    timeline: '', frontmatter: fm, source_path: `${slug}.md`,
+  });
+}
+
+describe('runUnifyTypes', () => {
+  describe('preflight', () => {
+    it('refuses target pack with no mapping_rules', async () => {
+      // gbrain-base has no mapping_rules
+      await expect(unify({
+        target_pack: 'gbrain-base',
+        apply: false,
+      })).rejects.toThrow(/mapping_rules/);
+    });
+
+    it('refuses unknown target pack', async () => {
+      await expect(unify({
+        target_pack: 'nonexistent-pack',
+        apply: false,
+      })).rejects.toThrow();
+    });
+  });
+
+  describe('dry-run', () => {
+    it('returns shape with would_apply counts; no mutation', async () => {
+      await seed('tweets/a', 'tweet-single');
+      const result = await unify({
+        target_pack: 'gbrain-base-v2',
+        apply: false,
+      });
+      expect(result.apply).toBe(false);
+      expect(result.active_pack_flipped).toBe(false);
+      expect(result.per_phase.retype_explicit.would_apply).toBeGreaterThanOrEqual(1);
+      // Original page is untouched
+      const rows = await engine.executeRaw<{ type: string }>(
+        `SELECT type FROM pages WHERE slug = 'tweets/a'`,
+      );
+      expect(rows[0].type).toBe('tweet-single');
+    });
+  });
+
+  describe('apply (full lifecycle)', () => {
+    it('runs all 4 phases + active-pack flip (D13)', async () => {
+      await seed('tweets/a', 'tweet-single');
+      await seed('articles/x', 'media/article');
+      await seed('atoms/a', 'atom-extraction');
+      await seed('note/civic-1', 'civic');  // cluster-8 retype to note
+      await seed('wiki/concepts/canonical', 'concept');
+      await seed('wiki/concepts/redirect-1', 'concept-redirect',
+        {},
+        '[[wiki/concepts/canonical]] redirect body that is long enough to pass min char gates');
+      const result = await unify({
+        target_pack: 'gbrain-base-v2',
+        apply: true,
+      });
+      expect(result.apply).toBe(true);
+      expect(result.active_pack_flipped).toBe(true);
+      expect(result.pack_identity_after).toContain('gbrain-base-v2');
+      // Retype: tweets/a → tweet, articles/x → media, atoms/a → atom, note/civic-1 → note
+      expect(result.per_phase.retype_explicit.applied).toBeGreaterThanOrEqual(4);
+      // Page-to-alias: wiki/concepts/redirect-1 → slug_aliases row
+      expect(result.per_phase.page_to_alias.aliased).toBeGreaterThanOrEqual(1);
+      // Verify state
+      const rows = await engine.executeRaw<{ slug: string; type: string; frontmatter: Record<string, unknown> }>(
+        `SELECT slug, type, frontmatter FROM pages WHERE deleted_at IS NULL ORDER BY slug`,
+      );
+      const map = Object.fromEntries(rows.map((r) => [r.slug, { type: r.type, fm: r.frontmatter }]));
+      expect(map['tweets/a'].type).toBe('tweet');
+      expect(map['tweets/a'].fm.subtype).toBe('single');
+      expect(map['tweets/a'].fm.legacy_type).toBe('tweet-single');
+      expect(map['articles/x'].type).toBe('media');
+      expect(map['atoms/a'].type).toBe('atom');
+      expect(map['note/civic-1'].type).toBe('note');
+      expect(map['note/civic-1'].fm.legacy_type).toBe('civic');
+      // Alias row created
+      const aliasRows = await engine.executeRaw<{ alias_slug: string }>(
+        `SELECT alias_slug FROM slug_aliases`,
+      );
+      expect(aliasRows.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('catch-all rule retypes unknown types to note with legacy_type', async () => {
+      await seed('odd/x', 'some-weird-type');  // not in any explicit rule
+      const result = await unify({
+        target_pack: 'gbrain-base-v2',
+        apply: true,
+      });
+      expect(result.per_phase.retype_catch_all.synthesized_rules).toBeGreaterThanOrEqual(1);
+      const rows = await engine.executeRaw<{ type: string; frontmatter: Record<string, unknown> }>(
+        `SELECT type, frontmatter FROM pages WHERE slug = 'odd/x'`,
+      );
+      expect(rows[0].type).toBe('note');
+      expect(rows[0].frontmatter.legacy_type).toBe('some-weird-type');
+    });
+  });
+
+  describe('idempotency', () => {
+    it('second apply run is mostly no-op', async () => {
+      await seed('tweets/a', 'tweet-single');
+      const r1 = await unify({
+        target_pack: 'gbrain-base-v2',
+        apply: true,
+      });
+      expect(r1.per_phase.retype_explicit.applied).toBeGreaterThan(0);
+      const r2 = await unify({
+        target_pack: 'gbrain-base-v2',
+        apply: true,
+      });
+      // Second run: no more pages to retype
+      expect(r2.per_phase.retype_explicit.applied).toBe(0);
+      expect(r2.per_phase.page_to_alias.aliased).toBe(0);
+    });
+  });
+});
+
+// #2184 — conversation-shaped types must survive the v2 migration. The
+// conversation-facts pipeline (ALLOWED_TYPES in src/core/facts/
+// conversation-types.ts) walks pages by type ∈ {conversation, meeting,
+// slack, email, imessage, imessage-daily}. Pre-fix, gbrain-base-v2
+// declared neither `meeting` nor `conversation` and had no explicit
+// retype rule for them, so the D12 catch-all retyped both to `note`
+// (legacy_type stamp) — silently emptying the facts-extraction backlog
+// after a pack upgrade.
+describe('#2184 conversation-shaped types survive v2 unify', () => {
+  it('meeting/conversation/slack keep their types through apply', async () => {
+    await seed('meetings/2026-04-03', 'meeting');
+    await seed('conversations/imessage/alice-example', 'conversation');
+    await seed('slack/general-2026-04-03', 'slack');
+    await unify({
+      target_pack: 'gbrain-base-v2',
+      apply: true,
+    });
+    const rows = await engine.executeRaw<{ slug: string; type: string }>(
+      `SELECT slug, type FROM pages WHERE deleted_at IS NULL ORDER BY slug`,
+    );
+    const map = Object.fromEntries(rows.map((r) => [r.slug, r.type]));
+    expect(map['meetings/2026-04-03']).toBe('meeting');
+    expect(map['conversations/imessage/alice-example']).toBe('conversation');
+    expect(map['slack/general-2026-04-03']).toBe('slack');
+    // Every survivor stays enumerable by the conversation-facts walker.
+    for (const t of Object.values(map)) {
+      expect(ALLOWED_TYPES as readonly string[]).toContain(t);
+    }
+  });
+
+  it('gbrain-base-v2 statically declares meeting + conversation (temporal, extractable)', () => {
+    const p = new URL('../src/core/schema-pack/base/gbrain-base-v2.yaml', import.meta.url);
+    const manifest = parseSchemaPackManifest(parseYamlMini(readFileSync(p, 'utf-8')), {
+      path: p.pathname,
+    });
+    for (const [name, prefix] of [['meeting', 'meetings/'], ['conversation', 'conversations/']] as const) {
+      const pt = manifest.page_types.find((t) => t.name === name);
+      expect(pt).toBeDefined();
+      expect(pt?.primitive).toBe('temporal');
+      expect(pt?.path_prefixes).toContain(prefix);
+      expect(pt?.extractable).toBe(true);
+    }
+  });
+});
+
+// #1575 — the jobs worker registration must honor the handler's documented
+// dry-run default. `apply: data.apply ?? true` made the canonical operator
+// invocation (`gbrain jobs submit unify-types --params
+// '{"target_pack":...}'`) destructively retype pages by default while
+// UnifyTypesOpts.apply documents 'Default false (dry-run)'. Structural pin —
+// the worker source must default apply to false.
+import { readFileSync } from 'fs';
+
+// #4651 — the catch-all capture dropped path_filter/slug_filter, so the
+// synthesized per-type retype rules silently widened their selection to
+// EVERY page of an unknown type (the explicit-rule path always copied the
+// filters). Protected bulk mutation must respect the pack-declared
+// boundaries.
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { surfaceFileSource } from './helpers/source-surface.ts';
+
+function filteredCatchAllPack(name: string, filterLines: string): string {
+  return `api_version: gbrain-schema-pack-v1
+name: ${name}
+version: 1.0.0
+description: catch-all retype scoped by disambiguation filters (regression pack for gbrain#4651)
+page_types:
+  - name: note
+    primitive: concept
+mapping_rules:
+  - kind: retype
+    from_type: "*unknown*"
+    to_type: note
+    subtype_field: legacy_type
+    subtype: "*original_type*"
+${filterLines}
+`;
+}
+
+describe('#4651 catch-all retype carries slug_filter/path_filter into synthesized rules', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'gbrain-unify-4651-'));
+    for (const [name, filterLines] of [
+      ['unify-catchall-slugfilter', '    slug_filter: "inbox/%"'],
+      ['unify-catchall-pathfilter', '    path_filter: "inbox/%"'],
+    ] as const) {
+      const dir = join(home, '.gbrain', 'schema-packs', name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'pack.yaml'), filteredCatchAllPack(name, filterLines));
+    }
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('dry-run: slug_filter scopes the synthesized rules — out-of-filter pages are not counted', async () => {
+    await seed('inbox/legacy-a', 'widget-legacy');
+    await seed('keep/legacy-b', 'widget-legacy');
+    const result = await withEnv({ GBRAIN_HOME: home }, () => runUnifyTypesRaw(ctxOf(), {
+      target_pack: 'unify-catchall-slugfilter',
+      apply: false,
+    }));
+    expect(result.per_phase.retype_catch_all.synthesized_rules).toBe(1);
+    // Pre-fix: 2 — the filter was dropped and the whole unknown type matched.
+    expect(result.per_phase.retype_catch_all.would_apply).toBe(1);
+  });
+
+  it('apply: path_filter parity — a same-type page outside the filter keeps its type', async () => {
+    await seed('inbox/legacy-a', 'widget-legacy');
+    await seed('keep/legacy-b', 'widget-legacy');
+    const result = await withEnv({ GBRAIN_HOME: home }, () => runUnifyTypesRaw(ctxOf(), {
+      target_pack: 'unify-catchall-pathfilter',
+      apply: true,
+    }));
+    expect(result.per_phase.retype_catch_all.applied).toBe(1);
+    const rows = await engine.executeRaw<{ slug: string; type: string }>(
+      `SELECT slug, type FROM pages WHERE deleted_at IS NULL ORDER BY slug`,
+    );
+    const map = Object.fromEntries(rows.map((r) => [r.slug, r.type]));
+    expect(map['inbox/legacy-a']).toBe('note');
+    expect(map['keep/legacy-b']).toBe('widget-legacy');
+  });
+});
+
+describe('#1575 unify-types worker dry-run default', () => {
+  it('jobs.ts worker registration defaults apply to false, matching the handler contract', () => {
+    // W4 jobs: jobs.ts registers the handler module that now holds the body.
+    expect(surfaceFileSource('jobs', 'src/commands/jobs.ts')).toContain(
+      "worker.register('unify-types', makeUnifyTypesHandler(engine))",
+    );
+    const jobsSource = surfaceFileSource('jobs', 'src/core/minions/handlers/unify-types.ts');
+    expect(jobsSource.indexOf('export function makeUnifyTypesHandler(')).toBeGreaterThan(-1);
+    const workerBlock = jobsSource.slice(jobsSource.indexOf('export function makeUnifyTypesHandler('));
+    const registration = workerBlock.slice(0, workerBlock.indexOf('});'));
+    expect(registration).toContain('apply: data.apply ?? false');
+    expect(registration).not.toContain('apply: data.apply ?? true');
+  });
+});

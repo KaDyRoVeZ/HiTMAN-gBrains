@@ -1,0 +1,485 @@
+/**
+ * doctorReportRemote — verbatim peel from src/commands/doctor.ts
+ * (containment sprint). The remote/thin-client doctor check registry; its
+ * sole external consumer is the run_doctor op, which dynamic-imports it via
+ * the doctor.ts re-export.
+ *
+ * NOTE: '../doctor.ts' imports this module (the re-export seam), so the
+ * import below is circular. This is safe: every binding pulled from
+ * doctor.ts is a hoisted function declaration referenced only at call time
+ * inside doctorReportRemote, never during module evaluation.
+ */
+import type { BrainEngine } from '../../core/engine.ts';
+import { LATEST_VERSION } from '../../core/migrate.ts';
+import { loadConfig } from '../../core/config.ts';
+import { loadCompletedMigrations } from '../../core/preferences.ts';
+import { indexCompletedEntries, isFreshInstallStamp, migrationLedgerSummary, trailingPartialCount } from '../../core/migration-ledger.ts';
+import { VERSION } from '../../version.ts';
+import { pendingFreshInstallCheck } from './checks/pending-fresh-install.ts';
+import { compareVersions } from '../migrations/index.ts';
+import { resolveHoursEnv } from '../../core/env-number.ts';
+import { schemaVersionHealth } from '../../core/schema-version-health.ts';
+import { checkProjectionReadiness } from './checks/projection-readiness.ts';
+import { remoteUnlinkedFactsCheck } from './checks/unlinked-facts.ts';
+import { checkChatFallbackChain } from './checks/chat-fallback.ts';
+import { resolveExcludePrivatePages } from '../../core/search/private-visibility.ts';
+import {
+  type Check,
+  type DoctorReport,
+  computeDoctorReport,
+  checkPgliteScratchProbe,
+  computeQueueHealthCheck,
+  computeWedgedQueueCheck,
+  computeOrphanedPrivateQueueCheck,
+  computeAutopilotFanoutConcurrencyCheck,
+  checkSubagentHealth,
+  checkBatchRetryHealth,
+  checkEmbeddingEnvOverride,
+  checkEmbeddingMigrationState,
+  checkSubagentCapability,
+  checkVolunteerChannels,
+  checkSyncFreshness,
+  checkSyncConsolidation,
+  checkPoolBudget,
+  checkLinksExtractionLag,
+  checkSearchMode,
+  checkEvalDrift,
+  checkRerankerHealth,
+  checkGraphSignalsCoverage,
+  checkBrainstormHealth,
+  checkAbandonedThreads,
+  checkCalibrationFreshness,
+  checkGradeConfidenceDrift,
+  checkVoiceGateHealth,
+  checkContextualRetrievalCoverage,
+  checkHiddenBySearchPolicy,
+  checkLinkResolutionOpportunity,
+  checkFederationHealth,
+  checkSelfUpgradeHealth,
+  computeExtractAtomsBacklogCheck,
+} from '../doctor.ts';
+import {
+  checkSchemaPackActive,
+  checkSchemaPackConsistency,
+  checkSchemaPackSourceDrift,
+  multiSourceDriftCheck,
+  multiSourceDriftNotVerified,
+} from './schema-pack-checks.ts';
+import { managedPersistenceEnabled } from '../../core/persistence/ownership.ts';
+import { brainScorePlanFix, checkError } from './check-fix.ts';
+import type { RenderContext } from '../../core/agent-output.ts';
+
+// Same alias the local doctor keeps for its own freshness checks; the alias
+// is a private one-liner in doctor.ts's check-fn library, so this module
+// carries its own copy rather than widening that surface.
+const _resolveSyncFreshnessHours = resolveHoursEnv;
+
+export async function doctorReportRemote(
+  engine: BrainEngine,
+  opts: { sourceIds?: string[]; remote?: boolean; render?: RenderContext } = {},
+): Promise<DoctorReport> {
+  const checks: Check[] = [];
+
+  // 1. Connection. #4592: confined to the caller's source scope (undefined =
+  // brain-wide, the local/unscoped path) — an admin-scope aggregate on the
+  // remote trust boundary leaks an excluded source's size by subtraction.
+  let pageCount = 0;
+  try {
+    const stats = await engine.getStats({ sourceIds: opts.sourceIds });
+    pageCount = stats.page_count ?? 0;
+    checks.push({
+      name: 'connection',
+      status: 'ok',
+      message: `Connected, ${pageCount} pages`,
+    });
+  } catch (e) {
+    checks.push({
+      name: 'connection',
+      status: 'fail',
+      message: e instanceof Error ? e.message : String(e),
+    });
+    // #2674: on PGLite, a dead connection is exactly the ambiguous case the
+    // scratch probe exists for — pay its cold start only on this failure path.
+    // Unlike buildChecks (where the connect error was swallowed upstream), the
+    // real error IS in hand here: classify it, and only let the probe assert
+    // store damage on a damage-class verdict (wasm-abort/corrupt) — a lock or
+    // config refusal classifies 'unknown' and gets the hedged message.
+    if (engine.kind === 'pglite') {
+      let realStorePath: string | undefined;
+      try { realStorePath = loadConfig()?.database_path; } catch { /* no config */ }
+      let storeDamageEvidence = false;
+      try {
+        const { classifyPgliteInitError, stringifyPgliteInitError } = await import('../../core/pglite-engine.ts');
+        const verdict = classifyPgliteInitError(stringifyPgliteInitError(e));
+        storeDamageEvidence = verdict === 'wasm-abort' || verdict === 'corrupt';
+      } catch { /* classifier unavailable — stay hedged (fail-closed) */ }
+      checks.push(await checkPgliteScratchProbe({ realInitFailed: true, storeDamageEvidence, realStorePath }));
+    }
+    // Without a connection, every other check is meaningless — short-circuit.
+    return computeDoctorReport(checks, { render: opts.render });
+  }
+
+  // 2. Schema version. Uses engine.getConfig('version') — the same engine-
+  // agnostic API the local doctor uses, works on both Postgres and PGLite.
+  try {
+    const versionStr = await engine.getConfig('version');
+    const version = parseInt(versionStr || '0', 10);
+    checks.push({
+      name: 'schema_version',
+      ...schemaVersionHealth(version, LATEST_VERSION, { remote: true }),
+    });
+  } catch {
+    checks.push(checkError('schema_version', 'check schema version'));
+  }
+
+  // 2b. #2038: idx_timeline_dedup shape. A renumbered-during-merge migration
+  // (v102) can be recorded-as-applied without its DDL running, leaving the
+  // 3-column index in place — every timeline write then fails the 4-column
+  // ON CONFLICT. The version counter can't see this, so check the index SHAPE.
+  try {
+    const { checkTimelineDedupIndex } = await import('../../core/timeline-dedup-repair.ts');
+    const idx = await checkTimelineDedupIndex(engine);
+    if (!idx.tablePresent || !idx.needsRepair) {
+      checks.push({
+        name: 'timeline_dedup_index',
+        status: 'ok',
+        // #3737: canonical shape keys md5(summary) so long summaries can't
+        // overflow the btree row cap.
+        message: idx.tablePresent ? 'idx_timeline_dedup has the md5-keyed 4-column shape' : 'no timeline_entries table yet',
+      });
+    } else {
+      checks.push({
+        name: 'timeline_dedup_index',
+        status: 'fail',
+        message:
+          `idx_timeline_dedup is ${idx.indexPresent ? `(${idx.columns.join(', ')})` : 'absent'}, ` +
+          `expected (page_id, date, md5(summary), source) — timeline writes are failing (#2038/#3737). ` +
+          `Run \`gbrain apply-migrations --force-schema\` to heal it.`,
+      });
+    }
+  } catch {
+    checks.push(checkError('timeline_dedup_index', 'check idx_timeline_dedup shape'));
+  }
+
+  // 2c. #550: pages(source_id, slug) upsert arbiter — same drift class as 2b.
+  // When the arbiter is missing, EVERY putPage fails with "no unique or
+  // exclusion constraint" and the version counter can't see it.
+  {
+    const { pagesUpsertArbiterCheck, linkSourceCheckConstraintCheck } = await import('./checks/core-health.ts');
+    checks.push(await pagesUpsertArbiterCheck(engine));
+    // 2d. #4613: links_link_source_check shape — same drift class as 2b/2c.
+    checks.push(await linkSourceCheckConstraintCheck(engine));
+  }
+
+  // v0.42.x — Life Chronicle (#2390): orphaned event projections. Reads already
+  // hide projections whose event page is soft-deleted (read-time correctness);
+  // this always-run probe surfaces the cleanup backlog. Keyed off the real
+  // schema (event_page_id), NOT a migration verify-hook, per
+  // migration-verify-hook-never-runs-on-stamped-brains.
+  try {
+    // Source isolation: a scoped caller counts only its own sources' projections.
+    const orphans = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM timeline_entries te
+       JOIN pages ep ON ep.id = te.event_page_id
+       WHERE te.event_page_id IS NOT NULL AND ep.deleted_at IS NOT NULL
+         ${opts.sourceIds ? 'AND ep.source_id = ANY($1::text[])' : ''}`,
+      opts.sourceIds ? [opts.sourceIds] : undefined,
+    );
+    const n = Number(orphans[0]?.n ?? 0);
+    checks.push(
+      n === 0
+        ? { name: 'chronicle_projection_health', status: 'ok', message: 'No orphaned event projections' }
+        : {
+            name: 'chronicle_projection_health',
+            status: 'warn',
+            message:
+              `${n} timeline projection(s) point to soft-deleted event pages ` +
+              '(hidden at read time; clean up with `gbrain integrity auto`).',
+          },
+    );
+  } catch {
+    checks.push({ name: 'chronicle_projection_health', status: 'ok', message: 'no event projections yet' });
+  }
+
+  // 3. Brain score (#4592: same scope as the connection count above)
+  try {
+    const health = await engine.getHealth({ sourceIds: opts.sourceIds });
+    const score = health.brain_score ?? 0;
+    checks.push({
+      name: 'brain_score',
+      status: score >= 70 ? 'ok' : score >= 50 ? 'warn' : 'fail',
+      message: `Brain score ${score}/100`,
+      ...(score >= 70 ? {} : { fix: brainScorePlanFix() }),
+    });
+  } catch (e) {
+    checks.push(checkError('brain_score', 'compute', e));
+  }
+
+  // 3b. Migration wedge hint (v0.31.8 — D14 + D19). The brain server's
+  // filesystem holds the migration ledger; the wedge condition (>=3 consecutive
+  // partials with no later complete) needs the force-retry hint, not plain
+  // --yes. Same shape as the local doctor at line ~336.
+  try {
+    const completed = loadCompletedMigrations();
+    const byVersion = new Map<string, { complete: boolean; partial: boolean; ran: boolean }>();
+    for (const entry of completed) {
+      const seen = byVersion.get(entry.version) ?? { complete: false, partial: false, ran: false };
+      if (entry.status === 'complete') seen.complete = true;
+      if (entry.status === 'complete' && !isFreshInstallStamp(entry)) seen.ran = true;
+      if (entry.status === 'partial') seen.partial = true;
+      byVersion.set(entry.version, seen);
+    }
+    // Fresh-install stamps are not forward progress (same rule as the local doctor).
+    const completedVersions = Array.from(byVersion.entries()).filter(([, s]) => s.ran).map(([v]) => v);
+    // A trailing retry marker makes the version pending (same rule as the local doctor and get_health).
+    const history = indexCompletedEntries(completed);
+    const stuck = Array.from(byVersion.entries())
+      .filter(([v, s]) => {
+        if (!s.partial || s.complete) return false;
+        if (history.get(v)?.at(-1)?.status === 'retry') return false;
+        const supersededBy = completedVersions.find(cv => compareVersions(cv, v) >= 0);
+        return supersededBy === undefined;
+      })
+      .map(([v]) => v);
+    const wedged: string[] = [];
+    for (const v of stuck) {
+      const partialCount = trailingPartialCount(history.get(v) ?? []);
+      if (partialCount >= 3) wedged.push(v);
+    }
+    const newestRun = completedVersions.reduce<string | null>((a, v) => (a === null || compareVersions(v, a) > 0 ? v : a), null);
+    const pending = completed.length === 0 ? [] : migrationLedgerSummary(VERSION).pending.filter(v =>
+      (newestRun !== null && compareVersions(v, newestRun) < 0) || history.get(v)?.at(-1)?.status === 'retry');
+    if (wedged.length > 0) {
+      const cmd = wedged.map(v => `gbrain apply-migrations --force-retry ${v}`).join(' && ');
+      checks.push({
+        name: 'minions_migration',
+        status: 'fail',
+        message: `WEDGED MIGRATION(s) on brain host: ${wedged.join(', ')}. Run on the host: ${cmd}`,
+      });
+    } else if (stuck.length > 0) {
+      checks.push({
+        name: 'minions_migration',
+        status: 'fail',
+        message: `MINIONS HALF-INSTALLED on brain host: ${stuck.join(', ')}. Run on the host: gbrain apply-migrations --yes`,
+      });
+    } else if (pending.length > 0) {
+      checks.push({
+        name: 'minions_migration',
+        status: 'warn',
+        message: `${pending.length} host migration(s) not run yet on brain host: ${pending.join(', ')}. Run on the host: gbrain apply-migrations --yes`,
+        details: { pending },
+      });
+    } else {
+      const setup = pendingFreshInstallCheck();
+      if (setup) checks.push(setup);
+    }
+  } catch {
+    // Best-effort. A broken JSONL on the brain server should not stop the
+    // remote doctor.
+  }
+
+  // 4. Sync failures (file-plane ledger; see src/core/sync-failure-ledger.ts).
+  // issue #1939: read via the shared loader + severity decision so this remote
+  // surface agrees with the local buildChecks emitter by construction. Stays
+  // subprocess-free (file read + Date.parse only, no git), preserving the remote
+  // trust boundary. Escalates to FAIL when a stuck bookmark has blocked past the
+  // sync-freshness fail cadence or unresolved count is large.
+  try {
+    const { checkSyncFailures } = await import('./checks/sync-failures.ts');
+    const check = await checkSyncFailures(engine, { sourceIds: opts.sourceIds, remote: true });
+    checks.push(check ?? { name: 'sync_failures', status: 'ok', message: 'No unresolved sync failures' });
+  } catch {
+    checks.push({ name: 'sync_failures', status: 'warn', message: 'Durable sync failure state could not be read; health is unknown.' });
+  }
+
+  // 4b. Multi-source drift (v0.31.8 — D8 + D14). Same shape as the local
+  // doctor's check at the same name. Runs server-side; the result is
+  // returned to the thin-client over MCP.
+  try {
+    const { findMisroutedPages } = await import('../../core/multi-source-drift.ts');
+    // Source isolation: a scoped caller's roster (and the sample slugs the
+    // walk returns) stays inside its grant; unscoped = brain-wide.
+    const sources = await engine.executeRaw<{ id: string; local_path: string | null }>(
+      `SELECT id, local_path FROM sources ${opts.sourceIds ? 'WHERE id = ANY($1::text[])' : ''}`,
+      opts.sourceIds ? [opts.sourceIds] : undefined,
+    );
+    const nonDefaultWithPath = sources.filter(s => s.id !== 'default' && s.local_path);
+    if (sources.length > 1 && nonDefaultWithPath.length > 0) {
+      const result = await findMisroutedPages(
+        engine,
+        nonDefaultWithPath.map(s => ({ id: s.id, local_path: s.local_path as string })),
+      );
+      checks.push(multiSourceDriftCheck(result, nonDefaultWithPath.length, 'remote', await managedPersistenceEnabled(engine).catch(() => false)));
+    }
+  } catch (e) {
+    // Best-effort, but the check reports that it verified nothing (#5432).
+    checks.push(multiSourceDriftNotVerified(e));
+  }
+
+  // 5. Queue health (Postgres-only). PGLite has no minion_jobs in the same
+  // shape; skip the check there with an informational message.
+  checks.push(await computeQueueHealthCheck(engine, { remote: opts.remote !== false }));
+
+  // issue #1801 — wedged_queue (cross-surface parity with buildChecks).
+  checks.push(await computeWedgedQueueCheck(engine, { remote: opts.remote !== false }));
+  checks.push(await computeOrphanedPrivateQueueCheck(engine));
+
+  // #2194 fix #5 — warn when autopilot fan-out exceeds worker concurrency.
+  checks.push(await computeAutopilotFanoutConcurrencyCheck(engine));
+
+  // v0.41 Bug 2 / Eng D8 — subagent_health surfaces rate-lease pressure to the operator.
+  checks.push(await checkSubagentHealth(engine));
+
+  // v0.41.18.0 — batch_retry_health (cross-surface parity with buildChecks).
+  // Surfaces Supavisor circuit-breaker incidents over MCP so remote operators
+  // see the same signal local doctor surfaces.
+  checks.push(await checkBatchRetryHealth(engine));
+
+  // v0.41.2.1 — embedding_env_override (cross-surface parity with
+  // buildChecks). Surfaces when GBRAIN_EMBEDDING_* env vars disagree
+  // with DB config; closes the silent-override class that caused the
+  // 716K-chunk damage incident from PR #1421's description.
+  checks.push(await checkEmbeddingEnvOverride(engine));
+
+  // Surface the migration state marker (previously write-only): a live
+  // marker = mid-migration brain, with the exact resume + status commands.
+  checks.push(await checkEmbeddingMigrationState(engine, { sourceIds: opts.sourceIds }));
+
+  // v0.31.12 subagent runtime enforcement (Layer 3 of 3 — Codex F13).
+  // The subagent loop requires native tool-calling. If models.subagent,
+  // models.tier.subagent, or models.default resolves to a limited provider, warn here
+  // so the user sees it at the next `gbrain doctor` run instead of at the
+  // next subagent job submission. (Layers 1+2 also enforce — this is the
+  // surfacing layer.)
+  checks.push(await checkSubagentCapability(engine));
+
+  // Harness hook adapters — per-channel push-context visibility (sibling of
+  // the engine-free retrieval_reflex_health heartbeat check). Source-scoped
+  // for remote callers (cross-model P1): a source-bound token must not see
+  // other sources' activity counts/timestamps.
+  checks.push(await checkVolunteerChannels(engine, { sourceIds: opts.sourceIds }));
+
+  // 6. Sync freshness check. Every check below that takes { sourceIds } is
+  // confined to the caller's grant (#4592 class): a source-bound token never
+  // reads another source's id, name, counts or timestamps.
+  checks.push(await checkSyncFreshness(engine, { sourceIds: opts.sourceIds }));
+  const contentWrites = await (await import('./checks/canonical-content.ts')).checkCanonicalContentWrites(engine, opts.sourceIds);
+  if (contentWrites) checks.push(contentWrites);
+
+  // v0.41.19.0 (Issue 5): sync --all consolidation nudge for multi-source brains.
+  checks.push(await checkSyncConsolidation(engine, { sourceIds: opts.sourceIds }));
+
+  // v0.42.x (#1794, 4A): pool-budget nudge when GBRAIN_MAX_CONNECTIONS is set.
+  checks.push(await checkPoolBudget(engine));
+
+  // v0.42.7 (#1696): link-extraction lag. Strictly SQL (single indexed COUNT),
+  // safe on the thin-client/remote path — remote operators on checkout-less
+  // Postgres brains are exactly who can't otherwise see the extraction backlog.
+  // A scoped caller gets each granted source graded on its own (the worst wins).
+  checks.push(await remoteLinksExtractionLag(engine, opts.sourceIds));
+
+  // #4576 (related gap): extract_atoms_backlog was absent from the
+  // thin-client surface, so an MCP-only caller couldn't see the backlog at
+  // all. SQL counts + pack/config reads on the server side — the env that
+  // actually runs (or fails to run) the cycle. Source-scoped like the
+  // connection count: the roster + per-source backlog stay inside the grant.
+  checks.push(await computeExtractAtomsBacklogCheck(engine, { sourceIds: opts.sourceIds }));
+
+  // v0.39 T7 + T9 — schema-pack health checks (3 checks per v0.38 plan):
+  //   schema_pack_active        — active pack resolves cleanly
+  //   schema_pack_consistency   — % of pages typed against active pack
+  //   schema_pack_source_drift  — per-source pack divergence
+  checks.push(await checkSchemaPackActive(engine));
+  checks.push(await checkSchemaPackConsistency(engine, { sourceIds: opts.sourceIds }));
+  checks.push(await checkSchemaPackSourceDrift(engine, { sourceIds: opts.sourceIds }));
+
+  // 7. v0.32.3 search-lite mode + per-key drift surface.
+  checks.push(await checkSearchMode(engine));
+
+  // 8. v0.32.3 eval_drift: retrieval-affecting files changed since last
+  // eval run? Non-blocking — surfaces as ok + hint.
+  checks.push(await checkEvalDrift(engine));
+
+  // 9. v0.35.0.0+ reranker_health: surfaces rerank-audit failures from
+  // ~/.gbrain/audit/rerank-failures-*.jsonl. Failure-only (no success
+  // logging on the search hot path per CDX2-F22). Reads
+  // search.reranker.enabled FIRST so absence-of-failures means different
+  // things when reranker is on vs off.
+  checks.push(await checkRerankerHealth(engine));
+  checks.push(await checkChatFallbackChain(engine, { remote: opts.remote !== false }));
+
+  // 9a. v0.40.4 graph_signals_coverage: when graph_signals is enabled
+  // (via mode bundle default or explicit config override), surface
+  // whether link density is high enough for the signal to fire
+  // meaningfully. <10% inbound coverage warns; >=30% ok with metric.
+  checks.push(await checkGraphSignalsCoverage(engine, { sourceIds: opts.sourceIds }));
+
+  // 9b. v0.37.0 brainstorm_health: surfaces three brainstorm/lsd readiness
+  // signals: (a) migration v79 applied (last_retrieved_at column exists),
+  // (b) calibration cold-start status (active_bias_tags empty), (c)
+  // search.track_retrieval enabled/disabled. Each surfaces a paste-ready
+  // fix hint.
+  checks.push(await checkBrainstormHealth(engine, { sourceIds: opts.sourceIds }));
+
+  // 10. v0.36.1.0 Hindsight calibration wave (T12) — four new checks:
+  //   - abandoned_threads: high-conviction takes never revisited
+  //   - calibration_freshness: profile is older than 7 days
+  //   - grade_confidence_drift: judge self-reported confidence vs actual accuracy (CDX-11 mitigation)
+  //   - voice_gate_health: voice gate failure rate over the last 7 days
+  checks.push(await checkAbandonedThreads(engine, { sourceIds: opts.sourceIds }));
+  checks.push(await checkCalibrationFreshness(engine, { sourceIds: opts.sourceIds }));
+  checks.push(await checkGradeConfidenceDrift(engine, { sourceIds: opts.sourceIds }));
+  checks.push(await checkVoiceGateHealth(engine, { sourceIds: opts.sourceIds }));
+
+  // 11. v0.40.3.0 contextual_retrieval_coverage — surfaces pages with
+  //   - chunker_version drift (pre-v40 pages not yet re-embedded)
+  //   - contextual_retrieval_mode IS NULL (mode never evaluated)
+  //   - synopsis-failures audit JSONL entries from the last 7 days
+  checks.push(await checkContextualRetrievalCoverage(engine, { sourceIds: opts.sourceIds }));
+  checks.push(await checkProjectionReadiness(engine, {
+    sourceIds: opts.sourceIds,
+    excludePrivate: await resolveExcludePrivatePages(engine, opts.remote),
+  }, { resident: engine.kind === 'pglite' && opts.remote === true, remote: opts.remote === true }));
+
+  // issue #1777 — hidden_by_search_policy: chunked pages withheld from default
+  // search by the hard-exclude prefix policy. Pure SQL COUNT, safe on the
+  // remote/thin-client path.
+  checks.push(await checkHiddenBySearchPolicy(engine, { sourceIds: opts.sourceIds }));
+
+  // 11a. issue #972 link_resolution_opportunity — same check the local
+  // doctor runs at the equivalent slot in buildChecks. Mirrored for
+  // thin-client parity so `gbrain remote doctor` sees the same hint.
+  checks.push(await checkLinkResolutionOpportunity(engine, undefined, { sourceIds: opts.sourceIds }));
+
+  // 12. v0.40.5.0 Federated Sync v2 (T12) — federation_health:
+  //   - Per-source lag, embed coverage, failed-job rate, for the granted sources only.
+  //   - Single-source brain short-circuits to ok (unscoped callers).
+  //   - Three-state: ok / warn / fail.
+  checks.push(await checkFederationHealth(engine, { sourceIds: opts.sourceIds }));
+
+  // 13. v0.42 self_upgrade_health: mode, whether behind, recent failures.
+  // File-plane only (no engine) — works on thin clients too. Then #5836 unlinked_facts inside the caller's grant.
+  checks.push(checkSelfUpgradeHealth(), await remoteUnlinkedFactsCheck(engine, opts));
+
+  // 14. Wave checks as sanitized host-action lines (doctor/wave-checks.ts):
+  // stable check id, a count-free impact summary and the on-host preview
+  // command; a check that could not run reports unknown, never ok.
+  const { remoteWaveHandoff } = await import('./wave-checks.ts');
+  checks.push(...await remoteWaveHandoff(engine, opts.sourceIds));
+
+  return computeDoctorReport(checks, { render: opts.render });
+}
+
+/**
+ * links_extraction_lag for the remote doctor: brain-wide when unscoped;
+ * otherwise each granted source is graded on its own (the `--source` path)
+ * and the worst is reported, so no count, held slug or source id outside the
+ * grant reaches the result.
+ */
+async function remoteLinksExtractionLag(engine: BrainEngine, sourceIds?: string[]): Promise<Check> {
+  if (!sourceIds) return checkLinksExtractionLag(engine, { remote: true });
+  const checks: Check[] = [];
+  for (const sourceId of sourceIds) checks.push(await checkLinksExtractionLag(engine, { sourceId, remote: true }));
+  return checks.find(c => c.status === 'fail') ?? checks.find(c => c.status === 'warn') ?? checks[0]
+    ?? { name: 'links_extraction_lag', status: 'ok', message: 'Extraction lag not applicable (no pages)' };
+}

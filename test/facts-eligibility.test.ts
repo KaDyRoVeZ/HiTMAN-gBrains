@@ -1,0 +1,185 @@
+/**
+ * v0.31.2 — facts/eligibility.ts predicate tests.
+ *
+ * Pin the contract so future changes are intentional:
+ *   - Type-only branch: parsed.type ∈ ELIGIBLE_TYPES is enough.
+ *   - Slug-only branch: meetings/, personal/, daily/ rescue mistyped pages.
+ *   - Both branches: typed AND slug-prefixed → still ok.
+ *   - Neither: rejected with kind:<type> reason.
+ *   - Negative paths: null parsed, wiki/agents/, dream_generated, too_short.
+ *
+ * Pure-function tests; no DB.
+ */
+
+import { describe, test, expect } from 'bun:test';
+import { isFactsBackstopEligible } from '../src/core/facts/eligibility.ts';
+import type { PageType } from '../src/core/types.ts';
+
+const LONG_BODY = 'x'.repeat(120); // > 80 char threshold
+
+function fixture(overrides: {
+  slug?: string;
+  type?: PageType;
+  body?: string;
+  frontmatter?: Record<string, unknown>;
+} = {}) {
+  return {
+    slug: overrides.slug ?? 'meetings/2026-05-09-call',
+    parsed: {
+      type: overrides.type ?? 'meeting' as PageType,
+      compiled_truth: overrides.body ?? LONG_BODY,
+      frontmatter: overrides.frontmatter ?? {},
+    },
+  };
+}
+
+describe('isFactsBackstopEligible — branches', () => {
+  test('TYPED-ONLY: type=meeting, slug=arbitrary → ok', () => {
+    const f = fixture({ slug: 'wiki/x/y', type: 'meeting' });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: true });
+  });
+
+  test('SLUG-ONLY: type=note (legacy default), slug=meetings/... → ok via rescue', () => {
+    const f = fixture({ slug: 'meetings/2026-05-09', type: 'note' });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: true });
+  });
+
+  test('SLUG-ONLY: type=note, slug=personal/... → ok', () => {
+    const f = fixture({ slug: 'personal/journal-entry', type: 'note' });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: true });
+  });
+
+  test('SLUG-ONLY: type=note, slug=daily/2026-05-09 → ok', () => {
+    const f = fixture({ slug: 'daily/2026-05-09', type: 'note' });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: true });
+  });
+
+  test('BOTH: type=meeting, slug=meetings/... → ok', () => {
+    const f = fixture({ slug: 'meetings/2026-05-09', type: 'meeting' });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: true });
+  });
+
+  test('NEITHER: type=concept, slug=concepts/... → rejected with kind:concept reason', () => {
+    const f = fixture({ slug: 'concepts/abstract-thing', type: 'concept' });
+    const r = isFactsBackstopEligible(f.slug, f.parsed);
+    expect(r).toEqual({ ok: false, reason: 'kind:concept' });
+  });
+});
+
+describe('isFactsBackstopEligible — guards', () => {
+  test('null parsed → no_parsed_page', () => {
+    expect(isFactsBackstopEligible('any/slug', null)).toEqual({ ok: false, reason: 'no_parsed_page' });
+  });
+
+  test('undefined parsed → no_parsed_page', () => {
+    expect(isFactsBackstopEligible('any/slug', undefined)).toEqual({ ok: false, reason: 'no_parsed_page' });
+  });
+
+  test('subagent namespace (wiki/agents/...) is rejected even with eligible type', () => {
+    const f = fixture({ slug: 'wiki/agents/sonnet-1/scratch', type: 'meeting' });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: false, reason: 'subagent_namespace' });
+  });
+
+  test('dream_generated:true frontmatter is rejected (anti-loop)', () => {
+    const f = fixture({
+      slug: 'meetings/dream-output',
+      type: 'meeting',
+      frontmatter: { dream_generated: true },
+    });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: false, reason: 'dream_generated' });
+  });
+
+  test('dream_generated:false (or missing) is fine', () => {
+    const f = fixture({
+      slug: 'meetings/normal-page',
+      type: 'meeting',
+      frontmatter: { dream_generated: false },
+    });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: true });
+  });
+
+  test('body < 80 chars → too_short', () => {
+    const f = fixture({ body: 'TODO: write meeting notes' });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: false, reason: 'too_short' });
+  });
+
+  test('body exactly 80 chars → ok', () => {
+    const f = fixture({ body: 'a'.repeat(80) });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: true });
+  });
+
+  test('whitespace body collapses to too_short after trim', () => {
+    const f = fixture({ body: '   \n   \t   ' });
+    expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: false, reason: 'too_short' });
+  });
+});
+
+describe('isFactsBackstopEligible — eligible-types coverage', () => {
+  for (const t of ['note', 'meeting', 'slack', 'email', 'calendar-event', 'source', 'writing'] as PageType[]) {
+    test(`type=${t} on arbitrary slug → ok`, () => {
+      const f = fixture({ slug: 'wiki/whatever/x', type: t });
+      expect(isFactsBackstopEligible(f.slug, f.parsed)).toEqual({ ok: true });
+    });
+  }
+
+  for (const t of ['person', 'company', 'deal', 'concept', 'atom', 'project', 'image', 'code'] as PageType[]) {
+    test(`type=${t} on non-rescued slug → rejected with kind:${t}`, () => {
+      const f = fixture({ slug: 'wiki/whatever/x', type: t });
+      const r = isFactsBackstopEligible(f.slug, f.parsed);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe(`kind:${t}`);
+    });
+  }
+});
+
+describe('#6232 facts_backstop opt-out', () => {
+  test.each([false, 'false', 'no', 'off', 0, '0', 'OFF', ' No '])('facts_backstop: %p opts the page out', (value) => {
+    const { slug, parsed } = fixture({ frontmatter: { facts_backstop: value } });
+    expect(isFactsBackstopEligible(slug, parsed)).toEqual({ ok: false, reason: 'opted_out' });
+  });
+
+  test.each([true, 'true', 'yes', undefined, null, 'maybe'])('facts_backstop: %p leaves an eligible page eligible', (value) => {
+    const { slug, parsed } = fixture({ frontmatter: { facts_backstop: value } });
+    expect(isFactsBackstopEligible(slug, parsed)).toEqual({ ok: true });
+  });
+
+  test('the meeting-ingestion skill writes opt-outs the predicate honors', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { parseMarkdown } = await import('../src/core/markdown.ts');
+    const skill = readFileSync(new URL('../skills/meeting-ingestion/SKILL.md', import.meta.url), 'utf8');
+    expect(skill).toContain('`facts_backstop: false` in the sidecar\'s frontmatter');
+    const template = skill.match(/```markdown\n(---\ntype: meeting\n[\s\S]*?\n---\n)/)?.[1];
+    expect(template).toBeDefined();
+    const meeting = parseMarkdown(`${template}\n# Kickoff\n\n${LONG_BODY}\n`, 'meetings/2026-05-09-kickoff');
+    expect(isFactsBackstopEligible('meetings/2026-05-09-kickoff', meeting)).toEqual({ ok: false, reason: 'opted_out' });
+  });
+});
+
+// #6259 (quarantine leaks, item 2): a page the content-quality gate hid as junk is never offered to the backstop.
+describe('isFactsBackstopEligible — quarantined pages', () => {
+  test('a quarantine marker makes an otherwise eligible page ineligible with reason quarantined', () => {
+    const { slug, parsed } = fixture({ frontmatter: { quarantine: { reason: 'junk_pattern', detail: 'cloudflare_ray_id', assessed_at: '2026-10-07T00:00:00.000Z' } } });
+    expect(isFactsBackstopEligible(slug, parsed)).toEqual({ ok: false, reason: 'quarantined' });
+  });
+  test('a content_flag (searchable, warned) leaves the page eligible', () => {
+    const { slug, parsed } = fixture({ frontmatter: { content_flag: { reason: 'markup_heavy', detail: 'x', assessed_at: '2026-10-07T00:00:00.000Z' } } });
+    expect(isFactsBackstopEligible(slug, parsed)).toEqual({ ok: true });
+  });
+});
+
+// #6557: conversation-shaped pages belong to the opt-in conversation facts pipeline; the skip says so.
+describe('isFactsBackstopEligible — conversation pipeline types', () => {
+  test.each(['conversation', 'imessage', 'imessage-daily', 'slack-thread', 'slack-dm-day', 'email-digest'])(
+    '%s skips with reason conversation_pipeline', (type) => {
+      const { parsed } = fixture({ type: type as PageType });
+      expect(isFactsBackstopEligible('conversations/2026-10-01-thread', parsed)).toEqual({ ok: false, reason: 'conversation_pipeline' });
+    });
+  test('a non-conversation ineligible type keeps its kind reason', () => {
+    const { parsed } = fixture({ type: 'person' as PageType });
+    expect(isFactsBackstopEligible('people/alice-example', parsed)).toEqual({ ok: false, reason: 'kind:person' });
+  });
+  test('a conversation page under a rescue prefix stays eligible', () => {
+    const { parsed } = fixture({ type: 'conversation' as PageType });
+    expect(isFactsBackstopEligible('meetings/2026-10-01-call', parsed)).toEqual({ ok: true });
+  });
+});

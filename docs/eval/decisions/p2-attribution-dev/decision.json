@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "decision_id": "p2-attribution-dev",
+  "plan": "P2",
+  "title": "P2 speaker attribution prompt (facts.attribution) dev comparison",
+  "verdict_type": "quality",
+  "stage": "dev",
+  "candidate": {
+    "gbrain": "/workspace/gbrain@5d5375d438da490ad4d865fa93e3218a57e6bbdd",
+    "config": {
+      "facts.attribution": "true"
+    }
+  },
+  "baseline": {
+    "gbrain": "/workspace/gbrain@5d5375d438da490ad4d865fa93e3218a57e6bbdd",
+    "config": {}
+  },
+  "sources": [
+    {
+      "id": "lme-s-dev-assistant-facts",
+      "kind": "memory-qa",
+      "benchmark": "lme-s",
+      "split": "dev",
+      "embed": "real",
+      "limit": 30,
+      "categories": [
+        "single-session-assistant"
+      ],
+      "search_pins": {
+        "search.mode": "balanced",
+        "search.reranker.enabled": "false",
+        "search.autocut": "false"
+      },
+      "top_k": 10,
+      "id_field": "id",
+      "exclude_when": [
+        "abstention=true"
+      ],
+      "min_clusters": 10,
+      "facts": "conversation",
+      "qa": {
+        "mode": "reader",
+        "runs": 1,
+        "sessions": 5,
+        "context": "facts"
+      },
+      "comparisons": [
+        {
+          "id": "assistant-qa-from-facts",
+          "metric": "qa_score",
+          "gate": "superiority",
+          "direction": "higher",
+          "min_effect": 0,
+          "cluster_by": "conversation",
+          "description": "assistant-said questions answered from saved facts"
+        }
+      ],
+      "estimate_usd": 36
+    },
+    {
+      "id": "lme-s-dev-user-facts",
+      "kind": "memory-qa",
+      "benchmark": "lme-s",
+      "split": "dev",
+      "embed": "real",
+      "limit": 20,
+      "categories": [
+        "single-session-user"
+      ],
+      "search_pins": {
+        "search.mode": "balanced",
+        "search.reranker.enabled": "false",
+        "search.autocut": "false"
+      },
+      "top_k": 10,
+      "id_field": "id",
+      "exclude_when": [
+        "abstention=true"
+      ],
+      "min_clusters": 10,
+      "facts": "conversation",
+      "qa": {
+        "mode": "reader",
+        "runs": 1,
+        "sessions": 5,
+        "context": "facts"
+      },
+      "comparisons": [
+        {
+          "id": "user-qa-from-facts",
+          "metric": "qa_score",
+          "gate": "noninferiority",
+          "direction": "higher",
+          "tolerance": 0.02,
+          "cluster_by": "conversation",
+          "description": "guard: user-said questions do not drop by more than two points"
+        }
+      ],
+      "estimate_usd": 24
+    }
+  ],
+  "alpha": 0.05,
+  "seed": 42,
+  "draws": 10000,
+  "budget_usd": 60,
+  "created_at": "2026-10-04T23:09:08.960Z",
+  "notes": "Speaker attribution in the conversation-facts extractor. Both arms are the same build; the candidate turns facts.attribution on. Both run the facts lane (production conversation-facts extractor on dated conversation pages) and answer from the saved facts of the top five retrieved sessions. Gate result before this run (baseline extractor, 30 single-session-assistant questions): answers from saved facts 26.7% vs from pages 100%, a 73-pt deficit, so attribution storage is in scope. facts_count is not compared: one question per arm lost its facts to an extractor malformed_output error, so its count is missing; the QA rows of those questions score 0 and are kept."
+}

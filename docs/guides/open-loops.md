@@ -1,0 +1,424 @@
+# The Open-Loop Engine
+
+The point of ingesting your email is not "search my email." It is:
+
+> **Here are the three people waiting on you, what you promised, and the
+> context needed to respond.**
+
+```bash
+gbrain waiting
+```
+
+The open-loop engine maintains a structured record (`open_loops` table) of
+commitments, unanswered messages, and pending decisions over the
+[google source kind](google-connect.md)'s data, kept current on every sync.
+
+## Two detectors
+
+**1. The deterministic thread-state machine** (`src/core/google/loop-detect.ts`,
+zero LLM, free, always on). For every synced Gmail thread:
+
+- last substantive message is **theirs**, you're in To:, unanswered ≥24h →
+  `unanswered_inbound` — *they are waiting on you*.
+- last substantive message is **yours**, contains a question, unanswered
+  ≥72h → `unanswered_outbound` — *you are waiting on them*.
+- a reply lands → the loop **closes itself** (`closed_by: reply_detected`).
+  Loops close by state transition, never delete — the audit trail stays.
+  A reply of yours that only acknowledges their question ("Thanks!",
+  "Got it, thanks.") is not an answer: the loop stays open and its clock
+  keeps running. "Will do" counts as a reply.
+- a question mark inside a link (`https://docs.example.com/view?id=42`) is
+  not a question, so an FYI that only shares a link opens nothing.
+- "unanswered" is measured from the oldest unanswered message since the
+  last turn flip (the first one addressed to you, or your first question),
+  so a nudge or follow-up never restarts the clock — a request that waited
+  40h and got a "bumping this" 5h ago opens on the first sync. The loop's
+  `opened_at` is that message's time, not the time gbrain noticed it, so a
+  first sync of an old inbox ranks a 30-day wait as older than yesterday's.
+
+Precision rules (pinned by a labeled fixture corpus in
+`test/google-loop-detect.test.ts` — every false-positive class gets a
+fixture before its fix): noise senders (noreply/notifications, and Google's
+own system addresses such as the Meet notes digest, matched by exact address
+only), list mail (`List-Unsubscribe`), Gmail's bulk categories
+(`CATEGORY_PROMOTIONS` / `CATEGORY_SOCIAL` / `CATEGORY_FORUMS`, unless you
+wrote a substantive message in the thread; `CATEGORY_UPDATES` is not bulk),
+CC-only delivery, FYI/forwards without a question, self-threads, and muted
+senders/threads never open loops. Positively automated mail opens no
+reply-owed loop either (#5012): a `Precedence: bulk`, `list` or `junk`
+header, a `List-Id` header, or a no-reply `Reply-To`. Each of these is a
+header the sender set, so a person writing from the same domain is
+unaffected. None of these gates closes a loop: only a
+turn flip does (a mute is the one exception, below). Sent-mail
+ingestion is what makes "unanswered" honest — your own replies are the
+negative filter.
+
+**Google Calendar system mail is excluded structurally.** `Invitation:`,
+`Updated invitation:`, `Accepted:`, `Declined:`, `Tentative:` and
+`Canceled event:` notices are sent by Calendar ON BEHALF OF a human, so they
+arrive from your colleague's real address — `isNoiseSender` cannot see them
+and `loops mute sender` would silence that person's genuine email along with
+them. They are identified by the iCalendar `METHOD` (`REQUEST`, `REPLY`,
+`CANCEL`, … — the RFC 5546 values; nothing else counts) that Gmail carries in
+the `text/calendar` part's own Content-Type header on every one of them and on
+no ordinary human mail; a human attaching an `.ics` file, or an unrecognized
+method value, is not a stamp. The subject prefix is a fallback for messages
+whose MIME was not captured: anchored to the start of the subject, limited to
+Calendar's own headers (a generic word like `Notification:` is a human or
+vendor subject and never matches), and refusing anything with a Re:/Fwd:
+prefix so a human forward of an invite thread still opens a loop. These notices neither
+OPEN nor CLOSE a loop — an invite is not a reply, and letting it flip the
+turn would silently answer a real outbound loop. They still ingest as normal
+searchable pages and still feed calendar/meeting context.
+
+**2. The LLM commitment extractor** (`src/core/google/loops-extract.ts`, one
+model call per recent thread, default ON for google sources). Extracts
+commitments with direction ("I'll send the deck by Friday" →
+`commitment_owed_by_me`, counterparty, due date, verbatim quote) and pending
+decisions. One extractor, three projections per item:
+
+- the `open_loops` row itself
+- a `facts` row (`kind=commitment`, fence-first, deduped) — so `entity`,
+  `context_pack`, and `recall` see it through existing read paths
+- a typed edge thread-page → person-page (`owes_to` / `awaiting_reply_from`)
+  — so relational search can traverse it
+
+The person page a loop points at may live in another source than the mail:
+on a federated brain the Gmail source holds the threads while
+`people/<slug>` lives in `default`. Both detectors resolve the counterparty
+in the mail's own source first and then across sources by identity only:
+the exact email address as an alias of one page in one other source, or an
+`entity_identities` group whose canonical member sits elsewhere. A display
+name alone never crosses a source and a tie stays unresolved, so a loop is
+either attached to a real page or carries no counterparty page at all. The
+loop row records which source that page is in (`counterparty_source_id`),
+the typed edge points there, and the entity card, `gbrain waiting` and
+`open_loops` read the loop from that page, never from a namesake in another
+source. The commitment fact itself stays in the mail's source.
+
+Guardrails: injection-hardened input (the model sees the NEWEST 12k of the
+thread, so the latest reply is always visible to the judge), ALL-or-nothing
+parse barrier (a malformed model response writes nothing), only the last 30
+days of mail (the deep backfill is never extracted), kill switch
+`gbrain config set loops.extraction_enabled false`. With no chat provider
+configured (a keyless install, or an outage) the sweep enqueues no
+extraction jobs and logs one line saying so — the email pages still import,
+and the threads are extracted on their next touch or by
+`gbrain sync --source <id> --full` once a provider exists; a job that hits
+the outage mid-flight retries and, if it dies, frees its slot rather than
+completing empty. Sender/thread
+suppressions are shared by both detectors: `loops mute` also stops the LLM
+lane from recreating a commitment or decision for a muted sender/thread,
+while leaving the underlying email page searchable. A sender mute gates on
+who **wrote** in the thread — every message author, not only the newest —
+and never on recipients or CC: muting one person does not hide everyone
+else's commitments in a group thread they were copied on, and an outside
+sender cannot dodge extraction by CC'ing a muted address. Thread pages carry
+the author list as `senders:` frontmatter beside `participants:`.
+
+**Which threads reach the extractor.** A structural eligibility gate runs
+first (`loopExtractionEligibility`), so bulk mail neither pays for model
+calls nor crowds real correspondence out of the sweep:
+
+| shape | eligible |
+|---|---|
+| `SPAM` / `TRASH` | no — whoever wrote them |
+| a substantive message the account owner wrote (`SENT` label or a known owner address; a calendar RSVP or other noise does not count) | **yes, overriding every rule below** |
+| pure noise senders / pure calendar notices | no |
+| `CATEGORY_PROMOTIONS` / `CATEGORY_SOCIAL` / `CATEGORY_FORUMS` (one shared list, `gmail-categories.ts`, applied by both lanes) | no, unless the owner joined in |
+| `List-Unsubscribe` bulk | no, unless the owner joined in |
+| `CATEGORY_UPDATES` | **yes** — invoices, contracts and document requests live there |
+| a label you excluded (`g_loops_exclude_labels` on the source, else the brain-wide `loops.extraction_exclude_labels`) | no — even when you joined in (`excluded_label`) |
+| ordinary human correspondence | yes |
+
+The owner-participated rule is the load-bearing one: your own outbound
+message is exactly where your commitment lives, so "I'll send this by Friday"
+written in reply to a bulk-labelled thread stays reachable. Every rule is
+structural — Gmail labels, `List-Unsubscribe`, calendar part, who wrote the
+message — with no sender, domain, subject or body matching, so there is no
+vendor list to maintain. The sweep logs per-reason counts
+(`loops_extract eligibility:`) so a run can be audited for over-filtering
+without mail content reaching the logs.
+
+**Your own exclusions** (#5445). Some mail is yours and still not a
+commitment: a recruiting agency's label, a vendor-notification label, a
+newsletter label you never unsubscribe from. Name those labels once and
+no thread under them enters paid extraction or opens a deterministic
+loop:
+
+```bash
+gbrain sources add <id> --kind google --account you@example.com \
+  --loops-exclude-labels "Newsletters, Recruiting/Agencies"      # per source (g_loops_exclude_labels)
+gbrain config set loops.extraction_exclude_labels "Label_7"      # brain-wide, for every source without its own list
+```
+
+Names or Gmail label ids both work (a source's own list wins over the
+brain-wide key; the lists do not merge). The brain-wide key is the way to
+change the exclusion of a source that already exists, and it takes effect on
+the next sweep. Every sweep resolves the names
+against the account's labels exactly once, stores the resolution, and
+applies it at **all three** points a thread can reach the extractor: the
+sweep's own enqueue, the managed catch-up, and the job itself when it
+runs (so a label you add after a job was queued still stops it before the
+model call, `skipped: excluded_label`). The deterministic detector withholds
+new opens on an excluded thread and a grace hold that comes due under a now
+excluded label is dropped without opening; a close is never withheld, an
+already-open loop is never touched, and the email page still imports. The
+exclusion sits above the owner-participated override: replying inside an
+excluded label does not buy the thread back.
+
+A name that is not one of the account's labels, or a label list Gmail
+would not return this sweep, **fails closed**: the sweep logs
+`"<name>" is not a label of <account>`, every candidate counts as
+`excluded_label_unresolved`, nothing is queued (`loops_enqueue.skipped_reason`
+says why), a queued job retries instead of running, and a due grace hold is
+kept for the next sweep. Fix the name (or delete the token) and the next
+sweep picks up where it left off; nothing was spent in between. An id-shaped
+token (`Label_12`, `CATEGORY_FORUMS`) still applies when the list cannot be
+read.
+
+**What it may spend.** Extraction runs under a daily cap,
+`loops.extraction_max_usd_per_day` (default $2.00, per UTC day, across every
+source of the brain). Every `loops_extract` job a sweep or the managed
+catch-up queues carries the day's spend group, so the worker meters each
+model attempt against it: an attempt the cap cannot admit is refused before
+the provider is called (`cost_cap_exceeded` on the job, nothing spent), the
+job dies, and the thread is queued again on a later day when the sweep next
+touches it (the managed catch-up re-queues it once by itself). A sweep that
+finds the day already at its cap queues nothing and reports
+`loops_enqueue.skipped_reason: daily_spend_cap` with the amounts and the key
+to raise. `gbrain config set loops.extraction_max_usd_per_day 5` raises it;
+`0` queues no paid extraction at all (`spend_cap_zero`); a stored value makes
+the cap yours, so a model with no known price is refused instead of running
+unmetered. `gbrain jobs list --group <id>` shows a day's jobs and amounts
+(the group id is printed in the refusal). The deterministic detector is free
+and unaffected.
+
+**Every eligible thread is queued** (newest first — ordering only, nothing is
+dropped for being older). The MinionQueue is the backlog and the worker's
+concurrency is the rate limit (a thread only re-candidates when it changes,
+so a tight per-sweep cap would silently lose threads). Jobs are keyed by page
+revision (`loops:<source>:<slug>:<newestMs>`), so a re-sweep of an unchanged
+thread is a no-op and that key is the only dedupe in play. A generous safety
+ceiling (500/sweep) remains purely as a spend backstop for pathological
+sweeps; when it binds, the log names the drop honestly.
+
+The sweep queues extraction on managed and unmanaged brains alike. Its sync
+result carries `loops_enqueue` (`enqueued`, `deferred`, `skipped_reason`:
+`extraction_disabled`, `chat_unavailable`, `no_candidates` or
+`enqueue_failed`), and every skip is logged. On a managed brain a one-time
+catch-up also re-candidates email threads whose newest message is from the
+last 30 days. A thread counts as done only when the extractor recorded an
+outcome for its current revision (`extracted` or `skipped:<reason>`), so a
+thread whose job ran while extraction was off is analyzed later; a
+dead-lettered job is retried once. The catch-up honors the kill switch and
+the enqueue ceiling and marks itself done once every candidate is settled.
+
+### Quiet threads and grace holds
+
+A thread inside its waiting window (an inbound message under 24 h old, or
+your own question under 72 h) opens nothing yet. The sweep records a **grace
+hold** with the time the window ends and re-checks the thread on the first
+sweep after that time, even when no new mail arrives: an unchanged thread
+opens its loop from the stored page without a Gmail read, and a thread that
+changed or whose page is missing is re-fetched (at most 100 per sweep). A
+reply or a mute in the meantime means no loop opens. The first sweep after
+upgrading seeds holds for email pages active in the last 14 days from stored
+pages only, with no Gmail calls.
+
+Grace holds are kept apart from [held items](google-connect.md#held-items):
+they never appear in `connector_held_items`, never make `gbrain waiting`
+report partial coverage, and are capped at 2,000 per source (the oldest is
+dropped and logged).
+
+## The surfaces
+
+```bash
+gbrain waiting [--top N] [--json] [--stale-ok]
+    Ranked counterparties: what you owe them / they owe you, evidence
+    quotes, Gmail deep links, entity-card context, a paste-ready digest.
+    REFUSES when every google source has gone >24h without a successful
+    sync, printing the exact fix — stale-but-confident output is worse than
+    none. (One fresh account keeps output flowing; per-source sync ages are
+    always reported. If only some sources are stale, output continues with a
+    warning naming those sources; JSON includes their ids in `stale_sources`.)
+    When a Gmail thread from the last 14 days is held
+    after repeated import failures, the answer carries
+    completeness: "partial" and names each held thread with its retry
+    command (gbrain sources retry-held <id>); an empty partial answer says
+    coverage is partial instead of "You are clean".
+
+gbrain loops list|show <id>          inspect
+gbrain loops done <id> | drop <id>   close (a closed commitment retires its
+                                     projected fact too; see Close semantics)
+gbrain loops mute sender <email>     never open loops for this sender again
+gbrain loops mute thread <id>        ...or this thread; both also close its
+                                     open reply-owed loops (--dry-run lists them)
+gbrain loops unmute sender <email>   undo a mute: new loops can open again, and
+gbrain loops unmute thread <id>      the loops it closed are re-checked on the
+                                     next sync (--dry-run lists them)
+gbrain loops drop sender <email>     close every open reply-owed loop from one
+                                     sender (--dry-run first; cannot be undone)
+```
+
+**Say to your agent:** *"Who is waiting on me?"* / *"open loops"* — routes to
+the google-loops skill, whose daily-operation runbook covers muting: your
+agent runs `gbrain loops mute sender <email>` to stop tracking a sender and
+`gbrain loops unmute sender <email>` to undo it (unmute has no trigger of its
+own; the agent reaches for the command directly).
+
+`gbrain waiting` and `gbrain loops list` read across **every source in the
+brain** by default (loops live in google sources, not `default` — a
+default-scoped read would say "all clean" while people wait); `--source <id>`
+narrows explicitly. An unqualified `loops mute` resolves to the brain's
+google source automatically, and refuses with the exact fix when there is
+none or more than one (`--source` disambiguates). `loops unmute` resolves
+its source the same way, so an unmute cannot aim at a different source than
+the mute it reverses.
+
+**Mute closes; unmute re-checks (#5012).** A mute also closes the muted
+sender's or thread's open reply-owed (`unanswered_inbound`) loops as
+`dropped` with `closed_by: muted`, and prints how many it closed plus the
+exact unmute command. Commitment and decision loops keep their state. A
+sweep never reopens a muted loop for the same counterparty, even on newer
+activity. `--dry-run` lists the loops a mute would close and changes nothing.
+
+Unmute is exact. It deletes the one
+`(source_id, kind, value)` row the mute wrote — the same lower-casing, so
+`unmute sender BOB@Example.com` reverses `mute sender bob@example.com`, while
+a sibling source, the other `kind`, or a different value are untouched. It
+then queues the loops that mute closed for a re-check (`closed_by:
+mute_recheck`): the next Gmail sync re-fetches each thread and reopens a loop
+only when nothing answered the thread since. A thread you answered during the
+mute stays closed. A loop another remaining mute still covers is left alone,
+a manual `done`/`drop` is never touched, and a loop with no thread to re-check
+stays closed (`unverifiable`, `closed_by: unmuted`). When the source has not
+synced in 24 hours, unmute says so and prints the sync that runs the
+re-check. A repeated unmute
+is a no-op that reports `removed: false` and exits 0, so a script may call it
+unconditionally without special-casing "was not muted".
+
+**Dropping a noisy sender's backlog.** `gbrain loops drop sender <email>
+--dry-run` lists the ids and count of that sender's open reply-owed loops and
+changes nothing; that preview is the consent step. Running it without
+`--dry-run` closes them as `dropped`, one `loops_close` per loop. A drop
+cannot be undone: no command reopens a dropped loop. Use `loops mute sender`
+when you want a reversible stop.
+
+**Loops the automated-mail rule would not open now.** Loops opened before the
+rule existed stay open until you act. Each Gmail sync records, in the
+source's connector state (not in any page), the senders whose threads the
+rule withheld (`loop_withheld_senders`: reason, count, last time; at most
+2,000 senders). The first sync after upgrading also re-checks the newest
+thread of up to 500 senders with open reply-owed loops, so the record covers
+older loops. `gbrain waiting` then prints how many open reply-owed loops come
+from those senders and the exact `gbrain loops drop sender <email> --source
+<id> --dry-run` to preview for each (JSON and the `open_loops` grouped view:
+`withheld_noise`). Nothing is closed automatically. The sync log prints
+`[google] reply-owed loops withheld: automated_mail=N`.
+
+**Opt-in: Updates mail needs reciprocity.** With
+`gbrain config set loops.updates_require_reciprocity true` (key
+`loops.updates_require_reciprocity`, default `false`, unit boolean, off value
+`false`), a thread whose newest message Gmail filed under `CATEGORY_UPDATES`
+opens a reply-owed loop only when you have written to the sender (they appear
+in a stored thread you wrote in) or wrote a substantive message in this
+thread. Off, the default, Updates mail opens loops like any other mail, so a
+cold introduction Gmail files under Updates is never hidden. Withheld threads
+are recorded as `updates_without_reciprocity`.
+
+MCP: the `open_loops`, `loops_close`, `loops_mute`, `loops_unmute` ops.
+`loops_mute` returns the closed loop ids in `closed` (dry run: `would_close`)
+and an `undo_command`; `loops_unmute` returns `requeued`, `unverifiable`,
+`stale_source` with its `recheck_command`, and an `undo_command` (dry run:
+`would_requeue`). The `open_loops` grouped view adds `withheld_noise` (null
+when none). `open_loops` is
+served to remote callers with **fail-closed evidence redaction** — counts,
+counterparty, summary, due date; verbatim quotes, deep links, and the
+injectable `text` digest are trusted-local only. Remote callers also need a
+resolved source scope: an unscoped remote read is refused outright rather
+than spanning the brain, and the write ops require a single-source scope
+that matches the caller's grants (`loops_unmute` included — lifting another
+source's suppression is as much a targeted write as planting one). `open_loops` takes per-call scope params —
+`source_id` (an MCP client whose transport is bound to another source can
+point the read at the google source, grant-checked for remote callers) and
+`all_sources` (trusted local spans the brain; remote stays in-grant).
+
+**Who counts as a person.** Grouped output ranks counterparties only. A loop
+with neither a counterparty page nor an email (a `decision_pending` the
+extractor could not attribute, say) is not a person, so it never takes a
+ranked slot or counts toward `--top`/`limit`: it comes back in
+`no_counterparty` and the digest lists it last under
+`## No counterparty (N open: <type> N, …)`. When only such loops exist, the
+digest says no person is waiting and lists them; it never says "You are
+clean". Each group (and the no-counterparty section) shows at most 5 loops,
+due-soonest first and then the most recently active; `loop_count` stays the
+total and `loops_omitted` counts the rest (`+N more` in the digest).
+
+```json
+// before
+{ "groups": [{ "counterparty": "unknown", "loop_count": 9, "loops": [/* all 9 */] },
+             { "counterparty": "bob@example.com", "loop_count": 8, "loops": [/* all 8 */] }] }
+// after
+{ "groups": [{ "counterparty": "bob@example.com", "loop_count": 8, "loops": [/* 5 */], "loops_omitted": 3 }],
+  "no_counterparty": { "loop_count": 9, "by_type": { "decision_pending": 9 }, "loops": [/* 5 */], "loops_omitted": 4 } }
+```
+
+When the scope holds **no google source at all**, the result carries
+`no_google_sources: true` and the digest says so explicitly instead of "You
+are clean" — a brain whose email arrives through a gateway or agent-authored
+collector has nothing for the loop engine to read, which is not the same as
+an empty inbox. Any Google access path works to fix it: `gbrain google setup`
+(BYO OAuth) or `--access command|env` on `sources add` (an existing Google
+CLI or token-minting gateway; see
+[google-connect.md](google-connect.md#other-ways-to-reach-google-no-gbrain-oauth)).
+
+Memory verbs: entity cards' `open_threads[]` entries backed by loop rows
+carry additive optional fields (`direction`, `due`, `counterparty`,
+`status`, `loop_id`) — visible through `entity`, and through `context_pack`
+and `delta` with `include_private`, to the trusted local CLI only. Remote
+callers (every MCP transport) get cards without loop-backed threads and read
+loops inside their grant with `open_loops`.
+
+## Close semantics
+
+- Thread loops close deterministically when a reply lands (an
+  acknowledgement-only reply to a question does not count).
+- Commitment loops close manually (`gbrain loops done`) or by staleness
+  (overdue >14 days AND no activity in 14 days — an actively-discussed
+  overdue commitment stays open — or >90 days without any activity →
+  `stale`, aligned with the commitment fact decay halflife).
+- **Closed means closed.** A closed loop (done, dropped, or stale) only
+  reopens on genuinely newer thread activity — a routine sweep re-seeing the
+  same thread never resurrects a loop you closed by hand.
+- Fulfillment-by-reply detection for commitments is future work, not
+  pretended at.
+- **Closing a commitment retires its fact.** `gbrain loops done`/`drop` and
+  the `loops_close` tool expire the commitment fact and strike its row in the
+  entity page's `## Facts` fence in one coordinated write, so entity cards
+  and recall stop showing the finished promise. A fact that another open loop
+  still references stays active until that loop closes too. The result
+  reports what actually happened: `{ closed, id, status, fact_expired,
+  retryable, reason? }`. `fact_expired: false, retryable: true` means the
+  loop closed but the fact retirement did not commit (`reason` names the
+  refusal); closing the same loop again retries it. `reason:
+  "shared_with_open_loop"` comes with `retryable: false`. No withdrawal is
+  recorded, so the same promise made again is stored normally.
+- **Loops closed before the fact was retired.** `gbrain doctor` reports them
+  as `loop_facts_drift`. Preview with `gbrain repair loop-facts`, then apply
+  the printed `gbrain repair loop-facts --apply --expect <hash>` after you
+  agree ([repair guide](repair.md#loop-facts)).
+
+**Say to your agent:** *"I finished the deck for Alice Example; close that
+loop."* (the agent runs `gbrain loops done <id>` and checks `fact_expired`) or
+*"Doctor says closed loops still have active commitments. Preview the fix."*
+(the agent runs `gbrain repair loop-facts`).
+
+## Ranking
+
+Counterparties rank by open-loop count, due-date proximity, age of the
+oldest loop, and how connected the person is in your brain (backlink
+count). Deterministic — same data and same reference time, same order. Due
+dates and ages are relative to the reference time, which defaults to now;
+pin it with `gbrain waiting --as-of <iso>` (MCP: `open_loops` `as_of`) to
+reproduce a ranking. The result echoes it as `as_of`.

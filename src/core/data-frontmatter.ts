@@ -1,0 +1,178 @@
+import { load, dump, Type, DEFAULT_SCHEMA, type Schema } from 'js-yaml';
+import { NAIVE_DATETIME } from './effective-date.ts';
+
+// js-yaml's timestamp type builds `2024-02-30` as March 1 (Date.UTC rolls the
+// day over). A calendar-invalid timestamp stays the string the author wrote,
+// so date consumers reject it instead of storing the wrong day.
+type TimestampBehavior = { resolve(data: string): boolean; construct(data: string): Date; represent(data: object): string };
+const baseTimestamp = (DEFAULT_SCHEMA as unknown as { compiledTypeMap: { scalar: Record<string, TimestampBehavior> } })
+  .compiledTypeMap.scalar['tag:yaml.org,2002:timestamp']!;
+const calendarTimestamp = new Type('tag:yaml.org,2002:timestamp', {
+  kind: 'scalar',
+  resolve: (data: string) => {
+    if (!baseTimestamp.resolve(data)) return false;
+    const m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(data);
+    if (!m) return true;
+    const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+    return d.getUTCFullYear() === +m[1] && d.getUTCMonth() === +m[2] - 1 && d.getUTCDate() === +m[3];
+  },
+  // An offset-less datetime keeps its wall-clock reading for brain.timezone.
+  construct: (data: string) => {
+    const date = baseTimestamp.construct(data);
+    if (/^\d{4}-\d{1,2}-\d{1,2}(?:[Tt]|[ \t]+)\d/.test(data) && !/(?:[Zz]|[+-]\d{1,2}(?::?\d{2})?)\s*$/.test(data)) {
+      Object.defineProperty(date, NAIVE_DATETIME, { value: true });
+    }
+    return date;
+  },
+  instanceOf: Date,
+  represent: baseTimestamp.represent,
+});
+export const FRONTMATTER_SCHEMA = DEFAULT_SCHEMA.extend({ implicit: [calendarTimestamp] });
+
+/**
+ * Most characters a YAML document's aliases may add once expanded. js-yaml
+ * keeps an alias as a reference to its anchor, so a few hundred bytes of nested
+ * anchors (`&a2 [*a1, *a1, ...]`) load instantly and expand exponentially the
+ * first time anything serializes or walks the value. Without aliases the
+ * expanded size never exceeds the text, so the bound is the text length plus
+ * this; real frontmatter that uses anchors at all adds a few hundred.
+ */
+export const MAX_YAML_ALIAS_EXPANSION = 65_536;
+
+/** Shaped like js-yaml's own error (`reason`, `mark`) so every caller's location handling reads it unchanged. */
+export class YamlAliasBoundError extends Error {
+  readonly reason = 'yaml aliases expand past the frontmatter size limit';
+  constructor(readonly mark: { line: number; column: number }) {
+    super('YAML aliases expand past the frontmatter size limit');
+    this.name = 'YamlAliasBoundError';
+  }
+}
+
+/**
+ * The one js-yaml entry point for content gbrain did not write. Loads, then
+ * measures the value as if every alias were copied out (strings by length,
+ * keys by length, other nodes as one; shared nodes memoized, a cycle infinite)
+ * and throws YamlAliasBoundError past the bound, before any caller can walk it.
+ */
+export function loadBoundedYaml(text: string, opts: { schema?: Schema } = {}): unknown {
+  const value = load(text, opts);
+  const limit = text.length + MAX_YAML_ALIAS_EXPANSION;
+  const sizes = new Map<object, number>();
+  const size = (node: unknown): number => {
+    if (typeof node === 'string') return node.length;
+    if (node === null || typeof node !== 'object') return 1;
+    if (ArrayBuffer.isView(node)) return node.byteLength;
+    const known = sizes.get(node);
+    if (known !== undefined) return known;
+    sizes.set(node, Infinity);
+    let total = 1;
+    if (Array.isArray(node)) for (const child of node) { total += size(child); if (total > limit) break; }
+    else for (const [key, child] of Object.entries(node)) { total += key.length + size(child); if (total > limit) break; }
+    sizes.set(node, total);
+    return total;
+  };
+  if (size(value) <= limit) return value;
+  const lines = text.split('\n');
+  const line = Math.max(0, lines.findIndex(row => ALIAS_TOKEN.test(row.replace(QUOTED_SCALAR, ''))));
+  const at = ALIAS_TOKEN.exec((lines[line] ?? '').replace(QUOTED_SCALAR, ''));
+  throw new YamlAliasBoundError({ line, column: at ? at.index + at[0].indexOf('*') : 0 });
+}
+const ALIAS_TOKEN = /(?:^|[\s,[{])\*[^\s,[\]{}]/;
+const QUOTED_SCALAR = /"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'/g;
+
+export interface DataFrontmatter {
+  data: Record<string, unknown>;
+  content: string;
+  hasFrontmatter: boolean;
+}
+
+export class FrontmatterLanguageError extends Error {
+  constructor() {
+    super('Unsupported frontmatter language; only YAML and JSON are allowed');
+    this.name = 'FrontmatterLanguageError';
+  }
+}
+
+/**
+ * Where parseDataFrontmatter finds the block: the input without its BOM and,
+ * for a fenced input, the language, the block text and the body after the
+ * closing fence (`content` null when the fence never closes). Throws
+ * FrontmatterLanguageError for a language selector other than YAML or JSON.
+ */
+export function scanDataFrontmatter(input: string): {
+  original: string;
+  fenced: { language: string; block: string; content: string | null } | null;
+} {
+  const original = input.replace(/^\uFEFF/, '');
+  // Preserve ordinary body whitespace; lift leading blank lines only for a fence.
+  const lifted = original.replace(/^(?:[\t ]*\r?\n)+(?=---)/, '');
+  const opening = /^---([^\r\n]*)(?:\r?\n|$)/.exec(lifted);
+  if (!opening || opening[1]!.startsWith('-') || opening[1]!.trimEnd().endsWith('---')) {
+    return { original, fenced: null };
+  }
+  const language = opening[1]!.trim().toLowerCase();
+  if (language !== '' && language !== 'yaml' && language !== 'yml' && language !== 'json') {
+    throw new FrontmatterLanguageError();
+  }
+  const rest = lifted.slice(opening[0].length);
+  const closing = /^---[\t ]*(?:\r?\n|$)/m.exec(rest);
+  // Match the established parser's missing-close behavior: parse the remaining
+  // block and let the higher-level markdown validator report MISSING_CLOSE.
+  return {
+    original,
+    fenced: {
+      language,
+      block: closing ? rest.slice(0, closing.index) : rest,
+      content: closing ? rest.slice(closing.index + closing[0].length) : null,
+    },
+  };
+}
+
+/** Parse data only. There is deliberately no pluggable engine or evaluator. */
+export function parseDataFrontmatter(input: string): DataFrontmatter {
+  const { original, fenced } = scanDataFrontmatter(input);
+  if (!fenced) return { data: {}, content: original, hasFrontmatter: false };
+  const { language, block } = fenced;
+  let value: unknown;
+  try {
+    value = block.trim() === '' ? {} : language === 'json' ? JSON.parse(block) : loadBoundedYaml(block, { schema: FRONTMATTER_SCHEMA });
+  } catch (error) {
+    // Parser messages can contain the document itself. Report only location,
+    // so request/job diagnostics never copy private frontmatter into logs.
+    const line = (error as { mark?: { line?: number } })?.mark?.line;
+    throw new Error(`Malformed ${language === 'json' ? 'JSON' : 'YAML'} frontmatter${typeof line === 'number' ? ` at line ${line + 2}` : ''}`);
+  }
+  if (value !== undefined && value !== null && (typeof value !== 'object' || Array.isArray(value))) {
+    throw new Error('Frontmatter must be a YAML or JSON object');
+  }
+  return {
+    data: (value ?? {}) as Record<string, unknown>,
+    content: fenced.content ?? '',
+    hasFrontmatter: true,
+  };
+}
+
+/**
+ * YAML dump that refuses `undefined`. js-yaml 4 silently drops an undefined
+ * mapping value, so a field a caller meant to write would vanish; a write site
+ * omits the key (conditional spread) or writes null instead.
+ */
+export function dumpFrontmatterYaml(data: unknown, opts: { lineWidth?: number } = {}): string {
+  return dump(data, { ...opts, replacer: (key: string, value: unknown) => {
+    if (value === undefined) {
+      throw new TypeError(`Frontmatter field "${key}" is undefined. Why: YAML has no undefined, so the field would be dropped silently. Fix: omit the key at the write site (\`...(v ? { ${key}: v } : {})\`) or pass null.`);
+    }
+    return value;
+  } });
+}
+
+/** Serialize metadata without ever interpreting the body as frontmatter. */
+export function stringifyDataFrontmatter(content: string, data: Record<string, unknown>): string {
+  const yaml = dumpFrontmatterYaml(data).trim();
+  const header = yaml === '{}' ? '' : `---\n${yaml}\n---\n`;
+  return header + (content.endsWith('\n') ? content : content + '\n');
+}
+
+// Small compatibility surface for callers that parse and serialize together.
+// Unlike the removed dependency, stringify never parses its content argument.
+export const dataFrontmatter = Object.assign(parseDataFrontmatter, { stringify: stringifyDataFrontmatter });

@@ -1,0 +1,39 @@
+{
+  "benchmark": "constrained-relational dev seeds 11 and 13 (phrasing A)",
+  "gbrain": "23d2597e2",
+  "arms": {
+    "off": "search.triplet_scoring=false",
+    "on": "search.triplet_scoring=true, penalty 3.0"
+  },
+  "n": 142,
+  "fire_rate": 1.0,
+  "off": {
+    "ndcg_at_10": 0.7383,
+    "hit_at_1": 0.669,
+    "hit_at_3": 0.7535,
+    "recall_all_at_5": 0.7324
+  },
+  "on": {
+    "ndcg_at_10": 0.7577,
+    "hit_at_1": 0.7113,
+    "hit_at_3": 0.7465,
+    "recall_all_at_5": 0.7535
+  },
+  "delta_ndcg_points": 1.94,
+  "ci95_question_bootstrap_points": [
+    0.87,
+    3.14
+  ],
+  "hit_at_1_losses": 0,
+  "hit_at_1_wins": 6,
+  "by_template_delta_ndcg_points": {
+    "who_at_topic": 2.73,
+    "portfolio_sector": 1.32,
+    "attended_role": 1.44
+  },
+  "by_template_off_ndcg": {
+    "who_at_topic": 0.9603,
+    "portfolio_sector": 0.9092,
+    "attended_role": 0.1052
+  }
+}

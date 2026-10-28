@@ -1,0 +1,94 @@
+/**
+ * Source-shape regression tests for the v0.41 autopilot wiring of
+ * `runNightlyQualityProbe`.
+ *
+ * The autopilot loop is hard to drive end-to-end without spinning a real
+ * daemon (database, queue, gateway, etc). These tests pin the structural
+ * shape of the wiring — the feature flag check, the try/catch, the DI
+ * shape passed to runNightlyQualityProbe — so future refactors can't
+ * silently strip the protections without a CI signal.
+ *
+ * The pure decision logic lives in shouldRunNightly (already pinned by
+ * tests in nightly-quality-probe.test.ts).
+ */
+
+import { describe, test, expect } from 'bun:test';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
+
+// W4 autopilot: containment reads the autopilot surface; positional spans name the module that holds the probe steps.
+const SOURCE = surfaceSource('autopilot');
+const PROBES_SOURCE = surfaceFileSource('autopilot', 'src/commands/autopilot-probes.ts');
+
+describe('autopilot wiring: nightly quality probe', () => {
+  test('imports runNightlyQualityProbe from the phase module', () => {
+    expect(SOURCE).toContain(`runNightlyQualityProbe`);
+    expect(SOURCE).toContain(`nightly-quality-probe`);
+  });
+
+  test('uses the eng-D2 adapter module (not direct subprocess of eval-longmemeval/cross-modal)', () => {
+    expect(SOURCE).toContain(`nightly-probe-adapters`);
+    expect(SOURCE).toContain(`runLongMemEvalForProbe`);
+    expect(SOURCE).toContain(`runCrossModalBatchForProbe`);
+  });
+
+  test('feature flag gate present: dual-plane read (DB row wins, file plane fallback)', () => {
+    // Per D10: the scheduler ONLY checks the feature flag. The 24h rate-limit
+    // lives inside runNightlyQualityProbe itself (no scheduler-side precheck).
+    // The flag resolves through resolveProbeEnabled so `gbrain config set
+    // autopilot.nightly_quality_probe.enabled true` (the doctor hint, DB
+    // plane) and ~/.gbrain/config.json (file plane) BOTH work — a file-only
+    // read made the printed hint a silent no-op.
+    expect(SOURCE).toContain(`getConfig('autopilot.nightly_quality_probe.enabled')`);
+    expect(SOURCE).toMatch(/resolveProbeEnabled\(dbEnabled,\s*cfg\?\.autopilot\?\.nightly_quality_probe\?\.enabled\)/);
+  });
+
+  test('NO scheduler-side rate-limit check (D10 simplification)', () => {
+    // Codex round-1 #11 caught: scheduler-side rate-limit duplicates phase-internal logic.
+    // The wiring code MUST NOT call shouldRunNightly directly OR read recent events
+    // before invoking the phase.
+    expect(SOURCE).not.toContain(`shouldRunNightly(`);
+    expect(SOURCE).not.toContain(`readRecentQualityProbeEvents(`);
+  });
+
+  test('probe call wrapped in try/catch that does NOT bump consecutiveErrors', () => {
+    // The try/catch around the probe must log the error but never crash the loop.
+    // We verify the structural pattern: the probe call is inside a try block,
+    // the catch block calls logError, and consecutiveErrors is not bumped inside the catch.
+    expect(PROBES_SOURCE).toMatch(/try\s*\{\s*[^}]*nightly_quality_probe/);
+    // Anchored to the nightly probe's own catch block: logError, then only
+    // comments (one of them the do-NOT-bump note), then the closing brace. A
+    // lazy [\s\S]*? span would reach the parser probe's identical comment.
+    expect(PROBES_SOURCE).toMatch(
+      /\}\s*catch\s*\(e\)\s*\{\s*logError\('autopilot\.nightly_probe', e\);\s*\/\/[^\n]*do NOT bump consecutiveErrors[^\n]*\n(\s*\/\/[^\n]*\n)*\s*\}/,
+    );
+  });
+
+  test('DI shape: isEnabled / hasEmbeddingProvider / resolveMaxUsd / resolveBudgetPolicy / resolveFixturePath / runLongMemEval / runCrossModalBatch / now', () => {
+    expect(SOURCE).toContain(`isEnabled:`);
+    expect(SOURCE).toContain(`hasEmbeddingProvider:`);
+    expect(SOURCE).toContain(`resolveMaxUsd:`);
+    expect(SOURCE).toContain(`resolveBudgetPolicy:`);
+    expect(SOURCE).toContain(`resolveFixturePath:`);
+    expect(SOURCE).toContain(`runLongMemEval:`);
+    expect(SOURCE).toContain(`runCrossModalBatch:`);
+    expect(SOURCE).toContain(`now:`);
+  });
+
+  test('the fixture is the embedded package asset, never the brain repoPath (#5187)', () => {
+    // Before #5187 the wiring resolved the fixture from the package root on
+    // disk, which a compiled binary does not have, and fell back to the
+    // user's brain repo. The embedded asset is readable in both installs.
+    expect(SOURCE).toContain(`resolveFixturePath: () => NIGHTLY_PROBE_FIXTURES.longMemEval`);
+    expect(SOURCE).not.toMatch(/fixtureAtPkgRoot \? pkgRoot : repoPath/);
+  });
+
+  test('hasEmbeddingProvider reads from gateway.isAvailable("embedding") (codex round-2 #12 — in-process, not subprocess)', () => {
+    expect(SOURCE).toContain(`isAvailable('embedding')`);
+    expect(SOURCE).toContain(`gateway`);
+  });
+
+  test('max_usd resolves dual-plane with its cap source (default = 5 pinned by resolveProbeCap unit tests)', () => {
+    expect(SOURCE).toContain(`getConfig('autopilot.nightly_quality_probe.max_usd')`);
+    expect(SOURCE).toMatch(/resolveProbeCap\(dbMaxUsd,\s*cfg\?\.autopilot\?\.nightly_quality_probe\?\.max_usd\)/);
+  });
+});

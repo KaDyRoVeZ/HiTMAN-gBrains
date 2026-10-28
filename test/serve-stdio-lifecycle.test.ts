@@ -1,0 +1,763 @@
+import { describe, test, expect, afterEach } from 'bun:test';
+import { EventEmitter } from 'events';
+import { spawnSync } from 'node:child_process';
+import { PassThrough } from 'node:stream';
+import {
+  runServe,
+  isPidAlive,
+  readLiveParentPid,
+  probeWatchdogAvailable,
+  type ServeOptions,
+} from '../src/commands/serve';
+import type { BrainEngine } from '../src/core/engine';
+import { _resetStdoutRedirectForTests } from '../src/core/console-prefix';
+
+// runServe's stdio path calls redirectStdoutLoggingToStderr(), which
+// rebinds the process-global console.log/info/debug. Restore the real
+// bindings after every test so files sharing this shard process (e.g.
+// test/console-prefix.test.ts, which asserts bare console.log semantics)
+// don't inherit the redirect.
+/* eslint-disable no-console */
+const __realConsoleLog = console.log;
+const __realConsoleInfo = console.info;
+const __realConsoleDebug = console.debug;
+afterEach(() => {
+  console.log = __realConsoleLog;
+  console.info = __realConsoleInfo;
+  console.debug = __realConsoleDebug;
+  _resetStdoutRedirectForTests();
+});
+/* eslint-enable no-console */
+
+// These tests cover the stdio lifecycle hooks added to runServe so that the
+// PGLite write lock is released when the parent disconnects. We don't spawn
+// a real Bun child or boot the real MCP SDK; we inject a stub `engine`, a
+// fake stdin Readable (EventEmitter is enough — only on/once/emit are
+// touched), an injected exit() that resolves a promise instead of
+// terminating the process, and (per Codex Layer 2 review feedback) a
+// no-op startMcpServer stub so the real MCP SDK never attaches a 'data'
+// listener to the test runner's actual process.stdin.
+
+class StubEngine implements Partial<BrainEngine> {
+  // Track whether disconnect was called; the lock-release behavior we care
+  // about here is "did the lifecycle path actually invoke disconnect?".
+  disconnectCalls = 0;
+  disconnect = async (): Promise<void> => {
+    this.disconnectCalls += 1;
+  };
+}
+
+class StubSignals {
+  private handlers = new Map<string, Array<(...a: unknown[]) => void>>();
+  on(signal: string, handler: (...a: unknown[]) => void): this {
+    const list = this.handlers.get(signal) ?? [];
+    list.push(handler);
+    this.handlers.set(signal, list);
+    return this;
+  }
+  emit(signal: string): void {
+    for (const h of this.handlers.get(signal) ?? []) h();
+  }
+}
+
+// Stub timer pair: `setInterval` returns a numeric handle; `tickAll()`
+// fires every registered fn once, mirroring 1 real-time tick. Lets the
+// test drive the parent-watchdog deterministically without 5s of wall
+// clock and without leaving real timers active across the suite.
+interface TimerStub {
+  setInterval: (fn: () => void, ms: number) => unknown;
+  clearInterval: (h: unknown) => void;
+  tickAll: () => void;
+  active: () => number;
+}
+
+function makeTimerStub(): TimerStub {
+  const fns = new Map<number, () => void>();
+  let next = 1;
+  return {
+    setInterval(fn) {
+      const id = next++;
+      fns.set(id, fn);
+      return id;
+    },
+    clearInterval(h) {
+      if (typeof h === 'number') fns.delete(h);
+    },
+    tickAll() {
+      for (const fn of fns.values()) fn();
+    },
+    active() {
+      return fns.size;
+    },
+  };
+}
+
+interface Harness {
+  engine: StubEngine;
+  stdin: EventEmitter & { isTTY?: boolean; on: any; once: any };
+  signals: StubSignals;
+  logs: string[];
+  exited: Promise<number>;
+  opts: ServeOptions;
+  timers: TimerStub;
+  setParentPid: (pid: number) => void;
+}
+
+function makeHarness(opts: {
+  isTTY?: boolean;
+  initialParentPid?: number;
+  probeWatchdog?: boolean;
+  mcpStdio?: boolean;
+} = {}): Harness {
+  const engine = new StubEngine();
+  const stdin = new EventEmitter() as EventEmitter & { isTTY?: boolean };
+  if (opts.isTTY) stdin.isTTY = true;
+  const signals = new StubSignals();
+  const logs: string[] = [];
+
+  let resolveExit!: (code: number) => void;
+  const exited = new Promise<number>(r => { resolveExit = r; });
+  let exitCalled = false;
+
+  // Mutable parent-pid the test can flip; defaults to a non-1 sentinel
+  // so the watchdog *will* install (`initialParentPid !== 1` guard).
+  // Tests that want "we were spawned under PID 1" pass `initialParentPid: 1`.
+  let parentPid = opts.initialParentPid ?? 12345;
+  const timers = makeTimerStub();
+
+  // probeWatchdog defaults to true so tests run with watchdog installed.
+  // Set probeWatchdog: false to simulate stripped-container ps unavailability.
+  const probeWatchdogResult = opts.probeWatchdog ?? true;
+
+  const serveOpts: ServeOptions = {
+    stdin: stdin as any,
+    signals: signals as any,
+    exit: (code?: number) => {
+      if (exitCalled) return;
+      exitCalled = true;
+      resolveExit(code ?? 0);
+    },
+    log: (msg: string) => { logs.push(msg); },
+    // Replace the real MCP SDK boot with a no-op so we never touch the
+    // test runner's real process.stdin. The lifecycle hooks under test
+    // are installed *before* this is awaited, so all behaviors are still
+    // exercised end-to-end.
+    startMcpServer: async () => {},
+    getParentPid: () => parentPid,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    probeWatchdog: () => probeWatchdogResult,
+    mcpStdio: opts.mcpStdio,
+    // [ENG-5] The idle maintenance sweep registers its own (default-on)
+    // interval through the same deps.setInterval seam, which would inflate
+    // this harness's timers.active() watchdog assertions. This file tests
+    // the stdio lifecycle, not the sweep — test/sweep.test.ts owns the
+    // sweep-timer wiring coverage — so opt out here.
+    sweepEnabled: false,
+  };
+
+  return {
+    engine,
+    stdin: stdin as any,
+    signals,
+    logs,
+    exited,
+    opts: serveOpts,
+    timers,
+    setParentPid: (pid: number) => { parentPid = pid; },
+  };
+}
+
+// runServe in tests resolves quickly because the injected startMcpServer
+// is a no-op. The lifecycle hooks were installed synchronously before
+// that no-op was awaited, so they're already wired by the time runServe
+// returns. We start runServe and `await` it (so any setup error surfaces
+// immediately), then drive the test-controlled events.
+async function startInBackground(
+  engine: StubEngine,
+  args: string[],
+  opts: ServeOptions,
+): Promise<void> {
+  await runServe(engine as unknown as BrainEngine, args, opts);
+}
+
+describe('runServe stdio lifecycle', () => {
+  test('stdin end triggers engine.disconnect() and process exit(0)', async () => {
+    const h = makeHarness();
+    await startInBackground(h.engine, [], h.opts);
+
+    h.stdin.emit('end');
+    const code = await h.exited;
+
+    expect(code).toBe(0);
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.some(l => l.includes('graceful exit (stdin-end)'))).toBe(true);
+  });
+
+  test('SIGTERM triggers graceful exit', async () => {
+    const h = makeHarness();
+    await startInBackground(h.engine, [], h.opts);
+
+    h.signals.emit('SIGTERM');
+    const code = await h.exited;
+
+    expect(code).toBe(0);
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.some(l => l.includes('graceful exit (SIGTERM)'))).toBe(true);
+  });
+
+  test('SIGINT triggers graceful exit', async () => {
+    const h = makeHarness();
+    await startInBackground(h.engine, [], h.opts);
+
+    h.signals.emit('SIGINT');
+    const code = await h.exited;
+
+    expect(code).toBe(0);
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.some(l => l.includes('graceful exit (SIGINT)'))).toBe(true);
+  });
+
+  test('SIGHUP triggers graceful exit (terminal disconnect / daemon reload)', async () => {
+    // Per Aragorn (#591): real-world hosts (Claude Desktop on macOS,
+    // hermes-agent restart) sometimes send SIGHUP instead of closing
+    // stdin or sending SIGTERM. The handler converges on the same
+    // graceful path as the other signals.
+    const h = makeHarness();
+    await startInBackground(h.engine, [], h.opts);
+
+    h.signals.emit('SIGHUP');
+    const code = await h.exited;
+
+    expect(code).toBe(0);
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.some(l => l.includes('graceful exit (SIGHUP)'))).toBe(true);
+  });
+
+  test('stdin close (parent SIGKILL leaves pipe destroyed) triggers graceful exit', async () => {
+    // 'end' fires on a clean EOF; 'close' fires when the underlying
+    // handle is destroyed (e.g. parent SIGKILL'd while pipe still open).
+    // We must observe both — observing only 'end' would miss the
+    // hard-kill path that #591's reporter hit on macOS.
+    const h = makeHarness();
+    await startInBackground(h.engine, [], h.opts);
+
+    h.stdin.emit('close');
+    const code = await h.exited;
+
+    expect(code).toBe(0);
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.some(l => l.includes('graceful exit (stdin-close)'))).toBe(true);
+  });
+
+  test('parent watchdog fires shutdown when ppid flips to 1 (orphaned to init)', async () => {
+    // Some hosts (launchd, cron, certain MCP gateways) terminate
+    // without closing stdin and without sending a signal — the kernel
+    // re-parents us. The watchdog polls the live ppid on an interval;
+    // when it differs from the initial captured ppid, we detect "parent
+    // died" and shut down.
+    const h = makeHarness({ initialParentPid: 4242 });
+    await startInBackground(h.engine, [], h.opts);
+
+    // Watchdog should have installed (we passed initialParentPid !== 1
+    // and probeWatchdog defaulted to true).
+    expect(h.timers.active()).toBe(1);
+
+    // Simulate parent death: our process gets re-parented to init.
+    h.setParentPid(1);
+    h.timers.tickAll();
+
+    const code = await h.exited;
+    expect(code).toBe(0);
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.some(l => l.includes('graceful exit (parent-died)'))).toBe(true);
+
+    // beginShutdown clears the watchdog interval as part of cleanup so
+    // a duplicate tick can't queue a redundant shutdown.
+    expect(h.timers.active()).toBe(0);
+  });
+
+  test('parent watchdog fires shutdown when ppid flips to a SUBREAPER PID > 1 (codex finding #3)', async () => {
+    // Reparent-to-PID-1 is the easy case. Real hosts under launchd /
+    // systemd / tmux / a parent-shell-with-PR_SET_CHILD_SUBREAPER will
+    // re-parent us to that subreaper's PID, NOT to 1. The PR-#676
+    // author's original `=== 1` check missed this. The fix is to fire
+    // on `current !== initialParentPid` so any reparent triggers the
+    // shutdown, regardless of where the kernel re-anchors us.
+    const h = makeHarness({ initialParentPid: 8500 });
+    await startInBackground(h.engine, [], h.opts);
+
+    expect(h.timers.active()).toBe(1);
+
+    // Parent died; kernel re-parented to a launchd subreaper (PID 47).
+    h.setParentPid(47);
+    h.timers.tickAll();
+
+    const code = await h.exited;
+    expect(code).toBe(0);
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.some(l => l.includes('graceful exit (parent-died)'))).toBe(true);
+    expect(h.timers.active()).toBe(0);
+  });
+
+  test('parent watchdog NOT installed when initial ppid is already 1 (legitimate init child)', async () => {
+    // Spawned directly under PID 1 (e.g. systemd unit, Docker entrypoint):
+    // ppid=1 is the documented steady state, not "parent died". We must
+    // NOT install the watchdog or we'd shut down immediately.
+    const h = makeHarness({ initialParentPid: 1 });
+    await startInBackground(h.engine, [], h.opts);
+
+    expect(h.timers.active()).toBe(0);
+
+    // Sanity: the other lifecycle paths still work.
+    h.signals.emit('SIGTERM');
+    await h.exited;
+    expect(h.engine.disconnectCalls).toBe(1);
+  });
+
+  test('parent watchdog NOT installed when ps probe fails (codex finding #4 / D2-revisited)', async () => {
+    // Stripped containers / busybox-without-procps environments lack ps.
+    // The original PR's per-tick fallback would silently return cached
+    // process.ppid, never detect a change, and never fire the shutdown
+    // — while still claiming to be active.
+    //
+    // The fix: a one-shot startup probe. When it returns false, we skip
+    // installing the watchdog interval AND emit a loud stderr line so
+    // the operator sees the degraded mode at startup.
+    const h = makeHarness({ initialParentPid: 4242, probeWatchdog: false });
+    await startInBackground(h.engine, [], h.opts);
+
+    // Watchdog NOT installed — message matches behavior.
+    expect(h.timers.active()).toBe(0);
+    expect(h.logs.some(l => l.includes('[gbrain serve] watchdog disabled: no parent-liveness mechanism'))).toBe(true);
+
+    // Sanity: the other lifecycle paths still work — the shutdown still
+    // funnels through stdin EOF / signals, just not via the watchdog.
+    h.signals.emit('SIGTERM');
+    await h.exited;
+    expect(h.engine.disconnectCalls).toBe(1);
+  });
+
+  test('parent watchdog tick with ppid still alive does NOT fire shutdown', async () => {
+    // The watchdog must only fire on the *transition* away from the
+    // initial ppid; a healthy tick (ppid still equal to the original)
+    // is a no-op.
+    const h = makeHarness({ initialParentPid: 4242 });
+    await startInBackground(h.engine, [], h.opts);
+
+    expect(h.timers.active()).toBe(1);
+    // Tick with ppid unchanged.
+    h.timers.tickAll();
+    h.timers.tickAll();
+    h.timers.tickAll();
+    expect(h.engine.disconnectCalls).toBe(0);
+
+    // ... and signal-driven shutdown still works after several quiet ticks.
+    h.signals.emit('SIGTERM');
+    await h.exited;
+    expect(h.engine.disconnectCalls).toBe(1);
+  });
+
+  test('shutdown is idempotent — multiple signals only disconnect once', async () => {
+    const h = makeHarness();
+    await startInBackground(h.engine, [], h.opts);
+
+    h.signals.emit('SIGTERM');
+    h.signals.emit('SIGTERM');
+    h.signals.emit('SIGINT');
+    h.stdin.emit('end');
+
+    await h.exited;
+    expect(h.engine.disconnectCalls).toBe(1);
+  });
+
+  test('TTY stdin does NOT install end watcher (interactive use unaffected)', async () => {
+    const h = makeHarness({ isTTY: true });
+    await startInBackground(h.engine, [], h.opts);
+
+    // Emit 'end' on TTY stdin — no listener should be wired so this is a
+    // no-op. The test passes by simply not exiting; we give the runtime a
+    // beat to confirm nothing fires. Signals must still work.
+    h.stdin.emit('end');
+    await new Promise(r => setTimeout(r, 10));
+    expect(h.engine.disconnectCalls).toBe(0);
+
+    // Sanity: signals still wired regardless of TTY-ness.
+    h.signals.emit('SIGTERM');
+    await h.exited;
+    expect(h.engine.disconnectCalls).toBe(1);
+  });
+
+  test('--stdio-idle-timeout 0 disarms the idle hook (sanity)', async () => {
+    const h = makeHarness();
+    await startInBackground(h.engine, ['--stdio-idle-timeout', '0'], h.opts);
+
+    // 0 is the documented opt-out. No idle hook should be armed; drive a
+    // different exit path to confirm flow still works.
+    h.signals.emit('SIGTERM');
+    await h.exited;
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.every(l => !l.includes('idle timeout'))).toBe(true);
+  });
+
+  test('--stdio-idle-timeout > 0 logs the configured value', async () => {
+    const h = makeHarness();
+    await startInBackground(h.engine, ['--stdio-idle-timeout', '60'], h.opts);
+
+    expect(h.logs.some(l => l.includes('stdio idle timeout = 60s'))).toBe(true);
+
+    h.signals.emit('SIGTERM');
+    await h.exited;
+    expect(h.engine.disconnectCalls).toBe(1);
+  });
+
+  test('--stdio-idle-timeout leaves stdin paused until the MCP transport listener is attached', async () => {
+    const h = makeHarness();
+    const stdin = new PassThrough();
+    h.opts.stdin = stdin;
+    const initializeFrame = '{"jsonrpc":"2.0","id":1,"method":"initialize"}\n';
+    let sdkReceived = '';
+
+    h.opts.startMcpServer = async () => {
+      // Model a fast MCP client: it writes initialize while startMcpServer is
+      // still booting, immediately before StdioServerTransport adds its data
+      // listener. A paused Readable buffers this frame for the SDK. Any earlier
+      // lifecycle data listener flips the stream to flowing mode and consumes
+      // the frame before the SDK can observe it.
+      stdin.write(initializeFrame);
+      stdin.on('data', (chunk: Buffer) => { sdkReceived += chunk.toString('utf8'); });
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    };
+
+    await runServe(
+      h.engine as unknown as BrainEngine,
+      ['--stdio-idle-timeout', '60'],
+      h.opts,
+    );
+
+    expect(sdkReceived).toBe(initializeFrame);
+
+    h.signals.emit('SIGTERM');
+    await h.exited;
+    stdin.destroy();
+  });
+
+  test('idle timer is reset on every stdin data chunk', async () => {
+    const h = makeHarness();
+    // Use a very short timeout so we can observe the firing/resetting
+    // without slowing the suite. 50ms is enough to be measurable but
+    // short enough that the suite finishes promptly.
+    await startInBackground(
+      h.engine,
+      ['--stdio-idle-timeout', '1'], // 1 second; we reset it before it fires
+      h.opts,
+    );
+
+    // Pulse 'data' a few times to keep the timer reset.
+    for (let i = 0; i < 3; i++) {
+      h.stdin.emit('data', Buffer.from('{"jsonrpc":"2.0"}'));
+      await new Promise(r => setTimeout(r, 100));
+    }
+    expect(h.engine.disconnectCalls).toBe(0);
+
+    // Now stop pulsing and wait for the timer to actually fire end-to-end
+    // (it ought to elapse within ~1s of the last reset). Awaiting
+    // h.exited rather than a wall-clock race makes this deterministic.
+    await h.exited;
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.some(l => l.includes('stdio-idle-timeout (1s)'))).toBe(true);
+  }, 5000);
+
+  test.each([
+    ['abc', /--stdio-idle-timeout/],
+    ['30junk', /--stdio-idle-timeout/],
+    ['-1', /--stdio-idle-timeout/],
+    ['1.5', /--stdio-idle-timeout/],
+    ['', /--stdio-idle-timeout/],
+  ])('--stdio-idle-timeout rejects invalid value %p (typo is a CLI error)', async (bad, msgRe) => {
+    // Per Codex Layer 2 review P1: silent fallback on typo turns the
+    // opt-in safety net into a no-op. Strict parsing throws so the
+    // operator sees the mistake immediately.
+    const h = makeHarness();
+    expect(
+      runServe(h.engine as unknown as BrainEngine, ['--stdio-idle-timeout', bad], h.opts),
+    ).rejects.toThrow(msgRe);
+  });
+
+  test('--stdio-idle-timeout with no following value also throws', async () => {
+    const h = makeHarness();
+    // Flag at end of args — no value to consume.
+    expect(
+      runServe(h.engine as unknown as BrainEngine, ['--stdio-idle-timeout'], h.opts),
+    ).rejects.toThrow(/missing value/);
+  });
+
+  test('engine.disconnect throwing still results in exit(0) and logged error', async () => {
+    const h = makeHarness();
+    h.engine.disconnect = async () => {
+      throw new Error('synthetic disconnect failure');
+    };
+    await startInBackground(h.engine, [], h.opts);
+
+    h.signals.emit('SIGTERM');
+    const code = await h.exited;
+    expect(code).toBe(0);
+    expect(h.logs.some(l => l.includes('cleanup error: synthetic disconnect failure'))).toBe(true);
+  });
+
+  // v0.34.1 (#870): OpenClaw gateway / bundle-mcp wrappers pipe the
+  // JSON-RPC handshake on stdin then close their stdin half. Without
+  // MCP_STDIO=1 the server treats that as a permanent disconnect and
+  // exits before handling tools/call. The guard skips the stdin 'end' /
+  // 'close' hooks when MCP_STDIO=1; signals and parent watchdog still
+  // cover legitimate shutdown.
+  describe('MCP_STDIO=1 piped-stdin guard (#870)', () => {
+    test('stdin end with mcpStdio=true does NOT trigger shutdown', async () => {
+      const h = makeHarness({ mcpStdio: true });
+      await startInBackground(h.engine, [], h.opts);
+
+      // Without the guard this would shutdown; with the guard it must not.
+      h.stdin.emit('end');
+
+      // Give the event loop a microtask turn to catch any erroneous shutdown
+      // path. We assert NO exit was registered.
+      await new Promise<void>((r) => setTimeout(r, 10));
+      expect(h.engine.disconnectCalls).toBe(0);
+
+      // Then trigger SIGTERM to drive the test to completion; signal handlers
+      // remain active even with mcpStdio=true (codex would catch if they didn't).
+      h.signals.emit('SIGTERM');
+      const code = await h.exited;
+      expect(code).toBe(0);
+      expect(h.engine.disconnectCalls).toBe(1);
+      expect(h.logs.some(l => l.includes('graceful exit (SIGTERM)'))).toBe(true);
+    });
+
+    test('stdin close with mcpStdio=true does NOT trigger shutdown', async () => {
+      const h = makeHarness({ mcpStdio: true });
+      await startInBackground(h.engine, [], h.opts);
+
+      h.stdin.emit('close');
+
+      await new Promise<void>((r) => setTimeout(r, 10));
+      expect(h.engine.disconnectCalls).toBe(0);
+
+      h.signals.emit('SIGINT');
+      const code = await h.exited;
+      expect(code).toBe(0);
+      expect(h.engine.disconnectCalls).toBe(1);
+    });
+
+    test('mcpStdio=false (default) preserves stdin EOF shutdown', async () => {
+      // Regression guard: the guard must not over-trigger. With the env
+      // unset, stdin EOF must still drive shutdown so existing CLI usage
+      // (gbrain serve under launchd, claude-desktop's stdio MCP) is
+      // unchanged.
+      const h = makeHarness({ mcpStdio: false });
+      await startInBackground(h.engine, [], h.opts);
+
+      h.stdin.emit('end');
+      const code = await h.exited;
+      expect(code).toBe(0);
+      expect(h.engine.disconnectCalls).toBe(1);
+      expect(h.logs.some(l => l.includes('graceful exit (stdin-end)'))).toBe(true);
+    });
+  });
+});
+
+// Default watchdog implementations — the platform split that decides
+// whether the watchdog can run at all. The injected-seam tests above
+// never touch these; before this suite existed, the Windows branch had
+// zero coverage and the ps-only default silently disabled the watchdog
+// on every Windows host (orphaned serve → PGLite write lock held until
+// reboot). Signal-0 works on every platform Node/Bun support, so the
+// win32 branch is exercised on POSIX CI via the platform test seam.
+describe('watchdog platform defaults', () => {
+  test('isPidAlive: our own PID is alive', () => {
+    expect(isPidAlive(process.pid)).toBe(true);
+  });
+
+  test('isPidAlive: rejects non-PIDs without probing', () => {
+    expect(isPidAlive(0)).toBe(false);
+    expect(isPidAlive(-1)).toBe(false);
+    expect(isPidAlive(1.5)).toBe(false);
+    expect(isPidAlive(NaN)).toBe(false);
+  });
+
+  test('isPidAlive: an exited child is dead', () => {
+    // Spawn a trivial child and let it exit; its PID must then probe
+    // dead. PID reuse between exit and probe is theoretically possible
+    // but the window is microseconds — acceptable for a unit test of
+    // the same mechanism the production watchdog relies on.
+    const r = spawnSync(process.execPath, ['-e', ''], { timeout: 10_000 });
+    expect(r.pid).toBeGreaterThan(0);
+    expect(isPidAlive(r.pid as number)).toBe(false);
+  });
+
+  test('readLiveParentPid(win32): reports cached ppid while parent is alive', () => {
+    // The test runner's parent (bun's spawner / the shell) is alive, so
+    // the Windows reader must report the cached ppid unchanged — a
+    // healthy tick that must NOT fire the watchdog.
+    expect(readLiveParentPid('win32')).toBe(process.ppid);
+  });
+
+  test('probeWatchdogAvailable(win32): signal-0 mechanism is always available', () => {
+    // No external binary involved — the probe verifies signal-0 against
+    // our own (always-alive) PID. This is the line that un-disables the
+    // watchdog on Windows hosts.
+    expect(probeWatchdogAvailable('win32')).toBe(true);
+  });
+
+  test('readLiveParentPid(default platform): returns a usable integer PID', () => {
+    // POSIX: live kernel PPID via ps (or the cached-ppid fallback).
+    // Windows: liveness-checked cached ppid. Either way the watchdog
+    // install site needs an integer >= 0.
+    const n = readLiveParentPid();
+    expect(Number.isInteger(n)).toBe(true);
+    expect(n).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('boot-readiness deadline (#3273)', () => {
+  test('a boot that never completes releases the engine and exits non-zero', async () => {
+    const h = makeHarness();
+    // Never-resolving boot = serve wedged mid-boot while holding the
+    // PGLite write lock (the reported symptom: every CLI consumer times
+    // out on the lock until the serve PID is manually killed).
+    h.opts.startMcpServer = () => new Promise<void>(() => {});
+    h.opts.bootTimeoutMs = 20;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    const code = await h.exited;
+    expect(code).toBe(1);
+    expect(h.engine.disconnectCalls).toBe(1);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(true);
+  });
+
+  test('a completed boot clears the deadline (no spurious exit)', async () => {
+    const h = makeHarness();
+    h.opts.bootTimeoutMs = 20;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    // Give the (cleared) deadline window time to fire if the clear failed.
+    await new Promise(r => setTimeout(r, 50));
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  // #5205: the deadline line used to blame provider endpoints even when the
+  // boot was starved by a pool below what a resident serve needs.
+  test('names the stuck boot phase and a pool below the resident floor', async () => {
+    const h = makeHarness();
+    Object.assign(h.engine, { getPoolDiagnostics: () => ({ tracked: { raw: 0, direct: 0, reserved: 1, tx: 1 }, poolMax: 2, poisonedDiscards: 0 }) });
+    h.opts.startMcpServer = (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('persistence_consumer');
+      return new Promise<void>(() => {});
+    };
+    h.opts.bootTimeoutMs = 20;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    expect(await h.exited).toBe(1);
+    const line = h.logs.find(l => l.includes('boot did not complete'))!;
+    expect(line).toContain('code=serve_boot_timeout phase=persistence_consumer pool=2/2 tracked checkouts (below the resident floor of 6)');
+    expect(line).toContain('fix: export GBRAIN_POOL_SIZE=6');
+    expect(line).toContain('docs: docs/ENGINES.md#serve-boot-timeout');
+    expect(line).not.toContain('provider endpoints');
+  });
+
+  test('a stall with pool headroom points at the phase, not the pool', async () => {
+    const h = makeHarness();
+    Object.assign(h.engine, { getPoolDiagnostics: () => ({ tracked: { raw: 0, direct: 0, reserved: 0, tx: 0 }, poolMax: 10, poisonedDiscards: 0 }) });
+    h.opts.startMcpServer = (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('startup_sweep');
+      return new Promise<void>(() => {});
+    };
+    h.opts.bootTimeoutMs = 20;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    expect(await h.exited).toBe(1);
+    const line = h.logs.find(l => l.includes('boot did not complete'))!;
+    expect(line).toContain('phase=startup_sweep pool=0/10 tracked checkouts;');
+    expect(line).toContain('cause: boot stalled in startup_sweep');
+    expect(line).toContain('GBRAIN_SERVE_BOOT_TIMEOUT_SECONDS');
+  });
+
+  // Large-brain ceiling (F4d): a 52k-document brain took ~80 s to boot,
+  // past the 60 s deadline, and serve exited mid-session. The deadline now
+  // measures time without boot progress; a boot that keeps advancing is
+  // never killed, however long it takes in total.
+  test('a slow boot that keeps advancing phases outlives several windows', async () => {
+    const h = makeHarness();
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      for (const phase of ['source_preflight', 'writeback_config', 'mcp_connect', 'source_scope', 'persistence_consumer', 'resolve_ipc_bind', 'startup_sweep']) {
+        startOpts?.onBootPhase?.(phase);
+        await new Promise(r => setTimeout(r, 25));
+      }
+    };
+    h.opts.bootTimeoutMs = 60;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    await new Promise(r => setTimeout(r, 100));
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  test('forward-progress notes inside one long phase keep the boot alive', async () => {
+    const { noteForwardProgress } = await import('../src/core/forward-progress.ts');
+    const h = makeHarness();
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('persistence_consumer');
+      for (let i = 0; i < 12; i++) { noteForwardProgress(); await new Promise(r => setTimeout(r, 20)); }
+    };
+    h.opts.bootTimeoutMs = 60;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    await new Promise(r => setTimeout(r, 100));
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  // The 52k-document serve kept answering tool calls while its boot waited on
+  // the engine behind them; completed requests are progress too.
+  test('a boot phase waiting behind answered tool calls is not killed', async () => {
+    const { trackStdioRpc } = await import('../src/mcp/server.ts');
+    const h = makeHarness();
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('mcp_connect');
+      startOpts?.onBootPhase?.('persistence_consumer');
+      for (let i = 0; i < 12; i++) await trackStdioRpc(() => new Promise(r => setTimeout(r, 20)));
+    };
+    h.opts.bootTimeoutMs = 60;
+    await runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    await new Promise(r => setTimeout(r, 100));
+    expect(h.engine.disconnectCalls).toBe(0);
+    expect(h.logs.some(l => l.includes('boot did not complete'))).toBe(false);
+  });
+
+  test('a boot that stops advancing still exits one window after its last progress, naming the phase', async () => {
+    const h = makeHarness();
+    h.opts.startMcpServer = async (_engine, startOpts) => {
+      startOpts?.onBootPhase?.('source_scope');
+      await new Promise(r => setTimeout(r, 30));
+      startOpts?.onBootPhase?.('persistence_consumer');
+      return new Promise<void>(() => {});
+    };
+    h.opts.bootTimeoutMs = 50;
+    void runServe(h.engine as unknown as BrainEngine, [], h.opts);
+    expect(await h.exited).toBe(1);
+    const line = h.logs.find(l => l.includes('boot did not complete'))!;
+    expect(line).toContain('no boot progress for 50ms');
+    expect(line).toContain('code=serve_boot_timeout phase=persistence_consumer');
+  });
+
+  test('bootTimeoutMs = 0 disables the deadline', async () => {
+    const h = makeHarness();
+    let resolveBoot!: () => void;
+    h.opts.startMcpServer = () => new Promise<void>(r => { resolveBoot = r; });
+    h.opts.bootTimeoutMs = 0;
+    const running = runServe(h.engine as unknown as BrainEngine, [], h.opts);
+
+    await new Promise(r => setTimeout(r, 30));
+    expect(h.engine.disconnectCalls).toBe(0);
+    resolveBoot();
+    await running;
+  });
+});

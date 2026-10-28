@@ -1,0 +1,274 @@
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import {
+  AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS,
+  decideLockAcquisition,
+  isPidAlive,
+} from '../src/commands/autopilot.ts';
+import { looksLikeGbrainAutopilotCommand, readProcessCommand } from '../src/core/autopilot-lock.ts';
+
+let tmp: string;
+let lockPath: string;
+beforeEach(() => {
+  tmp = mkdtempSync(join(tmpdir(), 'gbrain-autopilot-lock-'));
+  lockPath = join(tmp, 'autopilot.lock');
+});
+
+afterEach(() => {
+  rmSync(tmp, { recursive: true, force: true });
+});
+
+describe('isPidAlive', () => {
+  test('returns true for the current process', () => {
+    expect(isPidAlive(process.pid)).toBe(true);
+  });
+
+  test('returns false for invalid process ids', () => {
+    expect(isPidAlive(0)).toBe(false);
+    expect(isPidAlive(-1)).toBe(false);
+    expect(isPidAlive(Number.NaN)).toBe(false);
+    expect(isPidAlive(Number.POSITIVE_INFINITY)).toBe(false);
+  });
+});
+
+describe('decideLockAcquisition', () => {
+  test('acquires when no lock exists', () => {
+    expect(decideLockAcquisition(lockPath, process.pid)).toEqual({ action: 'acquire' });
+  });
+
+  test('takes over a lock whose holder is dead', () => {
+    writeFileSync(lockPath, '4194303');
+    expect(decideLockAcquisition(lockPath, process.pid)).toEqual({
+      action: 'takeover',
+      reason: 'dead pid 4194303',
+    });
+  });
+
+  test('keeps a lock whose holder is a live gbrain autopilot process', () => {
+    writeFileSync(lockPath, '1234');
+    expect(decideLockAcquisition(lockPath, process.pid, {
+      isPidAlive: (pid) => pid === 1234,
+      readProcessCommand: () => 'gbrain autopilot --repo repo',
+    })).toEqual({
+      action: 'exit',
+      holderPid: 1234,
+      holderState: 'alive-autopilot',
+    });
+  });
+
+  test('keeps a STALE lock whose holder is a live gbrain autopilot process', () => {
+    // The age gate applies only to non-autopilot holders: a genuine autopilot
+    // sibling is never stolen no matter how old the lockfile mtime is.
+    writeFileSync(lockPath, '1234');
+    const stale = new Date(Date.now() - AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS - 1000);
+    utimesSync(lockPath, stale, stale);
+    expect(decideLockAcquisition(lockPath, process.pid, {
+      isPidAlive: (pid) => pid === 1234,
+      readProcessCommand: () => 'gbrain autopilot --repo repo',
+    })).toEqual({
+      action: 'exit',
+      holderPid: 1234,
+      holderState: 'alive-autopilot',
+    });
+  });
+
+  test('keeps a fresh lock when the live PID command is unrecognized', () => {
+    writeFileSync(lockPath, '1234');
+    expect(decideLockAcquisition(lockPath, process.pid, {
+      isPidAlive: (pid) => pid === 1234,
+      readProcessCommand: () => '/sbin/launchd',
+    })).toEqual({
+      action: 'exit',
+      holderPid: 1234,
+      holderState: 'alive-foreign',
+    });
+  });
+
+  test.each([
+    'bun "C:/Users/Example User/project/src/cli.ts" autopilot',
+    "bun '/home/example user/project/src/cli.js' autopilot",
+    'node "/project/src/cli.mjs" autopilot',
+  ])('keeps a stale lock held by a quoted autopilot command: %s', (command) => {
+    writeFileSync(lockPath, '1234');
+    const stale = new Date(Date.now() - AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS - 1000);
+    utimesSync(lockPath, stale, stale);
+    expect(decideLockAcquisition(lockPath, process.pid, {
+      isPidAlive: (pid) => pid === 1234,
+      readProcessCommand: () => command,
+    })).toEqual({ action: 'exit', holderPid: 1234, holderState: 'alive-autopilot' });
+  });
+
+  test('takes over a stale lock when the PID was reused by a foreign process', () => {
+    writeFileSync(lockPath, '1234');
+    const stale = new Date(Date.now() - AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS - 1000);
+    utimesSync(lockPath, stale, stale);
+    expect(decideLockAcquisition(lockPath, process.pid, {
+      isPidAlive: (pid) => pid === 1234,
+      readProcessCommand: () => '/sbin/launchd',
+    })).toEqual({
+      action: 'takeover',
+      reason: 'foreign pid 1234 with stale lock',
+    });
+  });
+
+  test('keeps a FRESH lock when process identity cannot be inspected', () => {
+    writeFileSync(lockPath, '1234');
+    expect(decideLockAcquisition(lockPath, process.pid, {
+      isPidAlive: (pid) => pid === 1234,
+      readProcessCommand: () => null,
+    })).toEqual({
+      action: 'exit',
+      holderPid: 1234,
+      holderState: 'alive-unknown',
+    });
+  });
+
+  test('takes over a STALE lock when process identity cannot be inspected (#4300)', () => {
+    // Recycled PID after reboot on a host where the command probe fails:
+    // pre-fix this exited forever (bricked daemon). alive-unknown now shares
+    // the alive-foreign age gate.
+    writeFileSync(lockPath, '1234');
+    const stale = new Date(Date.now() - AUTOPILOT_FOREIGN_PID_TAKEOVER_GRACE_MS - 1000);
+    utimesSync(lockPath, stale, stale);
+    expect(decideLockAcquisition(lockPath, process.pid, {
+      isPidAlive: (pid) => pid === 1234,
+      readProcessCommand: () => null,
+    })).toEqual({
+      action: 'takeover',
+      reason: 'unidentifiable pid 1234 with stale lock',
+    });
+  });
+
+  test('takes over malformed and empty locks', () => {
+    writeFileSync(lockPath, 'not-a-pid');
+    expect(decideLockAcquisition(lockPath, process.pid).action).toBe('takeover');
+    writeFileSync(lockPath, '');
+    expect(decideLockAcquisition(lockPath, process.pid).action).toBe('takeover');
+  });
+});
+
+describe('readProcessCommand', () => {
+  test('prefers /proc/<pid>/cmdline when readable (#4300)', () => {
+    const seen: string[] = [];
+    const cmd = readProcessCommand(1234, {
+      readCmdlineFile: (path) => {
+        seen.push(path);
+        return Buffer.from('gbrain\0autopilot\0--repo\0repo\0');
+      },
+    });
+    expect(seen).toEqual(['/proc/1234/cmdline']);
+    expect(cmd).toBe('gbrain autopilot --repo repo');
+  });
+
+  test('falls back to ps when the cmdline probe throws', () => {
+    // The current process always exists; ps must resolve it on macOS/Linux.
+    const cmd = readProcessCommand(process.pid, {
+      readCmdlineFile: () => {
+        throw new Error('ENOENT');
+      },
+    });
+    expect(cmd).not.toBeNull();
+    expect((cmd ?? '').length).toBeGreaterThan(0);
+  });
+
+  test('falls back to ps when the cmdline file is empty (zombie)', () => {
+    const cmd = readProcessCommand(process.pid, {
+      readCmdlineFile: () => Buffer.from(''),
+    });
+    expect(cmd).not.toBeNull();
+  });
+
+  test('returns null for invalid pids without probing', () => {
+    expect(readProcessCommand(0)).toBeNull();
+    expect(readProcessCommand(-5)).toBeNull();
+    expect(readProcessCommand(Number.NaN)).toBeNull();
+  });
+
+  test('uses Get-CimInstance on win32 and never touches /proc or ps (#4563)', () => {
+    const calls: Array<[string, string[]]> = [];
+    const cmd = readProcessCommand(1234, {
+      platform: 'win32',
+      readCmdlineFile: () => {
+        throw new Error('should not read /proc on win32');
+      },
+      execFile: (file, args) => {
+        calls.push([file, args]);
+        return 'C:\\Users\\u\\.bun\\bin\\gbrain.exe autopilot --repo C:\\brain\r\n';
+      },
+    });
+    expect(cmd).toBe('C:\\Users\\u\\.bun\\bin\\gbrain.exe autopilot --repo C:\\brain');
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe('powershell.exe');
+    expect(calls[0][1].join(' ')).toContain('Get-CimInstance Win32_Process');
+    expect(calls[0][1].join(' ')).toContain('ProcessId=1234');
+    expect(looksLikeGbrainAutopilotCommand(cmd!)).toBe(true);
+  });
+
+  test('win32: returns null when powershell fails or the process is gone (#4563)', () => {
+    expect(readProcessCommand(1234, {
+      platform: 'win32',
+      execFile: () => {
+        throw new Error('no powershell');
+      },
+    })).toBeNull();
+    // Empty CIM output = process exited between kill-0 and the CIM query.
+    expect(readProcessCommand(1234, {
+      platform: 'win32',
+      readCmdlineFile: () => {
+        throw new Error('should not read /proc on win32');
+      },
+      execFile: () => '',
+    })).toBeNull();
+  });
+});
+
+describe('looksLikeGbrainAutopilotCommand', () => {
+  test('matches packaged and source-tree autopilot invocations', () => {
+    expect(looksLikeGbrainAutopilotCommand('gbrain autopilot --repo repo')).toBe(true);
+    expect(looksLikeGbrainAutopilotCommand('./gbrain/src/cli.ts autopilot')).toBe(true);
+    expect(looksLikeGbrainAutopilotCommand('bun src/cli.ts autopilot --repo repo')).toBe(true);
+  });
+
+  test('matches a Windows command line with the executable quoted under a path with spaces', () => {
+    expect(looksLikeGbrainAutopilotCommand('"C:\\Program Files\\gbrain\\gbrain.exe" autopilot --repo "C:\\my brain"')).toBe(true);
+  });
+
+  test('rejects unrelated live processes', () => {
+    expect(looksLikeGbrainAutopilotCommand('/sbin/launchd')).toBe(false);
+    expect(looksLikeGbrainAutopilotCommand('/usr/bin/python worker.py')).toBe(false);
+  });
+
+  for (const extension of ['ts', 'js', 'mjs']) {
+    test.each([
+      `"C:/Users/Example User/project/src/cli.${extension}" autopilot`,
+      `"C:\\Program Files\\Bun\\bun.exe" "C:\\Users\\Example User\\project\\src\\cli.${extension}" autopilot`,
+      `bun '/home/example user/project/src/cli.${extension}' autopilot`,
+      `bun "/project/src/cli.${extension}" autopilot`,
+      `bun "cli.${extension}" autopilot`,
+      `bun 'cli.${extension}' autopilot`,
+      `bun /home/example user/project/src/cli.${extension} autopilot`,
+      `bun /home/example/project dir /cli.${extension} autopilot`,
+      `bun cli.${extension} autopilot`,
+      `bun ./cli.${extension} autopilot`,
+      `bun ../src/cli.${extension} autopilot`,
+      `node /project/dist/cli.${extension} autopilot --repo repo`,
+    ])('matches quoted and unquoted source paths: %s', (command) => {
+      expect(looksLikeGbrainAutopilotCommand(command)).toBe(true);
+    });
+  }
+
+  test.each([
+    'bun "C:/Users/Example User/project/src/cli.ts" serve',
+    'bun "C:/Users/Example User/project/src/cli.ts" autopilot-other',
+    'bun "C:/Users/Example User/project/src/not-cli.ts" autopilot',
+    'bun "C:/Users/Example User/project/src/cli.ts.bak" autopilot',
+    'bun "C:/Users/Example User/project/src/cli.jsx" autopilot',
+    'bun "C:/Users/Example User/project/src/cli.ts"suffix autopilot',
+    'other-gbrain autopilot',
+    'python worker.py autopilot',
+  ])('rejects commands outside script and argument boundaries: %s', (command) => {
+    expect(looksLikeGbrainAutopilotCommand(command)).toBe(false);
+  });
+});

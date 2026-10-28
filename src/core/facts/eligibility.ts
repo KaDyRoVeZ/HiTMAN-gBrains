@@ -1,0 +1,127 @@
+/**
+ * v0.31.2 — facts backstop eligibility predicate.
+ *
+ * Single source of truth for "should this page write fire the facts
+ * extraction backstop?" Used by:
+ *   - the page-write outbox (persistence/effect-facts.ts: prepareFactsBackstop
+ *     for put_page, capture and edit_page, and its body_unchanged check)
+ *   - runFactsBackstop (facts/backstop.ts), called by sync's post-import hook
+ *     and by the facts-absorb job, which re-checks the page it reads
+ *
+ * Pre-extraction (PR1 commit 5), this lived inline at operations.ts:633
+ * and sync.ts had its own divergent type filter (`['conversation',
+ * 'transcript', 'personal', 'therapy', 'call']` — only `meeting` was a
+ * real PageType, the rest never matched). Sync's filter is deleted in
+ * commit 7; everyone routes through this predicate.
+ *
+ * Eligible:
+ *   - parsed is non-null
+ *   - slug does NOT start with `wiki/agents/` (subagent scratch is its
+ *     own world; not user-meaningful for hot memory)
+ *   - frontmatter.dream_generated is NOT `true` (anti-loop: never extract
+ *     from dream-generated pages — they're already a digest)
+ *   - frontmatter.facts_backstop is NOT off (`false`, `0`, `no`, `off`; #6232):
+ *     the writer's opt-out for a page whose facts another page carries, such
+ *     as a meeting's raw transcript, or a draft not yet verified. It stops
+ *     future extraction only; facts already extracted from the page stay.
+ *   - body length >= 80 chars (skip TODO-style snippets)
+ *   - parsed.type ∈ {note, meeting, slack, email, calendar-event, source, writing}
+ *     OR slug.startsWith('meetings/' | 'personal/' | 'daily/')
+ *     (the slug-prefix branch is a "rescue" — a meetings/2026-05-09-foo.md
+ *      page that frontmatter-typed itself as 'note' should still get facts
+ *      extracted; the directory says it's a meeting regardless of the
+ *      legacy frontmatter type. Test fixtures cover all four combinations.)
+ *
+ * Conversation-shaped types (conversation, imessage, slack threads, email
+ * digests) skip with `conversation_pipeline`: their facts come from the
+ * opt-in conversation facts backfill, not the page-write backstop.
+ *
+ * Reasons returned for the skipped envelope are stable strings consumed
+ * by tests and observability (the doctor's facts_extraction_health check
+ * groups by reason).
+ */
+
+import { isQuarantined } from '../quarantine.ts';
+import type { PageType } from '../types.ts';
+import { ALLOWED_TYPES, isFrontmatterFlagOff, pageTypesForAllowed } from './conversation-types.ts';
+
+export type EligibilityResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Path prefixes that rescue a page even when frontmatter type is not
+ * eligible. A `meetings/2026-05-09-foo.md` page typed as 'note' (the
+ * legacy default) still extracts because the directory tells us it's
+ * conversation-shape.
+ */
+const RESCUE_SLUG_PREFIXES = ['meetings/', 'personal/', 'daily/'] as const;
+
+// v0.41.22 (T21, codex F-ELIGIBLE finding): UNION of gbrain-base's hardcoded
+// types AND gbrain-base-v2's canonical extractable types. Pre-rebase plan
+// deferred pack-aware ELIGIBLE_TYPES to v0.43+; codex outside voice caught
+// it as a blocker — changing the default taxonomy to gbrain-base-v2 while
+// `eligibility.ts:49` hardcodes only gbrain-base's types means post-unify
+// `media` (subtype: article), `tweet`, `analysis` pages would
+// silently drop out of facts extraction.
+//
+// `concept` is DELIBERATELY excluded: v0.41.11 documented its `extractable:
+// true` flag in gbrain-base.yaml as "cosmetic on the backstop path because
+// backstop uses hardcoded ELIGIBLE_TYPES" and the pre-existing test suite
+// pins `kind:concept` rejection. Concept extraction stays out of the
+// backstop; the schema-pack flag remains a forward-compatibility marker.
+//
+// `atom` is DELIBERATELY excluded too (#5831): atom pages are a derived
+// digest of pages that already went through the backstop, their facts carry
+// no entity, and consolidate never reads null-entity facts.
+//
+// The union here is safe for both packs:
+//   - gbrain-base brains: all original types still eligible (back-compat)
+//   - gbrain-base-v2 brains: post-unify canonical types also eligible
+//
+// Pack-aware async lookup via extractableTypesFromPack(pack) deferred to
+// v0.43+ once an async eligibility-check signature is feasible across all
+// call sites (operations.ts + import-file.ts + others).
+const ELIGIBLE_TYPES: PageType[] = [
+  // gbrain-base (legacy) types
+  'note', 'meeting', 'slack', 'email', 'calendar-event', 'source', 'writing',
+  // gbrain-base-v2 canonical types declared extractable in the pack
+  // (concept and atom deliberately omitted — see above)
+  'media', 'tweet', 'analysis',
+];
+
+const MIN_BODY_CHARS = 80;
+
+/**
+ * Page types the backstop leaves to the opt-in conversation facts pipeline
+ * (#6557): the paid backfill reads them in message windows under its own cost
+ * caps, so a write never fires an uncapped extraction for them. Skips carry
+ * `conversation_pipeline` and name the opt-in.
+ */
+export const CONVERSATION_PIPELINE_TYPES: readonly string[] = pageTypesForAllowed(ALLOWED_TYPES)
+  .filter(t => !(ELIGIBLE_TYPES as string[]).includes(t));
+export const CONVERSATION_PIPELINE_ENABLE_KEY = 'cycle.conversation_facts_backfill.enabled';
+export const BACKSTOP_RESCUE_SLUG_PREFIXES: readonly string[] = RESCUE_SLUG_PREFIXES;
+
+export function isFactsBackstopEligible(
+  slug: string,
+  parsed: { type: PageType; compiled_truth: string; frontmatter: Record<string, unknown> } | null | undefined,
+): EligibilityResult {
+  if (!parsed) return { ok: false, reason: 'no_parsed_page' };
+  if (slug.startsWith('wiki/agents/')) return { ok: false, reason: 'subagent_namespace' };
+  // #6259: the content-quality gate hid this page as junk; its text must not become facts.
+  if (isQuarantined(parsed.frontmatter)) return { ok: false, reason: 'quarantined' };
+  if (parsed.frontmatter && parsed.frontmatter.dream_generated === true) {
+    return { ok: false, reason: 'dream_generated' };
+  }
+  if (isFrontmatterFlagOff(parsed.frontmatter?.facts_backstop)) return { ok: false, reason: 'opted_out' };
+
+  const body = (parsed.compiled_truth ?? '').trim();
+  if (body.length < MIN_BODY_CHARS) return { ok: false, reason: 'too_short' };
+
+  const typeOk = ELIGIBLE_TYPES.includes(parsed.type);
+  const slugOk = RESCUE_SLUG_PREFIXES.some(p => slug.startsWith(p));
+  if (!typeOk && !slugOk) {
+    return { ok: false, reason: CONVERSATION_PIPELINE_TYPES.includes(parsed.type) ? 'conversation_pipeline' : `kind:${parsed.type}` };
+  }
+
+  return { ok: true };
+}

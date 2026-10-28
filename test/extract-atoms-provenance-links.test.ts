@@ -1,0 +1,1059 @@
+/**
+ * #3961 — atom provenance edges in the link graph.
+ *
+ * extract_atoms writes each atom with `source_slug` frontmatter, but nothing
+ * ever materialized that lineage as a link row — `gbrain backlinks
+ * <source-page>` showed no trace of the atoms derived from it. The phase now
+ * accumulates (source-page → atom) LinkBatchInput rows during the atom loop
+ * (link_source='atom-provenance', both endpoints in the phase's source) and
+ * flushes them BEFORE the completion-receipt flip (#4733: a failed provenance
+ * write leaves the item discoverable for a normal retry instead of stranding
+ * a completed page with no edges). Transcript items resolve their from-endpoint
+ * through the conversation page the transcript was imported into (matched on
+ * the normalized session id); a transcript with no imported page still gets no
+ * edge, because there is genuinely nothing to link to.
+ *
+ * Also pins the #4733 atom-identity fix: page-derived atom slugs fold the
+ * source-page slug into the identity hash so two same-date source pages
+ * emitting the same atom title can't alias one slug, plus the fail-closed
+ * binding guard and the upgrade path for pre-#4733 title-only-hash rows.
+ *
+ * Also pins the #5030 same-page case-insensitive adoption fallback.
+ *
+ * PGLite round-trip with a stubbed chat gateway (no model calls).
+ */
+
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { createHash } from 'crypto';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { runPhaseWithStoredPageFixtures as runPhaseExtractAtoms } from './helpers/extract-atoms-page-fixtures.ts';
+import { slugifySegment } from '../src/core/sync.ts';
+import type { ChatResult, ChatOpts } from '../src/core/ai/gateway.ts';
+
+let engine: PGLiteEngine;
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+}, 120_000);
+
+afterAll(async () => {
+  if (engine) await engine.disconnect();
+}, 60_000);
+
+const stubChat = (title: string) => async (_o: ChatOpts): Promise<ChatResult> => ({
+  text: `[{"title":"${title}","atom_type":"insight","body":"Enterprise buyers want tangible prototypes, not renders."}]`,
+  blocks: [{ type: 'text', text: '' }],
+  stopReason: 'end',
+  usage: { input_tokens: 500, output_tokens: 200, cache_read_tokens: 0, cache_creation_tokens: 0 },
+  model: 'anthropic:claude-haiku-4-5',
+  providerId: 'anthropic',
+});
+
+describe('atom provenance backlinks (#3961)', () => {
+  test('page-kind items get source-page → atom edges, visible as backlinks', async () => {
+    await engine.putPage('writings/essay-one', {
+      type: 'note', title: 'Essay One',
+      compiled_truth: 'A long essay with extractable claims.', timeline: '',
+    });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: 'writings/essay-one', content: 'A long essay with extractable claims.', contentHash: 'feedbeeffeedbeef' }],
+      _chat: stubChat('Prototypes beat renders'),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    // Outgoing edge on the source page, provenance-tagged.
+    const links = await engine.getLinks('writings/essay-one');
+    const provenance = links.filter(l => l.link_source === 'atom-provenance');
+    expect(provenance).toHaveLength(1);
+    expect(provenance[0]!.to_slug).toContain('prototypes-beat-renders');
+
+    // And the atom's backlinks point home.
+    const backs = await engine.getBacklinks(provenance[0]!.to_slug);
+    expect(backs.some(l => l.from_slug === 'writings/essay-one' && l.link_source === 'atom-provenance')).toBe(true);
+  });
+
+  test('re-running the same item upserts, never duplicates the edge', async () => {
+    // Same content hash re-run: deterministic atom slugs upsert; the batch
+    // write's ON CONFLICT dedupes the edge.
+    await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: 'writings/essay-one', content: 'A long essay with extractable claims.', contentHash: 'feedbeeffeedbee2' }],
+      _chat: stubChat('Prototypes beat renders'),
+    });
+    const links = await engine.getLinks('writings/essay-one');
+    expect(links.filter(l => l.link_source === 'atom-provenance')).toHaveLength(1);
+  });
+
+  test('an UNIMPORTED transcript creates no provenance edges (no page to link from)', async () => {
+    const before = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM links WHERE link_source = 'atom-provenance'`,
+    );
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath: '/fake/meeting.txt', content: 'transcript content here', contentHash: 'abc123def4567890' }],
+      _pages: [],
+      _chat: stubChat('Transcript atom'),
+    });
+    expect(result.status).toBe('ok');
+    const after = await engine.executeRaw<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM links WHERE link_source = 'atom-provenance'`,
+    );
+    expect(after[0]!.n).toBe(before[0]!.n);
+  });
+
+  test('an IMPORTED transcript links its conversation page → atom', async () => {
+    // The conversation page the transcript was rendered into. The corpus file
+    // on disk names the same session with '-' separators; the page stamps it
+    // with '_' — the resolver normalizes both.
+    await engine.putPage('conversations/sessions/2026-07-20-hermes-e91dbe', {
+      type: 'conversation', title: 'Session', compiled_truth: 'turns', timeline: '',
+      frontmatter: { transcript_import: { harness: 'hermes', session_id: '20260720_071844_e91dbe', part: 1, of: 1 } },
+    });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [{
+        filePath: '/corpus/2026-07-20-071844-e91dbe.md',
+        content: 'a session worth distilling',
+        contentHash: 'bbbb111122223333',
+      }],
+      _pages: [],
+      _chat: stubChat('Session atom lands home'),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    const links = await engine.getLinks('conversations/sessions/2026-07-20-hermes-e91dbe');
+    const provenance = links.filter(l => l.link_source === 'atom-provenance');
+    expect(provenance).toHaveLength(1);
+    expect(provenance[0]!.to_slug).toContain('session-atom-lands-home');
+  });
+
+  test('a split session links EVERY part page to the atom', async () => {
+    for (const part of [1, 2]) {
+      await engine.putPage(`conversations/sessions/2026-07-22-hermes-split-p${part}`, {
+        type: 'conversation', title: `Split (part ${part} of 2)`, compiled_truth: 'turns', timeline: '',
+        frontmatter: { transcript_import: { harness: 'hermes', session_id: '20260722_090000_split', part, of: 2 } },
+      });
+    }
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [{
+        filePath: '/corpus/2026-07-22-090000-split.md',
+        content: 'a long session split across two pages',
+        contentHash: 'cccc111122223333',
+      }],
+      _pages: [],
+      _chat: stubChat('Split session atom'),
+    });
+    expect(result.status).toBe('ok');
+
+    for (const part of [1, 2]) {
+      const links = await engine.getLinks(`conversations/sessions/2026-07-22-hermes-split-p${part}`);
+      expect(links.filter(l => l.link_source === 'atom-provenance')).toHaveLength(1);
+    }
+  });
+  test('a hook-captured <session_id>.txt corpus file links its conversation page → atom', async () => {
+    // gbrain's own Stop-hook capture writes the session corpus as
+    // `<session_id>.txt` (hook.ts) and the claude-code adapter stamps that
+    // same UUID into transcript_import.session_id — the stock capture + ingest
+    // flow, so the .txt stem must resolve like the .md/.jsonl ones.
+    await engine.putPage('conversations/sessions/2026-08-01-claude-code-0f1e2d3c', {
+      type: 'conversation', title: 'Hook session', compiled_truth: 'turns', timeline: '',
+      frontmatter: { transcript_import: { harness: 'claude-code', session_id: '0f1e2d3c-aaaa-bbbb-cccc-0123456789ab', part: 1, of: 1 } },
+    });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [{
+        filePath: '/corpus/0f1e2d3c-aaaa-bbbb-cccc-0123456789ab.txt',
+        content: 'a hook-captured session worth distilling',
+        contentHash: 'dddd111122223333',
+      }],
+      _pages: [],
+      _chat: stubChat('Hook session atom'),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    const links = await engine.getLinks('conversations/sessions/2026-08-01-claude-code-0f1e2d3c');
+    expect(links.filter(l => l.link_source === 'atom-provenance')).toHaveLength(1);
+  });
+});
+
+describe('atom identity folds the source locator (#4733)', () => {
+  test('two same-date source pages emitting the same atom title get DISTINCT atoms', async () => {
+    // Quotes are verbatim substrings of each source's own body, so the #4706
+    // extraction-time quote verification keeps them AND each atom's quote
+    // proves which source it came from.
+    const sources = [
+      {
+        slug: 'writings/2026-08-29-alpha-brief',
+        content: 'Alpha source body with an independently attributable claim.',
+        contentHash: '1111111111111111',
+        quote: 'Alpha source body with an independently attributable claim.',
+      },
+      {
+        slug: 'research/2026-08-29-beta-brief',
+        content: 'Beta source body with a separately attributable claim.',
+        contentHash: '2222222222222222',
+        quote: 'Beta source body with a separately attributable claim.',
+      },
+    ] as const;
+    for (const s of sources) {
+      await engine.putPage(s.slug, {
+        type: 'note', title: s.slug, compiled_truth: s.content, timeline: '',
+      });
+    }
+    const collisionChat = async (opts: ChatOpts): Promise<ChatResult> => {
+      const prompt = String(opts.messages[0]?.content ?? '');
+      const s = sources.find(c => prompt.includes(`Source: ${c.slug}`));
+      if (!s) throw new Error(`unexpected extraction prompt: ${prompt.slice(0, 120)}`);
+      return {
+        text: JSON.stringify([{
+          title: 'Shared collision title',
+          atom_type: 'insight',
+          body: `Atom derived from ${s.slug}.`,
+          source_quote: s.quote,
+        }]),
+        blocks: [{ type: 'text', text: '' }],
+        stopReason: 'end',
+        usage: { input_tokens: 500, output_tokens: 200, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'anthropic:claude-haiku-4-5',
+        providerId: 'anthropic',
+      };
+    };
+    const pages = sources.map(s => ({ slug: s.slug, content: s.content, contentHash: s.contentHash }));
+
+    const first = await runPhaseExtractAtoms(engine, { _transcripts: [], _pages: pages, _chat: collisionChat });
+    expect(first.status).toBe('ok');
+    expect(first.details?.atoms_extracted).toBe(2);
+
+    // Retry through the same seam (bypasses the source-hash skip) — must
+    // upsert, not add a second atom or edge per source.
+    const retry = await runPhaseExtractAtoms(engine, { _transcripts: [], _pages: pages, _chat: collisionChat });
+    expect(retry.status).toBe('ok');
+
+    const atomSlugs: string[] = [];
+    for (const s of sources) {
+      const links = (await engine.getLinks(s.slug)).filter(l => l.link_source === 'atom-provenance');
+      expect(links).toHaveLength(1);
+      const atomSlug = links[0]!.to_slug;
+      atomSlugs.push(atomSlug);
+      const atom = await engine.getPage(atomSlug, { sourceId: 'default' });
+      expect(atom).not.toBeNull();
+      // Pre-#4733 the second import aliased the first slug and overwrote this
+      // binding — each atom must keep ITS OWN source binding and quote.
+      expect(atom!.frontmatter.source_slug).toBe(s.slug);
+      expect(atom!.frontmatter.source_hash).toBe(s.contentHash.slice(0, 16));
+      expect(atom!.frontmatter.source_quote).toBe(s.quote);
+    }
+    expect(new Set(atomSlugs).size).toBe(2);
+  });
+
+  test('refuses to overwrite an atom whose stored binding names a DIFFERENT source (fail-closed)', async () => {
+    const source = {
+      slug: 'writings/2026-08-30-binding-guard',
+      content: 'A source page used to verify fail-closed atom imports.',
+      contentHash: '3333333333333333',
+    };
+    await engine.putPage(source.slug, {
+      type: 'note', title: 'Binding guard source', compiled_truth: source.content, timeline: '',
+    });
+    const first = await runPhaseExtractAtoms(engine, {
+      _transcripts: [], _pages: [source], _chat: stubChat('Binding guard atom'),
+    });
+    expect(first.status).toBe('ok');
+    const provenance = (await engine.getLinks(source.slug)).filter(l => l.link_source === 'atom-provenance');
+    expect(provenance).toHaveLength(1);
+    const atomSlug = provenance[0]!.to_slug;
+
+    // Corrupt the stored binding to point at a foreign source page.
+    await engine.executeRaw(
+      `UPDATE pages
+          SET frontmatter = frontmatter || jsonb_build_object('source_slug', $1::text)
+        WHERE source_id = 'default' AND slug = $2`,
+      ['research/2026-08-30-foreign-page', atomSlug],
+    );
+
+    const retry = await runPhaseExtractAtoms(engine, {
+      _transcripts: [], _pages: [source], _chat: stubChat('Binding guard atom'),
+    });
+    expect(retry.status).toBe('warn');
+    expect(retry.details?.atoms_extracted).toBe(0);
+    expect(retry.details?.failures).toEqual([
+      expect.objectContaining({
+        source: source.slug,
+        error: expect.stringContaining('atom identity conflict'),
+      }),
+    ]);
+    // The existing row is untouched — fail-closed means no overwrite.
+    const preserved = await engine.getPage(atomSlug, { sourceId: 'default' });
+    expect(preserved!.frontmatter.source_slug).toBe('research/2026-08-30-foreign-page');
+  });
+
+  test('upgrade: a pre-#4733 title-only-hash atom with a compatible binding is ADOPTED — re-extraction upserts in place, no duplicate', async () => {
+    // Seed a PRE-WAVE atom exactly where the legacy formula put it:
+    // atoms/<date>/<stem>-<sha256(title).slice(0,6)>, bound to the SAME
+    // source page the re-extraction runs against.
+    const title = 'Upgrade shared title';
+    const sourceSlug = 'writings/2026-08-28-upgrade-page';
+    const legacyHash = createHash('sha256').update(title).digest('hex').slice(0, 6);
+    const legacySlug = `atoms/2026-08-28/upgrade-shared-title-${legacyHash}`;
+    await engine.putPage(legacySlug, {
+      type: 'atom',
+      title,
+      compiled_truth: 'Pre-wave atom body extracted from version one.',
+      timeline: '',
+      frontmatter: { source_slug: sourceSlug, source_hash: 'aaaa000011112222', atom_type: 'insight' },
+    });
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Upgrade page', compiled_truth: 'Edited body, version two.', timeline: '',
+    });
+
+    // Post-upgrade re-extraction of the (edited) source page: same title.
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'Edited body, version two.', contentHash: 'bbbb333344445555' }],
+      _chat: stubChat(title),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.failures).toEqual([]);
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    // The legacy row was ADOPTED: same slug, binding kept, content refreshed —
+    // exactly what a pre-#4733 re-extraction did (reword-still-upserts holds
+    // across the upgrade boundary). Never deleted, never repointed elsewhere.
+    const legacy = await engine.getPage(legacySlug, { sourceId: 'default' });
+    expect(legacy).not.toBeNull();
+    expect(legacy!.deleted_at ?? null).toBeNull();
+    expect(legacy!.frontmatter.source_slug).toBe(sourceSlug);
+    expect(legacy!.frontmatter.source_hash).toBe('bbbb333344445555');
+
+    // NO duplicate on the locator-folded slug — pre-fix, re-extraction found
+    // nothing at the new shape and minted a second atom beside the legacy one.
+    const newHash = createHash('sha256').update(`${sourceSlug}\0${title}`).digest('hex').slice(0, 8);
+    const newSlug = `atoms/2026-08-28/upgrade-shared-title-${newHash}`;
+    expect(newSlug).not.toBe(legacySlug);
+    expect(await engine.getPage(newSlug, { sourceId: 'default' })).toBeNull();
+    const atoms = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages
+        WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND deleted_at IS NULL`,
+      [sourceSlug],
+    );
+    expect(atoms[0]!.n).toBe(1);
+    // Provenance edge points at the adopted legacy slug.
+    const links = (await engine.getLinks(sourceSlug)).filter(l => l.link_source === 'atom-provenance');
+    expect(links).toHaveLength(1);
+    expect(links[0]!.to_slug).toBe(legacySlug);
+  });
+
+  test('upgrade: a legacy-slug atom bound to a DIFFERENT source page is NOT adopted — the new-shape slug lands beside it', async () => {
+    const title = 'Upgrade foreign title';
+    const foreignSource = 'research/2026-08-26-foreign-origin';
+    const sourceSlug = 'writings/2026-08-26-adoption-guard-page';
+    const legacyHash = createHash('sha256').update(title).digest('hex').slice(0, 6);
+    const legacySlug = `atoms/2026-08-26/upgrade-foreign-title-${legacyHash}`;
+    await engine.putPage(legacySlug, {
+      type: 'atom',
+      title,
+      compiled_truth: 'Atom that belongs to the foreign source page.',
+      timeline: '',
+      frontmatter: { source_slug: foreignSource, source_hash: 'ffff000011112222', atom_type: 'insight' },
+    });
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Adoption guard page', compiled_truth: 'A separately owned claim.', timeline: '',
+    });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'A separately owned claim.', contentHash: 'dddd333344445555' }],
+      _chat: stubChat(title),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.failures).toEqual([]);
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    // The foreign-bound legacy row is untouched (the #4733 collision class).
+    const legacy = await engine.getPage(legacySlug, { sourceId: 'default' });
+    expect(legacy!.frontmatter.source_slug).toBe(foreignSource);
+    expect(legacy!.frontmatter.source_hash).toBe('ffff000011112222');
+    // The new atom lands on the locator-folded slug beside it.
+    const newHash = createHash('sha256').update(`${sourceSlug}\0${title}`).digest('hex').slice(0, 8);
+    const fresh = await engine.getPage(`atoms/2026-08-26/upgrade-foreign-title-${newHash}`, { sourceId: 'default' });
+    expect(fresh).not.toBeNull();
+    expect(fresh!.frontmatter.source_slug).toBe(sourceSlug);
+  });
+
+  test('upgrade: a pre-binding-era legacy atom (no source binding at all) is adopted and gains the binding', async () => {
+    const title = 'Upgrade unbound title';
+    const sourceSlug = 'writings/2026-08-25-unbound-page';
+    const legacyHash = createHash('sha256').update(title).digest('hex').slice(0, 6);
+    const legacySlug = `atoms/2026-08-25/upgrade-unbound-title-${legacyHash}`;
+    await engine.putPage(legacySlug, {
+      type: 'atom',
+      title,
+      compiled_truth: 'Unbound pre-binding-era atom body.',
+      timeline: '',
+      frontmatter: { atom_type: 'insight' },
+    });
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Unbound page', compiled_truth: 'The unbound claim, revised.', timeline: '',
+    });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'The unbound claim, revised.', contentHash: 'eeee333344445555' }],
+      _chat: stubChat(title),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.failures).toEqual([]);
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    const legacy = await engine.getPage(legacySlug, { sourceId: 'default' });
+    expect(legacy).not.toBeNull();
+    expect(legacy!.frontmatter.source_slug).toBe(sourceSlug); // binding gained
+    expect(legacy!.frontmatter.source_hash).toBe('eeee333344445555');
+    const newHash = createHash('sha256').update(`${sourceSlug}\0${title}`).digest('hex').slice(0, 8);
+    expect(await engine.getPage(`atoms/2026-08-25/upgrade-unbound-title-${newHash}`, { sourceId: 'default' })).toBeNull();
+  });
+
+  test("a type:'note' page squatting on the atom slug is never overwritten (fail-closed, 'atom identity conflict')", async () => {
+    // assertAtomImportBinding's non-atom arm: the deterministic slug already
+    // holds a page that is NOT an atom. The upsert would silently turn a
+    // human note into an atom — refuse, record the failure, leave it alone.
+    const title = 'Squatted atom title';
+    const sourceSlug = 'writings/2026-08-28-squatter-source';
+    const newHash = createHash('sha256').update(`${sourceSlug}\0${title}`).digest('hex').slice(0, 8);
+    const squatSlug = `atoms/2026-08-28/squatted-atom-title-${newHash}`;
+    await engine.putPage(squatSlug, {
+      type: 'note', title: 'A note, not an atom', compiled_truth: 'Human-written note body.', timeline: '',
+    });
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Squatter source', compiled_truth: 'A claim from the squatter source.', timeline: '',
+    });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'A claim from the squatter source.', contentHash: 'abab000011112222' }],
+      _chat: stubChat(title),
+    });
+    expect(result.status).toBe('warn');
+    expect(result.details?.atoms_extracted).toBe(0);
+    expect(result.details?.failures).toEqual([
+      expect.objectContaining({
+        source: sourceSlug,
+        error: expect.stringContaining('atom identity conflict'),
+      }),
+    ]);
+    const preserved = await engine.getPage(squatSlug, { sourceId: 'default' });
+    expect(preserved).not.toBeNull();
+    expect(preserved!.type).toBe('note');
+    expect(preserved!.title).toBe('A note, not an atom');
+    expect(preserved!.compiled_truth).toBe('Human-written note body.');
+    expect(preserved!.frontmatter.source_slug).toBeUndefined();
+    // No provenance edge was banked toward the squatter.
+    expect((await engine.getLinks(sourceSlug)).filter(l => l.link_source === 'atom-provenance')).toHaveLength(0);
+  });
+
+  test('upgrade: a legacy-slug atom bound via source_path (transcript origin) is NOT adopted — the new-shape slug lands beside it', async () => {
+    // resolvePageAtomSlug's other rejecting arm: a legacy title-only-hash
+    // row that carries a source_path binding belongs to a transcript file,
+    // not to this page — adopting it would repoint someone else's atom.
+    const title = 'Upgrade transcript title';
+    const sourceSlug = 'writings/2026-08-24-transcript-neighbor-page';
+    const legacyHash = createHash('sha256').update(title).digest('hex').slice(0, 6);
+    const legacySlug = `atoms/2026-08-24/upgrade-transcript-title-${legacyHash}`;
+    const transcriptPath = '/brain/conversations/2026-08-24-telegram.md';
+    await engine.putPage(legacySlug, {
+      type: 'atom',
+      title,
+      compiled_truth: 'Atom distilled from a transcript file.',
+      timeline: '',
+      frontmatter: { source_path: transcriptPath, source_hash: 'aaaa111122223333', atom_type: 'insight' },
+    });
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Transcript neighbor page', compiled_truth: 'A page-derived claim.', timeline: '',
+    });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'A page-derived claim.', contentHash: 'bbbb333344445555' }],
+      _chat: stubChat(title),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.failures).toEqual([]);
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    // The transcript-bound legacy row is untouched: same path, same hash, no source_slug gained.
+    const legacy = await engine.getPage(legacySlug, { sourceId: 'default' });
+    expect(legacy!.frontmatter.source_path).toBe(transcriptPath);
+    expect(legacy!.frontmatter.source_hash).toBe('aaaa111122223333');
+    expect(legacy!.frontmatter.source_slug).toBeUndefined();
+    // The page-derived atom lands on the locator-folded slug beside it.
+    const newHash = createHash('sha256').update(`${sourceSlug}\0${title}`).digest('hex').slice(0, 8);
+    const fresh = await engine.getPage(`atoms/2026-08-24/upgrade-transcript-title-${newHash}`, { sourceId: 'default' });
+    expect(fresh).not.toBeNull();
+    expect(fresh!.frontmatter.source_slug).toBe(sourceSlug);
+    expect(fresh!.frontmatter.source_path).toBeUndefined();
+  });
+
+  test('reword-still-upserts survives: same page re-extracted after a body edit updates ONE atom', async () => {
+    const sourceSlug = 'writings/2026-08-27-reword-page';
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Reword page', compiled_truth: 'Original body.', timeline: '',
+    });
+    await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'Original body.', contentHash: 'cafe000000000001' }],
+      _chat: stubChat('Reword stable title'),
+    });
+    // Body edit → new content hash, same title. Must upsert in place (the
+    // content hash is deliberately NOT part of atom identity).
+    await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'Edited body.', contentHash: 'cafe000000000002' }],
+      _chat: stubChat('Reword stable title'),
+    });
+    const atoms = await engine.executeRaw<{ slug: string; source_hash: string }>(
+      `SELECT slug, frontmatter->>'source_hash' AS source_hash
+         FROM pages WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND deleted_at IS NULL`,
+      [sourceSlug],
+    );
+    expect(atoms).toHaveLength(1);
+    expect(atoms[0]!.source_hash).toBe('cafe000000000002');
+    const links = (await engine.getLinks(sourceSlug)).filter(l => l.link_source === 'atom-provenance');
+    expect(links).toHaveLength(1);
+  });
+});
+
+/**
+ * #4733/#4734 ship-review gap: the locator fold applies to PAGE-derived atoms
+ * only. Transcript atoms (locator = a file path, not page identity) keep the
+ * legacy title-only 6-char hash so an upgrade never re-mints every transcript
+ * atom, and a re-extraction of the same transcript (edited → new content
+ * hash, so the source_hash short-circuit does not apply) upserts the SAME
+ * slug instead of minting a duplicate.
+ */
+describe('transcript atoms keep the legacy title-only 6-char slug (#4733)', () => {
+  test('slug is atoms/<source-date>/<stem>-<sha256(title)[0:6]> and a second run upserts it (atom count stays 1)', async () => {
+    const title = 'Transcript legacy slug title';
+    const filePath = '/fake/conversations/2026-08-20-standup.md';
+    const legacyHash = createHash('sha256').update(title).digest('hex').slice(0, 6);
+    const expectedSlug = `atoms/2026-08-20/transcript-legacy-slug-title-${legacyHash}`;
+
+    const first = await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath, content: 'standup transcript, take one', contentHash: 'aaaa000000000001' }],
+      _pages: [],
+      _chat: stubChat(title),
+    });
+    expect(first.status).toBe('ok');
+    expect(first.details?.atoms_extracted).toBe(1);
+
+    const atom = await engine.getPage(expectedSlug, { sourceId: 'default' });
+    expect(atom).not.toBeNull();
+    expect(atom!.type).toBe('atom');
+    // Title-only 6-char suffix — NOT the 8-char locator-folded page shape.
+    expect(expectedSlug).toMatch(/-[0-9a-f]{6}$/);
+    const foldedHash = createHash('sha256').update(`${filePath}\0${title}`).digest('hex').slice(0, 8);
+    expect(await engine.getPage(`atoms/2026-08-20/transcript-legacy-slug-title-${foldedHash}`, { sourceId: 'default' })).toBeNull();
+    // Transcript binding: source_path, never source_slug.
+    expect(atom!.frontmatter.source_path).toBe(filePath);
+    expect(atom!.frontmatter.source_slug).toBeUndefined();
+    expect(atom!.frontmatter.source_hash).toBe('aaaa000000000001');
+
+    // The transcript grew (append-only corpus → new content hash, same title):
+    // the run re-extracts and UPSERTS the same slug.
+    const second = await runPhaseExtractAtoms(engine, {
+      _transcripts: [{ filePath, content: 'standup transcript, take one, plus a later addendum', contentHash: 'aaaa000000000002' }],
+      _pages: [],
+      _chat: stubChat(title),
+    });
+    expect(second.status).toBe('ok');
+    expect(second.details?.atoms_extracted).toBe(1);
+
+    const atoms = await engine.executeRaw<{ slug: string; source_hash: string }>(
+      `SELECT slug, frontmatter->>'source_hash' AS source_hash
+         FROM pages WHERE type = 'atom' AND frontmatter->>'source_path' = $1 AND deleted_at IS NULL`,
+      [filePath],
+    );
+    expect(atoms).toHaveLength(1);
+    expect(atoms[0]!.slug).toBe(expectedSlug);
+    expect(atoms[0]!.source_hash).toBe('aaaa000000000002');
+  });
+});
+
+describe('provenance edges are banked BEFORE the completion flip (#4733)', () => {
+  test('a provenance write failure leaves the item discoverable; the retry converges to one edge', async () => {
+    const sourceSlug = 'meetings/2026-08-30-provenance-retry';
+    const contentHash = '4444444444444444';
+    await engine.putPage(sourceSlug, {
+      type: 'meeting', title: 'Provenance retry source',
+      compiled_truth: 'A retryable source claim with enough detail.', timeline: '',
+    });
+
+    const originalAddLinksBatch = engine.addLinksBatch;
+    let provenanceWrites = 0;
+    // GBRA-161: the edges are written inside the generation's activation transaction, so the stub keeps its receiver.
+    engine.addLinksBatch = async function (this: typeof engine, links, opts) {
+      provenanceWrites++;
+      if (provenanceWrites === 1) throw new Error('forced provenance write failure');
+      return originalAddLinksBatch.call(this, links, opts);
+    };
+    try {
+      const first = await runPhaseExtractAtoms(engine, {
+        _transcripts: [],
+        _pages: [{ slug: sourceSlug, content: 'A retryable source claim with enough detail.', contentHash }],
+        _chat: stubChat('Retryable provenance atom'),
+      });
+      // The failure is recorded, NOT swallowed (pre-fix: logged + flip
+      // proceeded, stranding a "completed" page with zero edges forever).
+      expect(first.status).toBe('warn');
+      expect(first.details?.failures).toEqual([
+        expect.objectContaining({
+          source: sourceSlug,
+          error: expect.stringContaining('forced provenance write failure'),
+        }),
+      ]);
+      // No edge banked, and the atom's receipt NEVER flipped. GBRA-161: the atoms, edges and flip are one generation
+      // transaction, so the failed publication left no atom row at all; the item stays discoverable for the next run.
+      expect((await engine.getLinks(sourceSlug)).filter(l => l.link_source === 'atom-provenance')).toHaveLength(0);
+      const pending = await engine.executeRaw<{ source_hash: string }>(
+        `SELECT frontmatter->>'source_hash' AS source_hash
+           FROM pages WHERE type = 'atom' AND frontmatter->>'source_slug' = $1`,
+        [sourceSlug],
+      );
+      expect(pending).toEqual([]);
+
+      const retry = await runPhaseExtractAtoms(engine, {
+        _transcripts: [],
+        _pages: [{ slug: sourceSlug, content: 'A retryable source claim with enough detail.', contentHash }],
+        _chat: stubChat('Retryable provenance atom'),
+      });
+      expect(retry.status).toBe('ok');
+      const links = (await engine.getLinks(sourceSlug)).filter(l => l.link_source === 'atom-provenance');
+      expect(links).toHaveLength(1);
+      const atom = await engine.getPage(links[0]!.to_slug, { sourceId: 'default' });
+      expect(atom?.frontmatter.source_hash).toBe(contentHash.slice(0, 16));
+    } finally {
+      engine.addLinksBatch = originalAddLinksBatch;
+    }
+  });
+});
+
+/**
+ * #5030: case-only title drift used to mint duplicate atoms. Two extractions
+ * of the same claim from the same source page whose titles differed only in
+ * letter case hashed to different identity slugs. resolvePageAtomSlug now
+ * falls back, after both exact-slug probes miss, to this page's live bound
+ * atoms (loaded once per page per run), matched with JS `.toLowerCase()`, and
+ * adopts exactly one match; zero or several mint the new-shape slug. Atom
+ * slug hashing is unchanged.
+ */
+function expectedAtomStem(title: string): string {
+  // Mirrors atomSlugStem exactly (private to extract-atoms.ts): slugify,
+  // truncate to 60 chars, re-strip a trailing dash the truncation can expose.
+  return slugifySegment(title).slice(0, 60).replace(/-+$/g, '') || 'untitled';
+}
+
+describe('case-insensitive same-page atom adoption (#5030)', () => {
+  test('core regression: re-extracting the same claim with a different-case title leaves exactly ONE live atom', async () => {
+    const sourceSlug = 'writings/2026-09-05-case-regression-page';
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Case regression source',
+      compiled_truth: 'A claim whose title case may drift between extractions.', timeline: '',
+    });
+
+    const first = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{
+        slug: sourceSlug,
+        content: 'A claim whose title case may drift between extractions.',
+        contentHash: 'case000000000001',
+      }],
+      _chat: stubChat('12-month price momentum predicts next-month returns'),
+    });
+    expect(first.status).toBe('ok');
+    expect(first.details?.atoms_extracted).toBe(1);
+
+    // Body edit (new content hash) but the same claim, re-titled with
+    // different letter case only.
+    const second = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{
+        slug: sourceSlug,
+        content: 'A claim whose title case may drift between extractions, reworded.',
+        contentHash: 'case000000000002',
+      }],
+      _chat: stubChat('12-Month Price Momentum Predicts Next-Month Returns'),
+    });
+    expect(second.status).toBe('ok');
+    expect(second.details?.atoms_extracted).toBe(1);
+
+    const atoms = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages
+        WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND deleted_at IS NULL`,
+      [sourceSlug],
+    );
+    expect(atoms[0]!.n).toBe(1);
+    const links = (await engine.getLinks(sourceSlug)).filter(l => l.link_source === 'atom-provenance');
+    expect(links).toHaveLength(1);
+  });
+
+  test('an existing same-page atom is adopted in place when the title changes only in case', async () => {
+    const seedTitle = 'Existing Different Case Title';
+    const sourceSlug = 'writings/2026-09-03-existing-different-case';
+    const oldHash = createHash('sha256').update(`${sourceSlug}\0${seedTitle}`).digest('hex').slice(0, 8);
+    const oldSlug = `atoms/2026-09-03/${expectedAtomStem(seedTitle)}-${oldHash}`;
+    await engine.putPage(oldSlug, {
+      type: 'atom', title: seedTitle,
+      compiled_truth: 'Existing atom body.', timeline: '',
+      frontmatter: { source_slug: sourceSlug, source_hash: 'cccc666677778888', atom_type: 'insight' },
+    });
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Existing different case source', compiled_truth: 'Edited body, take two.', timeline: '',
+    });
+
+    const differentCaseTitle = 'EXISTING DIFFERENT CASE TITLE';
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'Edited body, take two.', contentHash: 'dddd222233334444' }],
+      _chat: stubChat(differentCaseTitle),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.failures).toEqual([]);
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    const seeded = await engine.getPage(oldSlug, { sourceId: 'default' });
+    expect(seeded).not.toBeNull();
+    expect(seeded!.frontmatter.source_slug).toBe(sourceSlug);
+    expect(seeded!.frontmatter.source_hash).toBe('dddd222233334444');
+
+    const atoms = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages
+        WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND deleted_at IS NULL`,
+      [sourceSlug],
+    );
+    expect(atoms[0]!.n).toBe(1);
+    const links = (await engine.getLinks(sourceSlug)).filter(l => l.link_source === 'atom-provenance');
+    expect(links).toHaveLength(1);
+    expect(links[0]!.to_slug).toBe(oldSlug);
+  });
+
+  test('ambiguous: two or more pre-existing case-variant candidates are NOT guessed between — a fresh slug is minted instead', async () => {
+    const sourceSlug = 'writings/2026-09-02-ambiguous-case-page';
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Ambiguous case source',
+      compiled_truth: 'A claim with an ambiguous title history.', timeline: '',
+    });
+
+    // Two case-variant atoms already bound to this page. Neither sits at the
+    // third title's exact address, so only the fallback can see them.
+    const titleA = 'Ambiguous Duplicate Title';
+    const titleB = 'AMBIGUOUS DUPLICATE TITLE';
+    const hashA = createHash('sha256').update(`${sourceSlug}\0${titleA}`).digest('hex').slice(0, 8);
+    const hashB = createHash('sha256').update(`${sourceSlug}\0${titleB}`).digest('hex').slice(0, 8);
+    const slugA = `atoms/2026-09-02/${expectedAtomStem(titleA)}-${hashA}`;
+    const slugB = `atoms/2026-09-02/${expectedAtomStem(titleB)}-${hashB}`;
+    expect(slugA).not.toBe(slugB); // sanity: two genuinely distinct pre-existing rows
+
+    await engine.putPage(slugA, {
+      type: 'atom', title: titleA, compiled_truth: 'Duplicate atom A.', timeline: '',
+      frontmatter: { source_slug: sourceSlug, source_hash: 'eeee111122223333', atom_type: 'insight', extracted_by: 'extract_atoms-v0.41.2.1' },
+    });
+    await engine.putPage(slugB, {
+      type: 'atom', title: titleB, compiled_truth: 'Duplicate atom B.', timeline: '',
+      frontmatter: { source_slug: sourceSlug, source_hash: 'ffff444455556666', atom_type: 'insight', extracted_by: 'extract_atoms-v0.41.2.1' },
+    });
+    // GBRA-161: an atom from before the generation ledger is retired only on retained extractor evidence (a page
+    // version the extractor wrote, unedited since), so the seed keeps one like a real extraction would.
+    await engine.createVersion(slugA, { sourceId: 'default' });
+    await engine.createVersion(slugB, { sourceId: 'default' });
+
+    // Re-extraction returns yet a THIRD case variant of the same title. Must
+    // not throw, and must not silently adopt either pre-existing duplicate.
+    const thirdCaseTitle = 'ambiguous Duplicate title';
+    // GBRA-161: one atom replacing two is a shrink the default floor (0.5) holds for review; this test is about slug
+    // choice, so it lowers the floor to its minimum for this one run.
+    await engine.setConfig('generations.shrink_floor', '0.05');
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'A claim with an ambiguous title history.', contentHash: 'gggg777788889999' }],
+      _chat: stubChat(thirdCaseTitle),
+    }).finally(() => engine.setConfig('generations.shrink_floor', '0.5'));
+    expect(result.status).toBe('ok');
+    expect(result.details?.failures).toEqual([]);
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    // Neither pre-existing duplicate was adopted/rewritten. (The completed
+    // extraction's stale-atom cleanup may soft-delete them, so read the rows
+    // directly rather than via getPage, which hides soft-deleted pages.)
+    const dupRows = await engine.executeRaw<{ slug: string; source_hash: string }>(
+      `SELECT slug, frontmatter->>'source_hash' AS source_hash FROM pages
+        WHERE slug = ANY($1::text[]) AND source_id = 'default'`,
+      [[slugA, slugB]],
+    );
+    const hashBySlug = new Map(dupRows.map((r) => [r.slug, r.source_hash]));
+    expect(hashBySlug.get(slugA)).toBe('eeee111122223333');
+    expect(hashBySlug.get(slugB)).toBe('ffff444455556666');
+
+    // A third, FRESH slug was minted instead of guessing between them.
+    const newHash = createHash('sha256')
+      .update(`${sourceSlug}\0${thirdCaseTitle}`)
+      .digest('hex').slice(0, 8);
+    const freshSlug = `atoms/2026-09-02/${expectedAtomStem(thirdCaseTitle)}-${newHash}`;
+    expect(freshSlug).not.toBe(slugA);
+    expect(freshSlug).not.toBe(slugB);
+    const fresh = await engine.getPage(freshSlug, { sourceId: 'default' });
+    expect(fresh).not.toBeNull();
+    expect(fresh!.frontmatter.source_hash).toBe('gggg777788889999');
+
+    const atoms = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages
+        WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND deleted_at IS NULL`,
+      [sourceSlug],
+    );
+    // Only the freshly minted atom stays live: the two stale pre-existing
+    // duplicates are retired by the completed extraction's stale-atom cleanup.
+    expect(atoms[0]!.n).toBe(1);
+  });
+
+  test('two titles sharing the same 60-char truncated stem stay on DISTINCT slugs (the full title is hashed, never the truncated stem)', async () => {
+    const sourceSlug = 'writings/2026-09-01-shared-stem-page';
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Shared stem source',
+      compiled_truth: 'A page yielding two claims with a shared title prefix.', timeline: '',
+    });
+
+    const sharedPrefix = Array(6).fill('sharedstemword').join(' '); // well over 60 chars once slugified
+    const titleAlpha = `${sharedPrefix} variant Alpha unique tail`;
+    const titleBeta = `${sharedPrefix} variant Beta unique tail`;
+    // Sanity: this test is only meaningful if the two titles really do
+    // collapse to the identical 60-char stem — confirm that up front.
+    expect(expectedAtomStem(titleAlpha)).toBe(expectedAtomStem(titleBeta));
+
+    const twoAtomsChat = async (): Promise<ChatResult> => ({
+      text: JSON.stringify([
+        { title: titleAlpha, atom_type: 'insight', body: 'Alpha claim body.' },
+        { title: titleBeta, atom_type: 'insight', body: 'Beta claim body.' },
+      ]),
+      blocks: [{ type: 'text', text: '' }],
+      stopReason: 'end',
+      usage: { input_tokens: 500, output_tokens: 200, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'anthropic:claude-haiku-4-5',
+      providerId: 'anthropic',
+    });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{
+        slug: sourceSlug,
+        content: 'A page yielding two claims with a shared title prefix.',
+        contentHash: 'stem000000000001',
+      }],
+      _chat: twoAtomsChat,
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.atoms_extracted).toBe(2);
+
+    const hashAlpha = createHash('sha256').update(`${sourceSlug}\0${titleAlpha}`).digest('hex').slice(0, 8);
+    const hashBeta = createHash('sha256').update(`${sourceSlug}\0${titleBeta}`).digest('hex').slice(0, 8);
+    expect(hashAlpha).not.toBe(hashBeta);
+
+    const stem = expectedAtomStem(titleAlpha);
+    const slugAlpha = `atoms/2026-09-01/${stem}-${hashAlpha}`;
+    const slugBeta = `atoms/2026-09-01/${stem}-${hashBeta}`;
+    const atomAlpha = await engine.getPage(slugAlpha, { sourceId: 'default' });
+    const atomBeta = await engine.getPage(slugBeta, { sourceId: 'default' });
+    expect(atomAlpha).not.toBeNull();
+    expect(atomBeta).not.toBeNull();
+    expect(atomAlpha!.compiled_truth).toContain('Alpha claim body');
+    expect(atomBeta!.compiled_truth).toContain('Beta claim body');
+
+    const atoms = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages
+        WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND deleted_at IS NULL`,
+      [sourceSlug],
+    );
+    expect(atoms[0]!.n).toBe(2);
+  });
+
+  test('an UNBOUND (pre-binding-era) atom with a matching case-variant title is NOT adopted — the fallback is scoped to same-page-bound atoms only', async () => {
+    const sourceSlug = 'writings/2026-08-31-unbound-title-collision-page';
+    const title = 'Unbound Title Collision Claim';
+    // An unbound atom (no source_slug, no source_path at all — the
+    // pre-binding-era shape `isCompatibleAtomBinding` treats as compatible
+    // for the LEGACY-SLUG path). Its slug is unrelated to this page/run —
+    // it is NOT at either the new-shape or legacy-shape address the
+    // extraction would compute, so it can only be found (if at all) by the
+    // case-insensitive title-search fallback under test.
+    const unboundSlug = 'atoms/2026-01-01/some-unrelated-pre-binding-atom-11112222';
+    await engine.putPage(unboundSlug, {
+      type: 'atom', title,
+      compiled_truth: 'An unbound atom that happens to share a title, case-insensitively.', timeline: '',
+      frontmatter: { source_hash: 'aaaa111122223333', atom_type: 'insight' }, // no source_slug/source_path
+    });
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Unbound collision source', compiled_truth: 'Body.', timeline: '',
+    });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'Body.', contentHash: 'bbbb555566667777' }],
+      _chat: stubChat(title.toUpperCase()), // case-variant of the unbound atom's title
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.failures).toEqual([]);
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    // The unbound atom must be untouched — not adopted, binding not changed.
+    const unbound = await engine.getPage(unboundSlug, { sourceId: 'default' });
+    expect(unbound).not.toBeNull();
+    expect(unbound!.frontmatter.source_hash).toBe('aaaa111122223333');
+    expect(unbound!.frontmatter.source_slug ?? null).toBeNull();
+
+    // A FRESH atom was minted for this page instead of claiming the unbound one.
+    const atoms = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages
+        WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND deleted_at IS NULL`,
+      [sourceSlug],
+    );
+    expect(atoms[0]!.n).toBe(1);
+  });
+
+  test('non-ASCII case variance (Greek): adoption is matched with JavaScript `.toLowerCase()`, not SQL `LOWER()`, which disagree for some titles', async () => {
+    // PostgreSQL/PGLite's LOWER('ΟΣ') is 'οσ'; JavaScript's 'ΟΣ'.toLowerCase()
+    // is 'ος' (a different final sigma form). If the case-insensitive
+    // fallback's title comparison were pushed into SQL, this exact adoption
+    // would silently miss and mint a duplicate — the defect this test guards.
+    const seedTitle = 'ΟΣ';
+    const reExtractedTitle = 'ος';
+    expect(seedTitle.toLowerCase()).toBe(reExtractedTitle); // sanity: JS agrees they're the same identity
+    const sourceSlug = 'writings/2026-08-30-greek-case-page';
+    const oldHash = createHash('sha256').update(`${sourceSlug}\0${seedTitle}`).digest('hex').slice(0, 8);
+    const oldSlug = `atoms/2026-08-30/${expectedAtomStem(seedTitle)}-${oldHash}`;
+    await engine.putPage(oldSlug, {
+      type: 'atom', title: seedTitle,
+      compiled_truth: 'Existing atom body with a Greek title.', timeline: '',
+      frontmatter: { source_slug: sourceSlug, source_hash: 'cccc888899990000', atom_type: 'insight' },
+    });
+    await engine.putPage(sourceSlug, {
+      type: 'note', title: 'Greek case source', compiled_truth: 'Edited body.', timeline: '',
+    });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'Edited body.', contentHash: 'dddd333344445555' }],
+      _chat: stubChat(reExtractedTitle),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.failures).toEqual([]);
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    const seeded = await engine.getPage(oldSlug, { sourceId: 'default' });
+    expect(seeded).not.toBeNull();
+    expect(seeded!.frontmatter.source_hash).toBe('dddd333344445555'); // adopted, not orphaned
+
+    const atoms = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages
+        WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND deleted_at IS NULL`,
+      [sourceSlug],
+    );
+    expect(atoms[0]!.n).toBe(1); // no duplicate minted under the Unicode-different SQL LOWER() form
+  });
+  test('the page-atom scan runs once per source page per run, however many atoms miss', async () => {
+    const pages = ['writings/2026-08-29-scan-count-a', 'writings/2026-08-29-scan-count-b'];
+    for (const slug of pages) {
+      await engine.putPage(slug, { type: 'note', title: slug, compiled_truth: 'Three fresh claims.', timeline: '' });
+    }
+    let scans = 0;
+    const counting = new Proxy(engine, {
+      get(target, key) {
+        if (key === 'executeRaw') return (sql: string, params?: unknown[]) => {
+          if (/SELECT slug, title FROM pages WHERE type = 'atom'/.test(sql)) scans++;
+          return target.executeRaw(sql, params);
+        };
+        const value = Reflect.get(target, key);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const threeAtoms = async (): Promise<ChatResult> => ({
+      text: JSON.stringify(['First fresh claim', 'Second fresh claim', 'Third fresh claim']
+        .map(title => ({ title, atom_type: 'insight', body: `${title} body.` }))),
+      blocks: [{ type: 'text', text: '' }],
+      stopReason: 'end',
+      usage: { input_tokens: 500, output_tokens: 200, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'anthropic:claude-haiku-4-5',
+      providerId: 'anthropic',
+    });
+    const result = await runPhaseExtractAtoms(counting, {
+      _transcripts: [],
+      _pages: pages.map((slug, i) => ({ slug, content: 'Three fresh claims.', contentHash: `scan00000000000${i}` })),
+      _chat: threeAtoms,
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.atoms_extracted).toBe(6);
+    expect(scans).toBe(2);
+  });
+
+  test('a case-variant title bound to a DIFFERENT page is never adopted', async () => {
+    const otherPage = 'writings/2026-08-28-other-origin-page';
+    const sourceSlug = 'writings/2026-08-28-this-origin-page';
+    const title = 'Other Origin Claim';
+    const otherSlug = 'atoms/2026-08-28/other-origin-claim-0a0b0c0d';
+    await engine.putPage(otherSlug, {
+      type: 'atom', title, compiled_truth: 'Atom from another page.', timeline: '',
+      frontmatter: { source_slug: otherPage, source_hash: 'abab000011112222', atom_type: 'insight' },
+    });
+    await engine.putPage(sourceSlug, { type: 'note', title: 'This origin', compiled_truth: 'Body.', timeline: '' });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'Body.', contentHash: 'cdcd333344445555' }],
+      _chat: stubChat(title.toUpperCase()),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    const other = await engine.getPage(otherSlug, { sourceId: 'default' });
+    expect(other!.frontmatter.source_slug).toBe(otherPage);
+    expect(other!.frontmatter.source_hash).toBe('abab000011112222');
+    const mine = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND deleted_at IS NULL`,
+      [sourceSlug],
+    );
+    expect(mine.map(r => r.slug)).not.toContain(otherSlug);
+    expect(mine).toHaveLength(1);
+  });
+
+  test('a soft-deleted same-page case variant is not adopted', async () => {
+    const sourceSlug = 'writings/2026-08-27-deleted-variant-page';
+    const title = 'Deleted Variant Claim';
+    const deletedSlug = 'atoms/2026-08-27/deleted-variant-claim-1a2b3c4d';
+    await engine.putPage(deletedSlug, {
+      type: 'atom', title, compiled_truth: 'Retired atom.', timeline: '',
+      frontmatter: { source_slug: sourceSlug, source_hash: 'efef666677778888', atom_type: 'insight' },
+    });
+    await engine.executeRaw(`UPDATE pages SET deleted_at = now() WHERE slug = $1 AND source_id = 'default'`, [deletedSlug]);
+    await engine.putPage(sourceSlug, { type: 'note', title: 'Deleted variant source', compiled_truth: 'Body.', timeline: '' });
+
+    const result = await runPhaseExtractAtoms(engine, {
+      _transcripts: [],
+      _pages: [{ slug: sourceSlug, content: 'Body.', contentHash: 'fafa999900001111' }],
+      _chat: stubChat(title.toLowerCase()),
+    });
+    expect(result.status).toBe('ok');
+    expect(result.details?.atoms_extracted).toBe(1);
+
+    const rows = await engine.executeRaw<{ slug: string; source_hash: string; deleted: boolean }>(
+      `SELECT slug, frontmatter->>'source_hash' AS source_hash, deleted_at IS NOT NULL AS deleted
+         FROM pages WHERE type = 'atom' AND frontmatter->>'source_slug' = $1 AND source_id = 'default'`,
+      [sourceSlug],
+    );
+    const retired = rows.find(r => r.slug === deletedSlug);
+    expect(retired).toMatchObject({ source_hash: 'efef666677778888', deleted: true });
+    expect(rows.filter(r => !r.deleted)).toHaveLength(1);
+  });
+});

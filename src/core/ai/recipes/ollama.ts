@@ -1,0 +1,113 @@
+import type { Recipe } from '../types.ts';
+import { GLM_THINKING_BY_DEFAULT_RE } from './zhipu.ts';
+
+export const ollama: Recipe = {
+  id: 'ollama',
+  name: 'Ollama (local)',
+  tier: 'openai-compat',
+  implementation: 'openai-compatible',
+  base_url_default: 'http://localhost:11434/v1',
+  auth_env: {
+    required: [], // Ollama runs unauthenticated locally; users pass `ollama` as the key.
+    optional: ['OLLAMA_BASE_URL', 'OLLAMA_API_KEY'],
+    setup_url: 'https://ollama.ai',
+  },
+  touchpoints: {
+    embedding: {
+      // #2271: modern local embed models added so assertTouchpoint accepts them.
+      models: [
+        'nomic-embed-text',
+        'mxbai-embed-large',
+        'all-minilm',
+        // Real Ollama library tags (verified 2026-08-08): the family is
+        // published as `qwen3-embedding` with size tags, and Arctic Embed
+        // 2.0 as `snowflake-arctic-embed2`. The earlier `qwen3-embed-8b` /
+        // HF-style `snowflake-arctic-embed-l-v2` spellings stay listed so
+        // brains initialized with them keep validating, but they never
+        // matched a pullable Ollama tag.
+        'qwen3-embedding:8b',
+        'qwen3-embed-8b',
+        'snowflake-arctic-embed2',
+        'snowflake-arctic-embed-l-v2',
+        'bge-m3',
+      ],
+      // #2051: per-model native dims. Ollama serves models spanning 384..4096,
+      // so the recipe-wide default_dims below is only correct for nomic. Without
+      // this map `init --embedding-model ollama:bge-m3` built a 768-wide column
+      // for a model that emits 1024, and the mismatch only surfaced at first
+      // insert. Resolved via `embeddingDimsForModel()`; unlisted models still
+      // fall back to default_dims, and trust_custom_dims keeps an explicit
+      // --embedding-dimensions override working for models not named here.
+      model_dims: {
+        'nomic-embed-text': 768,
+        'mxbai-embed-large': 1024,
+        'all-minilm': 384,
+        'qwen3-embedding:8b': 4096,
+        'qwen3-embed-8b': 4096,
+        'snowflake-arctic-embed2': 1024,
+        'snowflake-arctic-embed-l-v2': 1024,
+        'bge-m3': 1024,
+      },
+      default_dims: 768, // nomic-embed-text native dim
+      trust_custom_dims: true, // #2271: local models carry varied native dims
+      cost_per_1m_tokens_usd: 0,
+      price_last_verified: '2026-04-20',
+      // Ollama's batch capacity depends on the locally loaded model + the
+      // OLLAMA_NUM_PARALLEL config; no static cap to declare. v0.32 (#779).
+      no_batch_cap: true,
+    },
+    expansion: {
+      models: ['qwen2.5-coder:14b'],
+      cost_per_1m_tokens_usd: 0,
+      price_last_verified: '2026-06-26',
+    },
+    chat: {
+      // Model ids are user-managed; this informational default makes the chat
+      // capability visible in provider discovery without constraining custom tags.
+      models: ['qwen2.5-coder:14b'],
+      // Chat completion is provider-wide, but tool support varies by loaded
+      // model. Keep the subagent capability gate conservative.
+      supports_tools: false,
+      supports_subagent_loop: false,
+      supports_prompt_cache: false,
+      // Ollama enforces `response_format: json_schema` server-side
+      // (grammar-constrained decoding since 0.5) for every loaded model, so
+      // unlike tools this is a provider-wide fact, not a per-model one.
+      // chat() sends the caller's `responseSchema` here (facts extraction,
+      // #4863) and expand() takes the strict generateObject lane with its
+      // existing rejected-recipe fallback.
+      supports_structured_outputs: true,
+      // Reasoning-by-default local families spend output budget on internal
+      // reasoning before emitting answer text, and Ollama bills it against
+      // `max_tokens` — so callers that size output caps must grant headroom
+      // (same contract as DeepSeek v4, gbrain#4172). Without this, a 4000-token
+      // default is consumed entirely by reasoning and the caller gets EMPTY
+      // content with finish_reason "length". Verified on qwen38-27b:latest:
+      // max_tokens=16 returned "" (16 reasoning tokens), max_tokens=600
+      // returned "PONG". Model ids are user-managed, so this is a predicate
+      // over the known reasoning families rather than a recipe-wide boolean —
+      // non-reasoning local models (qwen2.5-coder, llama3.x, mistral) keep the
+      // conservative default. `qwen3` is matched with a boundary so the
+      // qwen2.5-* tags can never be swallowed by it, and `qwen3-coder` (the
+      // instruct-only Qwen3 variant, no thinking mode) is excluded by
+      // lookahead. `phi4-mini-reasoning` is a reasoning model and matches
+      // alongside `phi4-reasoning`. GLM-4.5+/5.x (`glm-5.3-flash[:cloud]`,
+      // `glm-4.6`) reuse the zhipu recipe's cutoff (gbrain#4727) — a reporter
+      // hit the 4000 cap on GLM-5.3-flash via Ollama cloud; `glm-4:9b` stays out.
+      thinking_by_default: (modelId: string) =>
+        GLM_THINKING_BY_DEFAULT_RE.test(modelId) ||
+        /^(?:qwen3[0-9]*(?!-coder)(?:[.\-:]|$)|deepseek-r[0-9]|gpt-oss(?:[.\-:]|$)|magistral(?:[.\-:]|$)|phi[0-9]+(?:-mini)?-reasoning)/i.test(
+          modelId,
+        ),
+      // Provider-wide routing ceiling only; Ollama still enforces each loaded
+      // model's actual context window at request time.
+      max_context_tokens: 128_000,
+      cost_per_1m_input_usd: 0,
+      cost_per_1m_output_usd: 0,
+      price_last_verified: '2026-08-18',
+      // Local cold starts can exceed the generic 5-second provider probe.
+      default_timeout_ms: 180_000,
+    },
+  },
+  setup_hint: 'Install Ollama from https://ollama.ai, then `ollama pull nomic-embed-text` for embeddings and `ollama pull qwen2.5-coder:14b` for local chat. Start it with `ollama serve`. Custom local model tags are accepted.',
+};

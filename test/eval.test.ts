@@ -1,0 +1,385 @@
+/**
+ * Unit tests for src/core/search/eval.ts
+ *
+ * Pure function tests — no database, no API keys, runs in: bun test
+ */
+
+import { describe, test, expect } from 'bun:test';
+import {
+  precisionAtK,
+  recallAtK,
+  mrr,
+  ndcgAtK,
+  parseQrels,
+} from '../src/core/search/eval.ts';
+
+// ─────────────────────────────────────────────────────────────────
+// precisionAtK
+// ─────────────────────────────────────────────────────────────────
+
+describe('precisionAtK', () => {
+  test('all hits relevant → 1.0', () => {
+    const relevant = new Set(['a', 'b', 'c']);
+    expect(precisionAtK(['a', 'b', 'c'], relevant, 3)).toBe(1.0);
+  });
+
+  test('no hits relevant → 0.0', () => {
+    const relevant = new Set(['x', 'y']);
+    expect(precisionAtK(['a', 'b', 'c'], relevant, 3)).toBe(0.0);
+  });
+
+  test('partial: 2 of 5 hits relevant at k=5', () => {
+    const relevant = new Set(['a', 'c']);
+    expect(precisionAtK(['a', 'b', 'c', 'd', 'e'], relevant, 5)).toBeCloseTo(2 / 5);
+  });
+
+  test('k=1 with first hit relevant → 1.0', () => {
+    const relevant = new Set(['a']);
+    expect(precisionAtK(['a', 'b', 'c'], relevant, 1)).toBe(1.0);
+  });
+
+  test('k=1 with first hit not relevant → 0.0', () => {
+    const relevant = new Set(['b']);
+    expect(precisionAtK(['a', 'b', 'c'], relevant, 1)).toBe(0.0);
+  });
+
+  test('k greater than hits length → uses actual hits', () => {
+    const relevant = new Set(['a', 'b']);
+    // 2 relevant in 2 hits but k=10 → still 2/10
+    expect(precisionAtK(['a', 'b'], relevant, 10)).toBeCloseTo(2 / 10);
+  });
+
+  test('duplicate chunks count as one page while the denominator remains k', () => {
+    expect(precisionAtK(['a', 'a'], new Set(['a']), 2)).toBe(0.5);
+  });
+
+  test('empty hits → 0', () => {
+    expect(precisionAtK([], new Set(['a']), 5)).toBe(0);
+  });
+
+  test('empty relevant set → 0', () => {
+    expect(precisionAtK(['a', 'b'], new Set(), 5)).toBe(0);
+  });
+
+  test('k=0 → 0', () => {
+    expect(precisionAtK(['a', 'b'], new Set(['a']), 0)).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// recallAtK
+// ─────────────────────────────────────────────────────────────────
+
+describe('recallAtK', () => {
+  test('all relevant found → 1.0', () => {
+    const relevant = new Set(['a', 'b']);
+    expect(recallAtK(['a', 'b', 'c'], relevant, 3)).toBe(1.0);
+  });
+
+  test('none found → 0.0', () => {
+    const relevant = new Set(['x', 'y', 'z']);
+    expect(recallAtK(['a', 'b', 'c'], relevant, 3)).toBe(0.0);
+  });
+
+  test('1 of 3 relevant found', () => {
+    const relevant = new Set(['a', 'x', 'y']);
+    expect(recallAtK(['a', 'b', 'c'], relevant, 3)).toBeCloseTo(1 / 3);
+  });
+
+  test('relevant found beyond k → not counted', () => {
+    const relevant = new Set(['a', 'b']);
+    // 'b' is at rank 5, beyond k=3
+    expect(recallAtK(['a', 'x', 'y', 'z', 'b'], relevant, 3)).toBeCloseTo(1 / 2);
+  });
+
+  test('deduplicates before the cutoff and cannot count one relevant page twice', () => {
+    expect(recallAtK(['a', 'a'], new Set(['a']), 2)).toBe(1);
+    expect(recallAtK(['x', 'x', 'a'], new Set(['a']), 2)).toBe(1);
+  });
+
+  test('empty hits → 0', () => {
+    expect(recallAtK([], new Set(['a']), 5)).toBe(0);
+  });
+
+  test('empty relevant set → 0', () => {
+    expect(recallAtK(['a', 'b'], new Set(), 5)).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// mrr
+// ─────────────────────────────────────────────────────────────────
+
+describe('mrr', () => {
+  test('first hit relevant → 1.0', () => {
+    expect(mrr(['a', 'b', 'c'], new Set(['a']))).toBe(1.0);
+  });
+
+  test('second hit relevant → 0.5', () => {
+    expect(mrr(['x', 'a', 'c'], new Set(['a']))).toBeCloseTo(0.5);
+  });
+
+  test('third hit relevant → 1/3', () => {
+    expect(mrr(['x', 'y', 'a'], new Set(['a']))).toBeCloseTo(1 / 3);
+  });
+
+  test('no relevant hit → 0', () => {
+    expect(mrr(['x', 'y', 'z'], new Set(['a']))).toBe(0);
+  });
+
+  test('empty hits → 0', () => {
+    expect(mrr([], new Set(['a']))).toBe(0);
+  });
+
+  test('empty relevant → 0', () => {
+    expect(mrr(['a', 'b'], new Set())).toBe(0);
+  });
+
+  test('uses first relevant hit when multiple are relevant', () => {
+    // 'b' is rank 2, 'c' is rank 3 — MRR should use 'b' at rank 2
+    expect(mrr(['x', 'b', 'c'], new Set(['b', 'c']))).toBeCloseTo(0.5);
+  });
+
+  test('duplicate non-relevant chunks do not consume page-level ranks', () => {
+    expect(mrr(['x', 'x', 'a'], new Set(['a']))).toBeCloseTo(0.5);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// ndcgAtK
+// ─────────────────────────────────────────────────────────────────
+
+describe('ndcgAtK', () => {
+  test('perfect ranking with binary relevance → 1.0', () => {
+    const grades = new Map([['a', 1], ['b', 1]]);
+    // Hits: a at rank1, b at rank2 — same as ideal
+    expect(ndcgAtK(['a', 'b', 'c'], grades, 5)).toBeCloseTo(1.0);
+  });
+
+  test('single relevant doc at rank 1 → 1.0', () => {
+    const grades = new Map([['a', 1]]);
+    expect(ndcgAtK(['a', 'x', 'y'], grades, 5)).toBeCloseTo(1.0);
+  });
+
+  test('a repeated relevant page receives gain once and remains bounded at 1', () => {
+    expect(ndcgAtK(['a', 'a'], new Map([['a', 1]]), 2)).toBe(1);
+  });
+
+  test('single relevant doc at rank 2 → less than 1', () => {
+    const grades = new Map([['a', 1]]);
+    const score = ndcgAtK(['x', 'a', 'y'], grades, 5);
+    expect(score).toBeGreaterThan(0);
+    expect(score).toBeLessThan(1);
+  });
+
+  test('no relevant in hits → 0', () => {
+    const grades = new Map([['a', 1], ['b', 1]]);
+    expect(ndcgAtK(['x', 'y', 'z'], grades, 5)).toBe(0);
+  });
+
+  test('graded relevance: higher grade docs placed first → nDCG=1', () => {
+    const grades = new Map([['a', 3], ['b', 2], ['c', 1]]);
+    expect(ndcgAtK(['a', 'b', 'c'], grades, 3)).toBeCloseTo(1.0);
+  });
+
+  test('graded relevance: lower grade first → nDCG < 1', () => {
+    const grades = new Map([['a', 3], ['b', 2], ['c', 1]]);
+    // Reversed: worst first
+    const score = ndcgAtK(['c', 'b', 'a'], grades, 3);
+    expect(score).toBeGreaterThan(0);
+    expect(score).toBeLessThan(1);
+  });
+
+  test('graded relevance: reversed is worse than perfect', () => {
+    const grades = new Map([['a', 3], ['b', 2], ['c', 1]]);
+    const perfect = ndcgAtK(['a', 'b', 'c'], grades, 3);
+    const reversed = ndcgAtK(['c', 'b', 'a'], grades, 3);
+    expect(perfect).toBeGreaterThan(reversed);
+  });
+
+  test('k=1 picks only the first hit', () => {
+    const grades = new Map([['a', 1], ['b', 1]]);
+    // Only 'x' at rank1, not relevant
+    expect(ndcgAtK(['x', 'a', 'b'], grades, 1)).toBe(0);
+    // Only 'a' at rank1, relevant
+    expect(ndcgAtK(['a', 'x', 'b'], grades, 1)).toBeCloseTo(1.0);
+  });
+
+  test('empty hits → 0', () => {
+    expect(ndcgAtK([], new Map([['a', 1]]), 5)).toBe(0);
+  });
+
+  test('empty grades → 0', () => {
+    expect(ndcgAtK(['a', 'b'], new Map(), 5)).toBe(0);
+  });
+
+  test('k=0 → 0', () => {
+    expect(ndcgAtK(['a', 'b'], new Map([['a', 1]]), 0)).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// parseQrels
+// ─────────────────────────────────────────────────────────────────
+
+describe('parseQrels', () => {
+  test('parses inline JSON array', () => {
+    const input = JSON.stringify([
+      { query: 'foo', relevant: ['a', 'b'] },
+    ]);
+    const result = parseQrels(input);
+    expect(result).toHaveLength(1);
+    expect(result[0].query).toBe('foo');
+    expect(result[0].relevant).toEqual(['a', 'b']);
+  });
+
+  test('parses inline JSON object with queries array', () => {
+    const input = JSON.stringify({
+      version: 1,
+      queries: [{ query: 'bar', relevant: ['x'] }],
+    });
+    const result = parseQrels(input);
+    expect(result).toHaveLength(1);
+    expect(result[0].query).toBe('bar');
+  });
+
+  test('preserves grades when present', () => {
+    const input = JSON.stringify([
+      { query: 'baz', relevant: ['a'], grades: { a: 3, b: 1 } },
+    ]);
+    const result = parseQrels(input);
+    expect(result[0].grades).toEqual({ a: 3, b: 1 });
+  });
+
+  test('throws on invalid JSON', () => {
+    expect(() => parseQrels('not-json')).toThrow();
+  });
+
+  test('throws on unrecognized format', () => {
+    expect(() => parseQrels(JSON.stringify({ foo: 'bar' }))).toThrow();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// parseQrels — #4608: validate/normalize BEFORE any billed search
+// ─────────────────────────────────────────────────────────────────
+
+describe('parseQrels (#4608) — gate-shape aliases + per-entry validation', () => {
+  test("gate legacy shape (relevant_slugs + first_relevant_slug) parses; keys map onto 'relevant'", () => {
+    // The exact shape of gbrain's own committed gate fixture — pre-fix this
+    // crashed inside buildGradesMap AFTER a live search+rerank was billed.
+    const input = JSON.stringify({
+      schema_version: 1,
+      queries: [
+        {
+          query_id: 'q1',
+          query: 'how does the sprocket subsystem handle retries',
+          relevant_slugs: ['topic/page-a', 'topic/page-b'],
+          first_relevant_slug: 'topic/page-a',
+        },
+      ],
+    });
+    const result = parseQrels(input);
+    expect(result).toHaveLength(1);
+    expect(result[0].relevant).toEqual(['topic/page-a', 'topic/page-b']);
+  });
+
+  test('gate legacy shape in a bare-array wrapper parses too', () => {
+    const input = JSON.stringify([
+      { query: 'q', relevant_slugs: ['topic/page-a'] },
+    ]);
+    expect(parseQrels(input)[0].relevant).toEqual(['topic/page-a']);
+  });
+
+  test('first_relevant_slug outside relevant_slugs is folded into the gold set', () => {
+    const input = JSON.stringify([
+      { query: 'q', relevant_slugs: ['topic/page-b'], first_relevant_slug: 'topic/page-a' },
+    ]);
+    expect(parseQrels(input)[0].relevant).toEqual(['topic/page-b', 'topic/page-a']);
+  });
+
+  test('the committed gate fixture itself parses (both --qrels commands accept one file)', () => {
+    const result = parseQrels('test/fixtures/eval-baselines/qrels-search.json');
+    expect(result.length).toBeGreaterThan(0);
+    for (const q of result) {
+      expect(typeof q.query).toBe('string');
+      expect(q.relevant.length).toBeGreaterThan(0);
+    }
+  });
+
+  test('federated {source_id, slug} gold is rejected BY NAME (not four zeros at exit 0)', () => {
+    const input = JSON.stringify({
+      schema_version: 1,
+      queries: [
+        { query: 'q', relevant: [{ source_id: 'vault-a', slug: 'topic/page-a' }] },
+      ],
+    });
+    expect(() => parseQrels(input)).toThrow(/gbrain eval gate/);
+    expect(() => parseQrels(input)).toThrow(/entry 0/);
+  });
+
+  test('missing relevant throws with the entry index (validation precedes any query)', () => {
+    const input = JSON.stringify([
+      { query: 'fine', relevant: ['a'] },
+      { query: 'broken' },
+    ]);
+    expect(() => parseQrels(input)).toThrow(/entry 1/);
+    expect(() => parseQrels(input)).toThrow(/"relevant"/);
+  });
+
+  test('missing/empty query throws with the entry index', () => {
+    expect(() => parseQrels(JSON.stringify([{ relevant: ['a'] }]))).toThrow(/entry 0/);
+    expect(() => parseQrels(JSON.stringify([{ query: '   ', relevant: ['a'] }]))).toThrow(/entry 0/);
+  });
+
+  test('empty gold set + non-object entries + malformed grades are named errors', () => {
+    expect(() => parseQrels(JSON.stringify([{ query: 'q', relevant: [] }]))).toThrow(/at least one gold slug/);
+    expect(() => parseQrels(JSON.stringify(['not-an-entry']))).toThrow(/entry 0/);
+    expect(() => parseQrels(JSON.stringify([{ query: 'q', relevant: ['a'], grades: ['x'] }]))).toThrow(/"grades"/);
+    expect(() => parseQrels(JSON.stringify([{ query: 'q', relevant: [42] }]))).toThrow(/slug strings/);
+  });
+
+  test("'relevant' wins over 'relevant_slugs' when both are present (alias is a fallback, not a merge)", () => {
+    const input = JSON.stringify([
+      { query: 'q', relevant: ['topic/page-a'], relevant_slugs: ['topic/page-z'] },
+    ]);
+    expect(parseQrels(input)[0].relevant).toEqual(['topic/page-a']);
+  });
+
+  test('a non-array relevant_slugs names the key in the error (not a bare missing-relevant message)', () => {
+    const input = JSON.stringify([{ query: 'q', relevant_slugs: 'topic/page-a' }]);
+    expect(() => parseQrels(input)).toThrow(/relevant_slugs/);
+    expect(() => parseQrels(input)).toThrow(/non-array/);
+    expect(() => parseQrels(input)).toThrow(/entry 0/);
+  });
+
+  test('id is kept only when it is a string', () => {
+    const parsed = parseQrels(JSON.stringify([
+      { id: 'q-1', query: 'q', relevant: ['a'] },
+      { id: 7, query: 'q2', relevant: ['b'] },
+      { query: 'q3', relevant: ['c'] },
+    ]));
+    expect(parsed[0].id).toBe('q-1');
+    expect('id' in parsed[1]).toBe(false);
+    expect('id' in parsed[2]).toBe(false);
+  });
+
+  test('grades: null throws a named error mentioning grades (null is not an absent key)', () => {
+    const input = JSON.stringify([{ query: 'q', relevant: ['a'], grades: null }]);
+    expect(() => parseQrels(input)).toThrow(/"grades"/);
+    expect(() => parseQrels(input)).toThrow(/entry 0/);
+  });
+
+  test('non-finite grade VALUES are named errors with the entry index (pre-billing)', () => {
+    // A string/null grade survives JSON.parse and the object-shape check;
+    // pre-fix it was cast blindly (grades as Record<string, number>) and
+    // produced NaN nDCG AFTER the paid searches had already run.
+    const stringGrade = JSON.stringify([{ query: 'q', relevant: ['a'], grades: { a: 'high' } }]);
+    expect(() => parseQrels(stringGrade)).toThrow(/entry 0/);
+    expect(() => parseQrels(stringGrade)).toThrow(/finite number/);
+    // null is representable in JSON and coerces to NaN through Math.log paths.
+    expect(() => parseQrels(JSON.stringify([{ query: 'q', relevant: ['a'], grades: { a: null } }]))).toThrow(/finite number/);
+    // Valid finite numeric grades still pass untouched.
+    expect(parseQrels(JSON.stringify([{ query: 'q', relevant: ['a'], grades: { a: 2.5 } }]))[0].grades).toEqual({ a: 2.5 });
+  });
+});

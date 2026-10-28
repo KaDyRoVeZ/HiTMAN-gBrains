@@ -1,0 +1,98 @@
+// v0.40.6.0 Schema Cathedral v3 — best-effort active pack loader.
+//
+// Single source of truth for the T1.5 wiring sites (whoknows,
+// find-experts, facts/eligibility, enrichment-service). All four call
+// sites consume this helper so the empty-filter fallback contract lives
+// in ONE place. Without this helper, the four sites would each open-code
+// their own `try { load pack } catch { ... }` block, and one of them
+// WILL drift to silently use hardcoded defaults — the bug class D4
+// closed.
+//
+// Contract (D4 from /plan-eng-review):
+//   - Pack load succeeds → return the ResolvedPack.
+//   - Pack load fails (any reason: corrupt file, missing pack, federation
+//     divergence, trust-gate reject) → return null.
+//   - Caller MUST interpret null as "EMPTY FILTER" semantics. A null
+//     return is NOT a license to fall back to hardcoded defaults like
+//     ['person', 'company']; that silently re-introduces types the
+//     user packed out.
+//
+// The empty-filter contract is the load-bearing design choice. Pack-load
+// failure should be loud (query returns empty results, agent debugs the
+// pack-load problem) — not silent (results look normal but contradict
+// user intent).
+
+import type { BrainEngine } from '../engine.ts';
+import type { OperationContext } from '../operations.ts';
+import { loadActivePackForEngine } from './engine-resolution.ts';
+export { readDbSchemaPack } from './engine-resolution.ts';
+import type { ResolvedPack } from './registry.ts';
+
+/**
+ * Best-effort loader for the active schema pack. Returns null on any
+ * failure path so callers can apply empty-filter semantics.
+ *
+ * NEVER throws. Never logs to stderr (callers don't need the noise on
+ * routine queries; the underlying pack-load errors surface through
+ * `gbrain doctor`'s schema_pack_coverage / schema_pack_writability
+ * checks).
+ *
+ * @example
+ *   // In whoknows.ts (T1.5 wiring site):
+ *   const pack = await loadActivePackBestEffort(ctx);
+ *   const types = pack
+ *     ? expertTypesFromPack(pack)
+ *     : [];  // EMPTY filter, NOT hardcoded defaults
+ *   const results = await search(query, { types });
+ */
+export async function loadActivePackBestEffort(
+  ctx: OperationContext,
+): Promise<ResolvedPack | null> {
+  try {
+    return await loadActivePackForEngine(ctx.engine, {
+      remote: ctx.remote ?? true,
+      sourceId: ctx.sourceId,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the active pack for a LOCAL, engine-backed surface.
+ *
+ * Same null contract as `loadActivePackBestEffort` (D4): null means the pack
+ * could not be resolved and is NOT a license to fall back to hardcoded
+ * defaults. Callers acting on a *capability* question must additionally
+ * surface null DISTINCTLY from "resolved, but lacks the capability" —
+ * collapsing the two converts a loud failure into a silent one.
+ */
+export async function loadActivePackForLocalEngine(
+  engine: Pick<BrainEngine, 'getConfig'>,
+  options: { sourceId?: string } = {},
+): Promise<ResolvedPack | null> {
+  try {
+    return await loadActivePackForEngine(engine, { remote: false, ...options });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does the active pack declare at least one `link_types[].inference.regex`
+ * rule? This is the EXACT capability `extractNerLinks` requires — without it,
+ * NER extraction is a structural no-op (returns `pack_unavailable`, 0 links).
+ *
+ * Shared so the onboard recommender (`checks.ts`, which suggests `extract-ner`)
+ * and the handler (`extract-ner.ts`) gate on ONE definition. Recommending a
+ * fix the handler will silently skip is the phantom-recommendation bug this
+ * closes; co-locating the predicate with the loader keeps the two from drifting
+ * (same anti-drift rationale as `loadActivePackBestEffort` above).
+ */
+export function packSupportsNerInference(pack: ResolvedPack | null | undefined): boolean {
+  const linkTypes = pack?.manifest?.link_types;
+  if (!linkTypes || linkTypes.length === 0) return false;
+  return linkTypes.some(
+    (lt) => lt.inference && typeof lt.inference === 'object' && 'regex' in lt.inference,
+  );
+}

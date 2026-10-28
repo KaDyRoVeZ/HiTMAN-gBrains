@@ -1,0 +1,2 @@
+user: ping the openclaw agent
+assistant: done

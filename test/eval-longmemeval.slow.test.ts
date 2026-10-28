@@ -1,0 +1,410 @@
+/**
+ * v0.28.1: LongMemEval benchmark harness tests.
+ *
+ * All tests run hermetically: in-memory PGLite, no DATABASE_URL, no API keys.
+ *
+ * v0.41.10 split: this file now holds the pure / harness-shared half of the
+ * surface — describes that don't call `runEvalLongMemEval` and so don't pay
+ * the per-call PGLite cold-create cost. End-to-end describes that DO call
+ * `runEvalLongMemEval` (and create their own benchmark brain via
+ * `withBenchmarkBrain`) live in test/eval-longmemeval-e2e.slow.test.ts.
+ * Both files run as separate .slow.test.ts entries so CI's LPT bin-packer
+ * (scripts/sharding.ts) can distribute them across different shards.
+ *
+ * Cold connect of a fresh PGLite is ~1-3s per pglite-engine.ts:106-108.
+ * Tests share one engine across the harness/reset/speed cases via beforeAll,
+ * so the connect cost amortizes across the file.
+ */
+
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { mkdtempSync, rmSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import {
+  createBenchmarkBrain,
+  resetTables,
+} from '../src/eval/longmemeval/harness.ts';
+import { haystackToPages, opaqueSessionId, sessionSlug, type LongMemEvalQuestion } from '../src/eval/longmemeval/adapter.ts';
+import { loadResumeSet } from '../src/commands/eval-longmemeval.ts';
+import { importFromContent } from '../src/core/import-file.ts';
+import { DEFAULT_SOURCE_BOOSTS } from '../src/core/search/source-boost.ts';
+import type { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { cpuMsAsync } from './helpers/cpu-time.ts';
+
+// ---------------------------------------------------------------------------
+// Shared engine for the harness/reset/speed cases
+// ---------------------------------------------------------------------------
+
+let sharedEngine: PGLiteEngine;
+
+beforeAll(async () => {
+  sharedEngine = await createBenchmarkBrain();
+});
+
+afterAll(async () => {
+  if (sharedEngine) await sharedEngine.disconnect();
+});
+
+// ---------------------------------------------------------------------------
+// 1. harness lifecycle
+// ---------------------------------------------------------------------------
+
+describe('harness lifecycle', () => {
+  test('create -> reset -> import -> search -> assert hits', async () => {
+    await resetTables(sharedEngine);
+    for (let i = 0; i < 5; i++) {
+      const slug = `chat/lifecycle-${i}`;
+      const content =
+        `---\ntype: note\nsession_id: lifecycle-${i}\n---\n\n` +
+        `**user:** I bought a chocolate labrador puppy named Biscuit.\n\n` +
+        `**assistant:** That's a great choice for a family dog.\n`;
+      await importFromContent(sharedEngine, slug, content, { noEmbed: true });
+    }
+    const results = await sharedEngine.searchKeyword('chocolate labrador', { limit: 5 });
+    expect(results.length).toBeGreaterThan(0);
+    expect(results.some(r => r.slug.startsWith('chat/lifecycle-'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2. reset clears all tables
+// ---------------------------------------------------------------------------
+
+describe('resetTables clears all tables', () => {
+  test('after reset, search returns zero rows and pages count is zero', async () => {
+    // Seed some pages first.
+    for (let i = 0; i < 3; i++) {
+      const slug = `chat/reset-${i}`;
+      const content = `---\ntype: note\n---\n\n**user:** seed content reset-${i}\n`;
+      await importFromContent(sharedEngine, slug, content, { noEmbed: true });
+    }
+    const beforeCount = await sharedEngine.executeRaw<{ c: number }>(
+      `SELECT COUNT(*)::int AS c FROM pages`,
+    );
+    expect(beforeCount[0].c).toBeGreaterThan(0);
+
+    await resetTables(sharedEngine);
+
+    const afterPages = await sharedEngine.executeRaw<{ c: number }>(
+      `SELECT COUNT(*)::int AS c FROM pages`,
+    );
+    expect(afterPages[0].c).toBe(0);
+
+    const afterChunks = await sharedEngine.executeRaw<{ c: number }>(
+      `SELECT COUNT(*)::int AS c FROM content_chunks`,
+    );
+    expect(afterChunks[0].c).toBe(0);
+
+    const searchAfter = await sharedEngine.searchKeyword('seed', { limit: 5 });
+    expect(searchAfter.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3. schema-migration robustness (table count floor)
+// ---------------------------------------------------------------------------
+
+describe('resetTables: schema-migration robustness', () => {
+  test('pg_tables enumeration returns at least the schema floor', async () => {
+    const rows = await sharedEngine.executeRaw<{ tablename: string }>(
+      `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`,
+    );
+    // Floor is 10: pages, content_chunks, links, tags, raw_data, ingest_log,
+    // page_versions, timeline_entries — plus several v0.28-shipped tables.
+    // If pg_tables discovery breaks (column rename, schema-name change), the
+    // count drops and the regression surfaces here.
+    expect(rows.length).toBeGreaterThanOrEqual(10);
+    const names = rows.map(r => r.tablename);
+    expect(names).toContain('pages');
+    expect(names).toContain('content_chunks');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4. speed (warm) — p50 + p99 across 10 trials
+// ---------------------------------------------------------------------------
+
+describe('warm-create speed gate', () => {
+  // v0.40.10 flake-hardening: mode-aware ceiling. Solo run on Apple Silicon
+  // shows p50 ~25ms; under 8-way shard CPU contention p50 reaches 600-1200ms;
+  // GitHub Actions Ubuntu runners are slower yet (CI run #77585655194 hit
+  // 17364ms total / ~1736ms/trial). Detect "loaded execution" via `$SHARD`
+  // (set by scripts/run-unit-parallel.sh) OR `$CI` (set by every major CI).
+  // Loaded ceiling 4000ms still catches >50x algorithmic regressions. Each
+  // trial is timed in thread CPU time (PGLite runs on this thread), which
+  // measures the work rather than how long the scheduler made it wait.
+  const LOADED = !!process.env.SHARD || !!process.env.CI;
+  const P50_CEILING_MS = LOADED ? 4000 : 1500;
+  test(`p50 < ${P50_CEILING_MS}ms under parallel test load (catches order-of-magnitude regressions)`, async () => {
+    const trials = 10;
+    const samples: number[] = [];
+    for (let i = 0; i < trials; i++) {
+      samples.push(await cpuMsAsync(async () => {
+        await resetTables(sharedEngine);
+        for (let j = 0; j < 5; j++) {
+          const slug = `chat/speed-${i}-${j}`;
+          const content = `---\ntype: note\n---\n\n**user:** speed sample ${i}-${j} keyword apple\n`;
+          await importFromContent(sharedEngine, slug, content, { noEmbed: true });
+        }
+        await sharedEngine.searchKeyword('apple', { limit: 5 });
+      }));
+    }
+    samples.sort((a, b) => a - b);
+    const p50 = samples[Math.floor(samples.length * 0.5)];
+    const p99 = samples[Math.floor(samples.length * 0.99)];
+    process.stderr.write(
+      `[speed] warm reset+import+search p50=${p50.toFixed(1)}ms p99=${p99.toFixed(1)}ms (n=${trials}, ceiling=${P50_CEILING_MS}ms loaded=${LOADED})\n`,
+    );
+    expect(p50).toBeLessThan(P50_CEILING_MS);
+    if (p99 > P50_CEILING_MS * 2) {
+      process.stderr.write(`[speed] WARN: p99 above ${P50_CEILING_MS * 2}ms threshold (informational)\n`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. adapter shape
+// ---------------------------------------------------------------------------
+
+describe('adapter haystackToPages', () => {
+  test('synthetic 3-session question converts to 3 pages with stable slugs + frontmatter', () => {
+    const q: LongMemEvalQuestion = {
+      question_id: 'q-shape-1',
+      question_type: 'single-session-user',
+      question: 'q?',
+      answer: 'a',
+      haystack_dates: ['2025-01-15', '2025-02-01', '2025-03-10'],
+      answer_session_ids: ['sess-1'],
+      haystack_sessions: [
+        { session_id: 'sess-1', turns: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }] },
+        { session_id: 'sess-2', turns: [{ role: 'user', content: 'q2' }] },
+        { session_id: 'sess-3', turns: [{ role: 'user', content: 'q3' }] },
+      ],
+    };
+    const pages = haystackToPages(q);
+    expect(pages.length).toBe(3);
+    expect(pages[0].slug).toBe(sessionSlug('q-shape-1', 'sess-1'));
+    expect(pages[1].slug).toBe(sessionSlug('q-shape-1', 'sess-2'));
+    expect(pages[2].slug).toBe(sessionSlug('q-shape-1', 'sess-3'));
+    expect(new Set(pages.map(p => p.slug)).size).toBe(3);
+    expect(pages[0].content).toContain('type: note');
+    expect(pages[0].content).toContain('date: 2025-01-15');
+    expect(pages[0].content).toContain(`session_id: ${opaqueSessionId('q-shape-1', 'sess-1')}`);
+    expect(pages[0].content).toContain('**user:** hi');
+    expect(pages[0].content).toContain('**assistant:** hello');
+  });
+
+  test('haystack without dates produces pages with no date frontmatter line', () => {
+    const q: LongMemEvalQuestion = {
+      question_id: 'q-shape-2',
+      question_type: 'multi-session',
+      question: 'q?',
+      answer: 'a',
+      answer_session_ids: [],
+      haystack_sessions: [
+        { session_id: 'sess-x', turns: [{ role: 'user', content: 'no date here' }] },
+      ],
+    };
+    const pages = haystackToPages(q);
+    expect(pages[0].content).toContain(`session_id: ${opaqueSessionId('q-shape-2', 'sess-x')}`);
+    expect(pages[0].content).not.toContain('date:');
+  });
+
+  // v0.35.1.1 regression: the public LongMemEval _s split uses arrays of
+  // turn-arrays for haystack_sessions plus a parallel haystack_session_ids
+  // string array. The pre-v0.35.1.1 adapter crashed with `session.turns is
+  // undefined` on this shape. Pre-v0.35.1.1 the slug validator also
+  // rejected the underscored, mixed-case session_ids the dataset uses.
+  test('v0.35.1.1: _s split shape (turn-array + parallel ids) normalizes correctly', () => {
+    const q: LongMemEvalQuestion = {
+      question_id: 'q-s-1',
+      question_type: 'single-session-user',
+      question: 'q?',
+      answer: 'a',
+      haystack_dates: ['2025-01-01', '2025-01-02'],
+      answer_session_ids: ['sharegpt_AbC_0'],
+      haystack_session_ids: ['sharegpt_AbC_0', 'sess_DEF_1'],
+      // No {session_id, turns} — turns directly per the _s shape.
+      haystack_sessions: [
+        [{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }],
+        [{ role: 'user', content: 'bye' }],
+      ],
+    };
+    const pages = haystackToPages(q);
+    expect(pages.length).toBe(2);
+    // Slugs are opaque per-question ids (validator-safe, no gold label).
+    expect(pages[0].slug).toBe(sessionSlug('q-s-1', 'sharegpt_AbC_0'));
+    expect(pages[1].slug).toBe(sessionSlug('q-s-1', 'sess_DEF_1'));
+    // Frontmatter carries the same opaque id; the raw id never reaches the page.
+    expect(pages[0].content).toContain(`session_id: ${opaqueSessionId('q-s-1', 'sharegpt_AbC_0')}`);
+    expect(pages[0].content).not.toContain('sharegpt_AbC_0');
+    expect(pages[0].content).toContain('date: 2025-01-01');
+    expect(pages[0].content).toContain('**user:** hi');
+    expect(pages[1].content).toContain('**user:** bye');
+  });
+
+  test('v0.35.1.1: missing haystack_session_ids on _s shape synthesizes ids per question', () => {
+    const q: LongMemEvalQuestion = {
+      question_id: 'q-s-2',
+      question_type: 'single-session-user',
+      question: 'q?',
+      answer: 'a',
+      answer_session_ids: [],
+      // _s shape but the parallel ids array is absent. Adapter falls back
+      // to a synthesized `lme_<question_id>_<i>` slug.
+      haystack_sessions: [
+        [{ role: 'user', content: 'turn 1' }],
+      ],
+    };
+    const pages = haystackToPages(q);
+    expect(pages.length).toBe(1);
+    expect(pages[0].slug).toBe(sessionSlug('q-s-2', 'lme_q-s-2_0'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. source-boost regression guard
+// ---------------------------------------------------------------------------
+
+describe('source-boost regression guard', () => {
+  test('chat/<session_id> slugs do not prefix-match any DEFAULT_SOURCE_BOOSTS entry (factor stays 1.0)', () => {
+    const candidate = 'chat/lme-fixture-1';
+    // Longest-prefix-match wins; ELSE branch is 1.0. We just need to assert
+    // no key is a prefix of the candidate slug.
+    const matched = Object.keys(DEFAULT_SOURCE_BOOSTS).filter(prefix =>
+      candidate.startsWith(prefix),
+    );
+    expect(matched).toEqual([]);
+    // Sanity: the existing openclaw/chat/ entry must not match either.
+    expect(DEFAULT_SOURCE_BOOSTS['openclaw/chat/']).toBeDefined();
+    expect(candidate.startsWith('openclaw/chat/')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 13. v0.35.1.0: --resume-from helper (pure file I/O)
+// ---------------------------------------------------------------------------
+
+describe('loadResumeSet (v0.35.1.0)', () => {
+  test('returns empty set when path does not exist', () => {
+    const set = loadResumeSet('/nonexistent/path/never/exists.jsonl');
+    expect(set.size).toBe(0);
+  });
+
+  test('reads question_ids from a well-formed JSONL', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'lme-resume-'));
+    const p = join(tmp, 'partial.jsonl');
+    const { writeFileSync } = await import('fs');
+    try {
+      writeFileSync(
+        p,
+        [
+          JSON.stringify({ question_id: 'a', hypothesis: 'one' }),
+          JSON.stringify({ question_id: 'b', hypothesis: 'two' }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      const set = loadResumeSet(p);
+      expect(set.size).toBe(2);
+      expect(set.has('a')).toBe(true);
+      expect(set.has('b')).toBe(true);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('skips rows whose hypothesis is empty AND error is set (retry case)', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'lme-resume-'));
+    const p = join(tmp, 'with-errors.jsonl');
+    const { writeFileSync } = await import('fs');
+    try {
+      writeFileSync(
+        p,
+        [
+          JSON.stringify({ question_id: 'good', hypothesis: 'real-answer' }),
+          JSON.stringify({ question_id: 'bad', hypothesis: '', error: 'rate-limit' }),
+          JSON.stringify({ question_id: 'recovered', hypothesis: 'second-try', error: 'old-error' }),
+        ].join('\n') + '\n',
+        'utf8',
+      );
+      const set = loadResumeSet(p);
+      // 'bad' is retried; 'good' and 'recovered' are kept (hypothesis non-empty).
+      expect(set.size).toBe(2);
+      expect(set.has('good')).toBe(true);
+      expect(set.has('bad')).toBe(false);
+      expect(set.has('recovered')).toBe(true);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('tolerates a truncated/corrupt final line (SIGKILL recovery case)', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'lme-resume-'));
+    const p = join(tmp, 'truncated.jsonl');
+    const { writeFileSync } = await import('fs');
+    try {
+      writeFileSync(
+        p,
+        JSON.stringify({ question_id: 'a', hypothesis: 'one' }) + '\n' +
+        '{"question_id":"b","hypothesis":"two-trunc' /* no closing brace, no LF */,
+        'utf8',
+      );
+      const set = loadResumeSet(p);
+      // First line counts; second is silently skipped (stderr warn).
+      expect(set.size).toBe(1);
+      expect(set.has('a')).toBe(true);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildByTypeSummary (pure function — no PGLite, no LLM)
+// ---------------------------------------------------------------------------
+
+describe('buildByTypeSummary (pure function, schema v2)', () => {
+  const ctx = {
+    k: 5,
+    excludedAbstention: 1,
+    goldMissingFromHaystack: 0,
+    slugCollisions: 0,
+    runConfig: { mode: 'balanced' },
+  };
+
+  test('populated buckets produce sorted keys + all/any rate math', async () => {
+    const { buildByTypeSummary } = await import('../src/commands/eval-longmemeval.ts');
+    const summary = buildByTypeSummary({
+      'multi-session': { total: 10, all_hit: 8, any_hit: 10, legacy_rows: 0 },
+      'single-session-user': { total: 19, all_hit: 18, any_hit: 18, legacy_rows: 0 },
+    }, { ...ctx, distinctSessionsInTopK: [5, 5, 4] });
+    expect(summary.kind).toBe('by_type_summary');
+    expect(summary.schema_version).toBe(2);
+    expect(summary.metric).toBe('recall_all@k');
+    expect(summary.k).toBe(5);
+    // Sorted alphabetically.
+    expect(Object.keys(summary.recall_by_type)).toEqual(['multi-session', 'single-session-user']);
+    expect(summary.recall_by_type['multi-session'].all_rate).toBeCloseTo(0.8, 5);
+    expect(summary.recall_by_type['multi-session'].any_rate).toBeCloseTo(1.0, 5);
+    expect(summary.recall_by_type['single-session-user'].all_rate).toBeCloseTo(18 / 19, 5);
+    expect(summary.aggregate.all_hit).toBe(26);
+    expect(summary.aggregate.any_hit).toBe(28);
+    expect(summary.aggregate.total).toBe(29);
+    expect(summary.aggregate.all_rate).toBeCloseTo(26 / 29, 5);
+    expect(summary.excluded_abstention).toBe(1);
+    expect(summary.mean_distinct_sessions).toBeCloseTo(14 / 3, 5);
+    expect(summary.run_config).toEqual({ mode: 'balanced' });
+  });
+
+  test('empty bucket map produces null rates, not NaN', async () => {
+    const { buildByTypeSummary } = await import('../src/commands/eval-longmemeval.ts');
+    const summary = buildByTypeSummary({}, ctx);
+    expect(summary.recall_by_type).toEqual({});
+    expect(summary.aggregate.all_hit).toBe(0);
+    expect(summary.aggregate.any_hit).toBe(0);
+    expect(summary.aggregate.total).toBe(0);
+    expect(summary.aggregate.all_rate).toBeNull();
+    expect(summary.aggregate.any_rate).toBeNull();
+    expect(summary.mean_distinct_sessions).toBeUndefined();
+  });
+});

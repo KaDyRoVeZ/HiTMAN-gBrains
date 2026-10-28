@@ -1,0 +1,213 @@
+name: Scale tier
+
+# F4c scale tier (docs/TESTING.md "Scale tier"; gate shape and cadence: O-CEO-16 /
+# O-ENG-16 / O-CEO-9). Runs scripts/scale/run.ts --enforce on PGLite and Postgres.
+#
+# When it runs (one rule):
+# - pull requests that touch the paths below, or carry the `scale-tier` label: 10k;
+# - nightly: 10k + 20k until the import-rate gate has passed at 20k on both
+#   engines on five consecutive nights, then 50k (scripts/scale/trend.ts
+#   decides from the last five nightly reports);
+# - workflow_dispatch: the size you pass.
+#
+# Enforced: import rate, known answers, no-op re-import, no duplicates across
+# sources, the import phase timer, planner health (probed after the first
+# timed op, hot tables above 500 rows; PGLite only) and the budgets phase timer
+# (PLANNER_HEALTH_ENFORCED in scripts/scale/gates.ts). Interactive ceilings
+# and calibrated budgets stay report-only until `bun scripts/scale/trend.ts`
+# prints "ceilings stable" and a reviewer sets the repo variable
+# GBRAIN_SCALE_ENFORCE_CEILINGS=1.
+#
+# Only the generated Markdown corpus is cached; an imported database never is,
+# so every run measures a real import.
+
+on:
+  # The paths filter lives in the plan job so the `scale-tier` label can also
+  # select a pull request that touches none of these paths.
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: '41 8 * * *'
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: Brain size in pages (10000, 20000 or 50000)
+        type: string
+        default: '10000'
+
+permissions:
+  contents: read
+
+# A label other than scale-tier gets its own group, so labelling a pull
+# request never cancels a scale run already in progress.
+# Event parity (docs/TESTING.md#event-parity): the suffixes only separate runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}${{ github.event.action == 'labeled' && github.event.label.name != 'scale-tier' && format('-label-{0}', github.run_id) || '' }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      run: ${{ steps.plan.outputs.run }}
+      pages: ${{ steps.plan.outputs.pages }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          sparse-checkout: scripts/scale
+      # Event parity: Bun is needed only by the schedule's trend planner below.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        if: github.event_name == 'schedule'
+        with:
+          bun-version: 1.4.4
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          ADDED_LABEL: ${{ github.event.label.name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+          PAGES_INPUT: ${{ inputs.pages }}
+        run: |
+          set -euo pipefail
+          # Spec 5.4 paths: engine SQL, search, import, sync, doctor, both engines,
+          # schema and migrations, the harness itself (and this workflow).
+          paths='^(src/core/engine-sql/|src/core/search/|src/core/import-file\.ts$|src/commands/import\.ts$|src/commands/sync/|src/core/sync[^/]*\.ts$|src/core/persistence/sync-[^/]*\.ts$|src/commands/doctor/|src/core/pglite-engine\.ts$|src/core/postgres-engine\.ts$|src/schema\.sql$|src/core/schema-migrations/|scripts/scale/|\.github/workflows/scale-tier\.yml$)'
+          run=false
+          pages='[10000]'
+          # Named exception (docs/TESTING.md#event-parity): pull requests run 10k pages
+          # only when they touch the paths above or carry the label; the nightly
+          # Scale tier schedule covers 10k-50k on both engines.
+          case "$EVENT" in
+            workflow_dispatch)
+              if ! [[ "$PAGES_INPUT" =~ ^[0-9]+$ ]] || [ "$PAGES_INPUT" -lt 20 ]; then
+                echo "::error::pages must be an integer >= 20, got '$PAGES_INPUT'. Re-run with e.g. pages=10000."
+                exit 1
+              fi
+              run=true
+              pages="[$PAGES_INPUT]"
+              ;;
+            schedule)
+              run=true
+              plan=$(bun scripts/scale/trend.ts --json) || plan='{}'
+              echo "trend: $plan"
+              pages=$(printf '%s' "$plan" | jq -c '.tiers // [10000,20000]')
+              ;;
+            pull_request)
+              if [ "$ACTION" = labeled ]; then
+                # Only the scale-tier label itself starts a run; other labels never do.
+                [ "$ADDED_LABEL" = scale-tier ] && run=true
+              elif printf '%s' "$PR_LABELS" | jq -e 'index("scale-tier") != null' >/dev/null; then
+                run=true
+              elif ! [[ "$CHANGED_FILES" =~ ^[0-9]{1,4}$ ]] || [ "$CHANGED_FILES" -ge 3000 ]; then
+                # The PR files API returns at most 3000 files; an unknown diff runs the tier.
+                run=true
+              elif files=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename'); then
+                if printf '%s\n' "$files" | grep -Eq "$paths"; then run=true; fi
+              else
+                run=true
+              fi
+              ;;
+          esac
+          echo "scale tier: run=$run pages=$pages"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "pages=$pages" >> "$GITHUB_OUTPUT"
+
+  scale:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    name: scale ${{ matrix.engine }} ${{ matrix.pages }}
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pglite, postgres]
+        pages: ${{ fromJSON(needs.plan.outputs.pages) }}
+    runs-on: ubicloud-standard-8-ubuntu-2404
+    # Backstop only: the harness's out-of-process phase watchdog
+    # (scripts/scale/watchdog.ts, 1.5x the phase ceilings: 10k ~30 min,
+    # 20k ~60 min) kills a stalled phase first and names it.
+    timeout-minutes: ${{ matrix.pages >= 20000 && 130 || 50 }}
+    services:
+      postgres:
+        # An empty image skips the service on the PGLite cell.
+        image: ${{ matrix.engine == 'postgres' && 'pgvector/pgvector:pg16' || '' }}
+        # Loopback-only throwaway server: trust auth, so no password literal is needed.
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: gbrain_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SCALE_SEED: '1'
+      CORPUS_DIR: .context/scale-corpus/${{ matrix.pages }}-seed1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
+      # The generated Markdown corpus only (O-CEO-9): never an imported database.
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ${{ env.CORPUS_DIR }}
+          key: scale-corpus-${{ hashFiles('scripts/scale/fixture.ts') }}-${{ matrix.pages }}-${{ env.SCALE_SEED }}
+      - name: Scale tier (${{ matrix.engine }}, ${{ matrix.pages }} pages, enforce)
+        env:
+          DATABASE_URL: ${{ matrix.engine == 'postgres' && 'postgresql://postgres@localhost:5432/gbrain_test' || '' }}
+          GBRAIN_SCALE_ENFORCE_CEILINGS: ${{ vars.GBRAIN_SCALE_ENFORCE_CEILINGS }}
+          ENGINE: ${{ matrix.engine }}
+          PAGES: ${{ matrix.pages }}
+        run: |
+          bun run test:scale -- --engine "$ENGINE" --pages "$PAGES" --seed "$SCALE_SEED" \
+            --corpus-dir "$CORPUS_DIR" --out ".context/scale/report-$ENGINE-$PAGES-seed$SCALE_SEED.json" --enforce
+      - name: Summary
+        if: always()
+        env:
+          REPORT: .context/scale/report-${{ matrix.engine }}-${{ matrix.pages }}-seed1.json
+        run: |
+          if [ ! -f "$REPORT" ]; then
+            WATCHDOG="${REPORT%.json}.watchdog.txt"
+            if [ -f "$WATCHDOG" ]; then
+              # The annotation is the signature nightly-watch matches against .github/nightly-known-red.tsv.
+              echo "::error title=Scale phase watchdog::$(head -1 "$WATCHDOG")"
+              { echo "### Phase watchdog killed the harness"; echo '```'; cat "$WATCHDOG"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "No report: the harness crashed before writing one; see the step log." >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          fi
+          jq -r '"### " + .headline.metric + ": " + (.headline.p50_ms|tostring) + " ms (" + .engine + ")",
+            "",
+            "| gate | status | enforced | message |", "|---|---|---|---|",
+            (.gates[] | select(.status == "fail" or (.gate|startswith("ceiling") or startswith("import_rate") or startswith("phase"))) |
+              "| " + .gate + " | " + .status + " | " + (.enforced|tostring) + " | " + (.message|gsub("\\|"; "/")) + " |"),
+            "", "Reproduce: `" + .reproduce + "`"' "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        if: always()
+        with:
+          name: scale-report-${{ matrix.engine }}-${{ matrix.pages }}
+          path: .context/scale/
+          retention-days: 30
+          if-no-files-found: warn

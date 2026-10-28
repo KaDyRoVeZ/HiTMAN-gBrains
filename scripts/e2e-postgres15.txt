@@ -1,0 +1,29 @@
+# Postgres 15 compatibility lane (#7112; e2e.yml job postgres15-compat).
+#
+# gbrain supports Postgres 15 (migration v011 refuses older servers), while
+# PGLite runs Postgres 17 and every other Postgres lane runs 16, so SQL that
+# only 16+ parses ships green everywhere else. This lane runs a targeted set of
+# the write, sync, jobs and migration files against pgvector/pgvector:pg15.
+# Every file applies the whole migration chain to a fresh database first.
+#
+# Left out on purpose: the catalog goldens (schema-catalog-golden,
+# schema-migrations-replay) pin pg_get_viewdef text, which Postgres 16 deparses
+# differently, so they hold Postgres 16 output by design.
+#
+# Format: one repo-relative path per line; # starts a comment.
+test/e2e/postgres15-sql-compat-7112-postgres.test.ts
+test/e2e/managed-sync-failures.test.ts
+test/e2e/put-page-persistence-postgres.test.ts
+test/e2e/persistence-publication-parity.test.ts
+test/e2e/sync.test.ts
+test/e2e/sync-reconcile-postgres.test.ts
+test/e2e/sync-run-workers-postgres.test.ts
+test/e2e/restore-source-config-jsonb-postgres.test.ts
+test/e2e/op-checkpoint-jsonb-parity.test.ts
+test/e2e/fact-fingerprint-search-path-postgres.test.ts
+test/e2e/minions-resilience.test.ts
+test/e2e/minions-concurrency.test.ts
+test/e2e/jobs-agent-scope-postgres.test.ts
+test/e2e/migrate-chain.test.ts
+test/e2e/migration-flow.test.ts
+test/e2e/doctor-revision-backfill-postgres.test.ts

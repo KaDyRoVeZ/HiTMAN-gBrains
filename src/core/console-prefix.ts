@@ -1,0 +1,247 @@
+/**
+ * v0.40.3.0 — per-source console line-prefixing via AsyncLocalStorage.
+ *
+ * Under `gbrain sync --all --parallel > 1`, multiple per-source syncs run
+ * concurrently. Without prefixing, every `console.log` from `performSync`
+ * (git pull lines, embed progress, drift gates, ~30+ call sites total)
+ * interleaves on the terminal — operators can't tell which source emitted
+ * which line. kubectl `--prefix` and docker-compose solve the same problem
+ * with `[<id>] ` prefixes that ride along with each line.
+ *
+ * Usage:
+ *   await withSourcePrefix(src.id, () => performSync(engine, opts));
+ *   // Inside performSync (and its callees), call slog() / serr() instead
+ *   // of console.log() / console.error(). When invoked under a wrap, the
+ *   // prefix is automatically prepended to each emitted line. Outside the
+ *   // wrap (single-source sync, doctor, anywhere else), slog/serr are
+ *   // identical to console.log/console.error — back-compat preserved.
+ *
+ * Multi-line strings: each newline-separated segment gets its own prefix,
+ * so a `serr('phase started\\n  details: x')` under prefix `[foo]` emits:
+ *   [foo] phase started
+ *   [foo]   details: x
+ *
+ * Why source.id and not source.name:
+ *   `sources add --name` accepts arbitrary text — operators (or attackers)
+ *   could embed newlines or control characters that break grep filtering
+ *   and impersonate other sources' lines. `source.id` is slug-validated by
+ *   the existing sources schema (lowercase alphanumeric + dash) and safe to
+ *   prefix raw. The per-source banner (one-shot at start of each source)
+ *   can still display `source.name` for human readability.
+ *
+ * Why AsyncLocalStorage:
+ *   Propagates through every `await` boundary without manual threading.
+ *   `withSourcePrefix(id, () => performSync(...))` covers performSync AND
+ *   every async function it calls (runImport, runEmbedCore, parallel-worker
+ *   subphases) as long as those functions use slog/serr. Nested wraps
+ *   restore the outer prefix on exit.
+ *
+ * Coverage in v0.40.3.0 (see CLAUDE.md for the canonical list):
+ *   - src/commands/sync.ts (performSync + in-file callees)
+ *   - src/commands/embed.ts (runEmbedCore + helpers)
+ *   - src/core/progress.ts (heartbeat / progress writer)
+ *   - src/commands/import.ts (runImport's human-only info() + summary lines)
+ *
+ * Anything outside those modules that writes directly to stdout/stderr will
+ * NOT get the prefix. If you find a delegate-module line that escapes the
+ * prefix under parallel sync, it's a missed migration target — file an
+ * issue (per D12 → A full-lake; honest about scope).
+ */
+
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+const __prefixStore = new AsyncLocalStorage<string>();
+
+// MCP stdio mode: stdout is reserved for JSON-RPC frames. When the stdio
+// serve path activates this guard, every logging surface this module owns
+// (slog's console.log fallthrough, slog's prefixed process.stdout.write)
+// routes to stderr instead, and the global console.log/info/debug are
+// rebound to console.error so library code reached from op handlers
+// (performSync, runEmbedCore, importFromFile, ...) can't emit plain text
+// onto the JSON-RPC channel. One direction only — never unset at runtime
+// (the serve process is stdio-MCP for its whole lifetime).
+let __stdoutLoggingRedirected = false;
+let __consoleBeforeRedirect: Pick<Console, 'log' | 'info' | 'debug'> | null = null;
+
+// CLI `--json` mode: stdout is reserved for the JSON envelope (and any JSON
+// status lines). Scoped, not process-wide: rebinding console.log here would
+// also push the envelope itself to stderr. slog consults it; serr is stderr
+// already; direct console.log(JSON.stringify(..)) sites are untouched.
+const __humanToStderr = new AsyncLocalStorage<true>();
+
+// #6317: a resident serve running a delegated managed sync captures the
+// drain's human lines for the polling CLI instead of printing them to its
+// own stderr. Scoped like the prefix: it rides every await (and Bun's
+// timers) under the wrap, so the drain's progress and stall lines, which an
+// interval prints, reach the sink too.
+const __lineSink = new AsyncLocalStorage<(line: string) => void>();
+
+/**
+ * Run `fn` with every `slog` / `serr` line delivered to `sink` (one call
+ * per formatted line, prefix applied, no trailing newline) instead of the
+ * process streams. Nests with `withSourcePrefix`; the innermost sink wins.
+ */
+export function withHumanLineSink<T>(sink: (line: string) => void, fn: () => Promise<T>): Promise<T> {
+  return __lineSink.run(sink, fn);
+}
+
+function deliverToSink(sink: (line: string) => void, args: unknown[], prefix: string | null): void {
+  const text = prefix === null ? formatArgs(args) : prefixLines(formatArgs(args), prefix);
+  for (const line of text.split('\n')) sink(line);
+}
+
+/**
+ * Run `fn` with every `slog` line (prefixed or not) routed to stderr, so a
+ * command's human output cannot interleave with the JSON it emits on
+ * stdout. Propagates through `await` like `withSourcePrefix`; nests with it.
+ */
+export function withHumanLogsToStderr<T>(fn: () => Promise<T>): Promise<T> {
+  return __humanToStderr.run(true, fn);
+}
+
+/**
+ * Route ALL stdout-bound logging to stderr for the lifetime of this
+ * process. Called once by the stdio MCP serve path before the transport
+ * starts. Idempotent.
+ *
+ * Rationale: any non-JSON-RPC line on stdout makes the MCP client's
+ * parser throw ("Failed to parse JSONRPC message"). Progress output from
+ * ops that run in-process (sync_brain -> performSync -> embed) previously
+ * leaked to stdout via slog / console.log.
+ */
+export function redirectStdoutLoggingToStderr(): void {
+  if (__stdoutLoggingRedirected) return;
+  __stdoutLoggingRedirected = true;
+  // eslint-disable-next-line no-console
+  __consoleBeforeRedirect = { log: console.log, info: console.info, debug: console.debug };
+  // eslint-disable-next-line no-console
+  const toStderr = (...args: unknown[]): void => console.error(...args);
+  // eslint-disable-next-line no-console
+  console.log = toStderr;
+  // eslint-disable-next-line no-console
+  console.info = toStderr;
+  // eslint-disable-next-line no-console
+  console.debug = toStderr;
+}
+
+/**
+ * Read-only accessor (test seam): is the stdio stderr redirect active?
+ */
+export function isStdoutLoggingRedirected(): boolean {
+  return __stdoutLoggingRedirected;
+}
+
+/**
+ * Test-only reset: clears the flag and puts back the console bindings the
+ * redirect replaced. Bun runs many test files in one process, so a reset that
+ * left console.log bound to stderr sent every later file's stdout logging to
+ * stderr.
+ */
+export function _resetStdoutRedirectForTests(): void {
+  __stdoutLoggingRedirected = false;
+  if (!__consoleBeforeRedirect) return;
+  Object.assign(console, __consoleBeforeRedirect);
+  __consoleBeforeRedirect = null;
+}
+
+/**
+ * Run `fn` with an active per-source prefix `id`. Within the closure,
+ * `slog` and `serr` will prepend `[id] ` to every line they emit. The
+ * prefix is automatically propagated through `await` boundaries.
+ *
+ * Nested wraps replace the active prefix for the inner closure and
+ * restore the outer prefix when the inner returns/throws.
+ *
+ * `id` should be a slug-validated source identifier (NOT a free-form
+ * display name) — see module docstring for the security rationale.
+ */
+export function withSourcePrefix<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  return __prefixStore.run(id, fn);
+}
+
+/**
+ * Read the currently-active per-source prefix. Returns null when called
+ * outside a `withSourcePrefix` scope. Test seam; production code should
+ * use `slog` / `serr` instead of reading the prefix directly.
+ */
+export function getSourcePrefix(): string | null {
+  return __prefixStore.getStore() ?? null;
+}
+
+/**
+ * Prefix-aware replacement for `console.log`. When called inside a
+ * `withSourcePrefix(id, ...)` scope, prepends `[id] ` to every line of
+ * the formatted output. Outside the scope, behaves exactly like
+ * `console.log` (writes to stdout).
+ */
+export function slog(...args: unknown[]): void {
+  const prefix = getSourcePrefix();
+  const sink = __lineSink.getStore();
+  if (sink) { deliverToSink(sink, args, prefix); return; }
+  const toStderr = __stdoutLoggingRedirected || __humanToStderr.getStore() === true;
+  if (prefix === null) {
+    // Back-compat fast path: bare console.log semantics. (Under the stdio
+    // MCP redirect, console.log is rebound to stderr — see
+    // redirectStdoutLoggingToStderr; under withHumanLogsToStderr the line
+    // is routed to stderr here instead.)
+    // eslint-disable-next-line no-console
+    if (toStderr) console.error(...args); else console.log(...args);
+    return;
+  }
+  const out = toStderr ? process.stderr : process.stdout;
+  out.write(prefixLines(formatArgs(args), prefix) + '\n');
+}
+
+/**
+ * Prefix-aware replacement for `console.error`. Same prefix semantics as
+ * `slog`, but writes to stderr. Use for warnings, errors, and any output
+ * that should NOT pollute `--json` stdout.
+ */
+export function serr(...args: unknown[]): void {
+  const prefix = getSourcePrefix();
+  const sink = __lineSink.getStore();
+  if (sink) { deliverToSink(sink, args, prefix); return; }
+  if (prefix === null) {
+    // eslint-disable-next-line no-console
+    console.error(...args);
+    return;
+  }
+  process.stderr.write(prefixLines(formatArgs(args), prefix) + '\n');
+}
+
+/**
+ * Format an args list the way `console.log` would, but as a single string.
+ * Strings stay raw; everything else goes through JSON.stringify with a
+ * fallback to String() for non-serializable values. Multi-arg invocations
+ * join with spaces (matches console.log's default delimiter).
+ */
+function formatArgs(args: unknown[]): string {
+  return args
+    .map((a) => {
+      if (typeof a === 'string') return a;
+      if (a instanceof Error) return a.stack ?? a.message;
+      try {
+        return JSON.stringify(a);
+      } catch {
+        return String(a);
+      }
+    })
+    .join(' ');
+}
+
+/**
+ * Prepend `[prefix] ` to every line of `text`. Preserves empty trailing
+ * lines (so a trailing newline in input stays a trailing newline in
+ * output — the caller's `+ '\\n'` adds the final separator). Embedded
+ * newlines inside the string each get their own prefix.
+ *
+ * Examples (prefix = 'foo'):
+ *   ''              → '[foo] '
+ *   'a'             → '[foo] a'
+ *   'a\\nb'         → '[foo] a\\n[foo] b'
+ *   'a\\nb\\n'      → '[foo] a\\n[foo] b\\n[foo] '
+ */
+function prefixLines(text: string, prefix: string): string {
+  const tag = `[${prefix}] `;
+  return text.split('\n').map((line) => tag + line).join('\n');
+}

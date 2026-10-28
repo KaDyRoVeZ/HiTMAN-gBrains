@@ -1,0 +1,1090 @@
+// ─────────────────────────────────────────────────────────────────
+// Sync failure ledger — issue #1939 (was "Bug 9" in src/core/sync.ts)
+// ─────────────────────────────────────────────────────────────────
+//
+// When a sync run catches a per-file parse error (YAML with unquoted
+// colons, malformed frontmatter, a non-string title, etc.), we record it
+// here instead of just logging and moving on. Goals:
+//   1. Gate the sync.last_commit bookmark advance in BOTH sync gates
+//      (incremental + full/runImport) through one shared policy.
+//   2. Give a visible, per-(source,path) record of what failed, with the
+//      commit hash to re-attempt after fixing the source file.
+//   3. `gbrain sync --skip-failed` acknowledges a known-bad set.
+//   4. BOUNDED AUTO-SKIP: a file that fails N consecutive syncs is
+//      auto-skipped so a single poison file can't wedge ALL indexing
+//      forever — without ever silently dropping a FRESH failure, and
+//      never auto-skipping an infra sentinel like `<head>`.
+//
+// This module is a LEAF (imports only fs/os/path/crypto/config and the import-free
+// ai/errors.ts) so it can be
+// re-exported from sync.ts without a circular dependency. The state lives
+// in `~/.gbrain/sync-failures.jsonl`, one JSON object per line.
+//
+// State machine (per (source_id, path)):
+//
+//        recordFailures (file fails a sync run)
+//             │  attempts++ each consecutive run
+//             ▼
+//          ┌──────┐  clearFailures (file imports OK)        ┌─────────┐
+//          │ open │ ───────────────────────────────────────│ removed │
+//          └──────┘                                          └─────────┘
+//          │     │
+//   --skip-│     │ attempts >= threshold AND no fresh failures
+//   failed │     │ (after bookmark advance)
+//          ▼     ▼
+//  ┌────────────┐  ┌──────────────┐
+//  │acknowledged│  │ auto_skipped │  (still UNRESOLVED → doctor WARN
+//  │ (resolved) │  │  visible      │   until the file imports cleanly)
+//  └────────────┘  └──────────────┘
+//
+// `acknowledged` = ok (human resolved). `open` + `auto_skipped` = unresolved
+// (doctor surfaces them). `<head>` and any `<…>` sentinel is recorded but
+// NEVER auto-skipped/acknowledged-to-advance — a history rewrite must hard-block.
+
+import {
+  existsSync as _existsSync,
+  readFileSync as _readFileSync,
+  writeFileSync as _writeFileSync,
+  mkdirSync as _mkdirSync,
+  renameSync as _renameSync,
+  openSync as _openSync,
+  closeSync as _closeSync,
+  unlinkSync as _unlinkSync,
+  statSync as _statSync,
+  mkdtempSync as _mkdtempSync,
+} from 'fs';
+import { tmpdir as _tmpdir } from 'os';
+import { join as _joinPath } from 'path';
+import { gbrainPath as _gbrainPath } from './config.ts';
+import { createHash as _createHash } from 'crypto';
+import { BILLING_MESSAGE_RE, RATE_MESSAGE_RE } from './ai/errors.ts';
+
+export const DEFAULT_SOURCE_ID = 'default';
+/** Reserved sentinel paths (e.g. `<head>`) start with this; never file paths. */
+export const SENTINEL_PREFIX = '<';
+/** `<rename:…>` sentinel prefix (#3056 — a rename-reconcile delete failed). */
+export const RENAME_SENTINEL_PREFIX = '<rename:';
+export const DEFAULT_AUTOSKIP_AFTER = 3;
+const LOCK_STALE_MS = 30_000;
+const LOCK_SPIN_MS = 50;
+const LOCK_TIMEOUT_MS = 5_000;
+
+export type SyncFailureState = 'open' | 'acknowledged' | 'auto_skipped';
+
+export interface SyncFailure {
+  managed_cursor_key?: string;
+  request_id?: string | null;
+  run_id?: string;
+  observation_id?: string;
+  /** Owning source (#1939 Codex #2 — failures must not merge across sources). */
+  source_id: string;
+  path: string;
+  error: string;
+  /** Structured error code extracted from the error message. */
+  code: string;
+  /** Most recent commit this path failed on. */
+  commit: string;
+  line?: number;
+  /** ISO — start of the current unresolved streak. */
+  first_seen: string;
+  /** ISO — last update. */
+  ts: string;
+  /** Consecutive failed sync runs for (source_id, path); a systemic run (most files failing) does not count. */
+  attempts: number;
+  /** GBRA-130 A-18: consecutive runs this path failed with an embedding-infra code while other files imported. */
+  infra_isolated_runs?: number;
+  state: SyncFailureState;
+  resolved_at?: string;
+  // Legacy MIRROR fields, still WRITTEN for one release so any pre-#1939
+  // reader of `acknowledged_at` keeps working. Derived from `state`.
+  acknowledged?: boolean;
+  acknowledged_at?: string | null;
+}
+
+export interface AcknowledgeResult {
+  count: number;
+  summary: Array<{ code: string; count: number }>;
+}
+
+/** A real importable file (not an infra sentinel like `<head>`). */
+export function isSkippablePath(path: string): boolean {
+  return !path.startsWith(SENTINEL_PREFIX);
+}
+
+/** The `<rename:…>` sentinel key for a rename whose destination is `to`. */
+export function renameSentinelPath(to: string): string {
+  return `${RENAME_SENTINEL_PREFIX}${to}>`;
+}
+
+/**
+ * The one place the `<rename:…>` sentinel's error text is composed. The
+ * format is load-bearing: `parseRenameReconcileFrom` below reads the OLD
+ * path back out of it so a later run can decide whether the sentinel is
+ * orphaned (#3479 blocker 2 — a force-push can invalidate the pinned
+ * target, the destination never re-enters the diff, and the ordinary
+ * success path can then never clear the row).
+ *
+ * The slug and path slots are JSON-encoded, NOT raw prose: a raw
+ * interpolation would make the format ambiguous for a path that itself
+ * contains the ` not removed): ` delimiter, and a misparse there flows
+ * straight into the orphan probe — which could then clear a sentinel while
+ * the real duplicate still exists. JSON escaping makes the quoted span
+ * self-delimiting for ANY path bytes. The stale slug slot is always
+ * present (`?` when the resolve itself failed before it was known) so the
+ * prefix parses unambiguously, and so the blocked-run message can tell the
+ * operator exactly which row `gbrain delete` should remove.
+ */
+export function renameReconcileErrorMessage(
+  from: string,
+  staleSlug: string | undefined,
+  cause: string,
+): string {
+  const slugSlot = staleSlug === undefined ? '?' : JSON.stringify(staleSlug);
+  return (
+    `rename reconcile failed (stale row ${slugSlot} for ${JSON.stringify(from)} not removed): ${cause}`
+  );
+}
+
+/** The literal that closes the path slot in BOTH sentinel formats. */
+const RENAME_SENTINEL_DELIM = ' not removed): ';
+
+/**
+ * Recover the rename's OLD path from a `<rename:…>` sentinel's error text
+ * (written by `renameReconcileErrorMessage` — this pair owns the format).
+ * Returns undefined on anything that doesn't parse; callers treat that as
+ * "leave the row alone" (fail-closed), so a hand-edited row can never be
+ * auto-cleared on a misread.
+ *
+ * Two formats are read. The current one JSON-encodes the path, which makes
+ * the quoted span self-delimiting for any path bytes. The PRE-#3479 one
+ * interpolated the path raw and carried no slug slot:
+ *
+ *   rename reconcile failed (stale row for <path> not removed): <cause>
+ *
+ * Reading only the current format would leave anyone ALREADY wedged by
+ * #3056 before upgrading wedged forever: their ledger row cannot be parsed,
+ * so the self-heal can never prove it orphaned, so `doctor` keeps failing —
+ * the exact condition this self-heal exists to end, denied to the users who
+ * need it most (review: "incomplete fix"). The legacy branch is admitted
+ * ONLY when it is unambiguous: the raw interpolation is undecidable if the
+ * delimiter appears more than once (a path or a cause containing it), so
+ * that case still returns undefined and the row stays open. The two formats
+ * cannot be confused — the current one always has a slug slot between
+ * `stale row ` and ` for `, which the legacy pattern does not match.
+ */
+export function parseRenameReconcileFrom(error: string): string | undefined {
+  const m = /^rename reconcile failed \(stale row (?:"(?:[^"\\]|\\.)*"|\?) for ("(?:[^"\\]|\\.)*") not removed\): /.exec(error);
+  if (m) {
+    try {
+      const parsed: unknown = JSON.parse(m[1]);
+      return typeof parsed === 'string' ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  const legacy = /^rename reconcile failed \(stale row for (.+) not removed\): /.exec(error);
+  if (!legacy) return undefined;
+  // Undecidable if the delimiter occurs more than once: the greedy capture
+  // above would swallow a cause that contains it, and a lazy one would cut
+  // a path that contains it. Neither guess is safe when the consequence is
+  // clearing a sentinel that still guards a real duplicate.
+  let occurrences = 0;
+  for (let i = error.indexOf(RENAME_SENTINEL_DELIM); i !== -1;
+       i = error.indexOf(RENAME_SENTINEL_DELIM, i + 1)) occurrences++;
+  if (occurrences !== 1) return undefined;
+  return legacy[1] === '' ? undefined : legacy[1];
+}
+
+/**
+ * Resolve the auto-skip threshold from `GBRAIN_SYNC_AUTOSKIP_AFTER`
+ * (default 3). `0` disables the valve entirely (pure fail-closed).
+ */
+export function resolveAutoSkipThreshold(): number {
+  const raw = process.env.GBRAIN_SYNC_AUTOSKIP_AFTER;
+  if (raw === undefined || raw === '') return DEFAULT_AUTOSKIP_AFTER;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_AUTOSKIP_AFTER;
+  return Math.floor(n);
+}
+
+/**
+ * Best-effort extraction of a structured error code from a sync failure
+ * message. Order matters: DB-layer errors are checked BEFORE YAML-layer
+ * ones so Postgres `duplicate key` isn't mislabeled as a YAML duplicate-key.
+ */
+/** Errno codes of a file the importer could not read: the file's own state, never a provider's. */
+const FILE_ERRNO_CODES: Record<string, string> = {
+  EACCES: 'PERMISSION_DENIED', EPERM: 'PERMISSION_DENIED',
+  ENOENT: 'FILE_UNREADABLE', ELOOP: 'FILE_UNREADABLE', EISDIR: 'FILE_UNREADABLE', ENOTDIR: 'FILE_UNREADABLE',
+  ENAMETOOLONG: 'FILE_UNREADABLE', EILSEQ: 'FILE_UNREADABLE',
+};
+
+/**
+ * GBRA-130 A-18: the part of a failure message a provider wrote. An embed
+ * envelope (`[embed(provider:model)] …`) starts it; the failing file's path and
+ * every path-like token are removed, so a file named `http-429.md` or living
+ * under `billing/` never reads as a rate limit or a quota.
+ */
+function providerText(errorMsg: string, path?: string): { text: string; enveloped: boolean } {
+  const envelope = /\[embed(?:Multimodal)?\([^)]*\)\]/.exec(errorMsg);
+  let text = envelope ? errorMsg.slice(envelope.index + envelope[0].length) : errorMsg;
+  for (const part of path ? [path, path.split('/').pop()!] : []) if (part) text = text.split(part).join(' ');
+  return { text: text.replace(/\S*[\\/]\S*/g, ' '), enveloped: envelope !== null };
+}
+
+/**
+ * The ledger code of an error raised while importing `path`: an errno is the
+ * file's own failure (structured, from the error's `code`); anything else is
+ * classified from its message with the path removed.
+ */
+export function syncFailureCode(error: unknown, path?: string): string {
+  const errno = (error as { code?: unknown } | null)?.code;
+  if (typeof errno === 'string' && FILE_ERRNO_CODES[errno]) return FILE_ERRNO_CODES[errno]!;
+  return classifyErrorCode(error instanceof Error ? error.message : String(error), path);
+}
+
+export function classifyErrorCode(errorMsg: string, path?: string): string {
+  // GBRA-130 A-18: a Node errno message (`EACCES: permission denied, open
+  // '<path>'`) is the file's own failure; its path text must never reach the
+  // patterns below.
+  const errno = /^(E[A-Z]+): /.exec(errorMsg)?.[1];
+  if (errno && FILE_ERRNO_CODES[errno]) return FILE_ERRNO_CODES[errno]!;
+
+  // `<rename:…>` sentinel envelope (#3056) — checked FIRST so the code is
+  // stable regardless of the underlying cause: the envelope wraps a raw DB
+  // error whose text would otherwise match a cause-level pattern below
+  // (STATEMENT_TIMEOUT, DB_DUPLICATE_KEY, …) and make the same sentinel
+  // class surface under different codes run to run (#3479 review). Without
+  // it the blocked-run breakdown also printed a bare `UNKNOWN: 1`.
+  if (/rename reconcile failed|RENAME_RECONCILE/i.test(errorMsg)) return 'RENAME_RECONCILE';
+
+  // #5032: a ':' file name on Windows (src/commands/sync/imports.ts).
+  if (/^colon_slug_windows_write_through:/.test(errorMsg)) return 'COLON_SLUG_WINDOWS_WRITE_THROUGH';
+
+  // SLUG_MISMATCH: thrown by importFromFile() at src/core/import-file.ts.
+  if (/slug.*does not match|SLUG_MISMATCH/i.test(errorMsg)) return 'SLUG_MISMATCH';
+
+  // DB-layer errors come BEFORE the YAML duplicate-key check.
+  if (/duplicate key value violates unique constraint|DB_DUPLICATE_KEY/i.test(errorMsg)) {
+    return 'DB_DUPLICATE_KEY';
+  }
+  if (/canceling statement due to statement timeout|STATEMENT_TIMEOUT/i.test(errorMsg)) {
+    return 'STATEMENT_TIMEOUT';
+  }
+
+  // YAML / frontmatter patterns.
+  if (/YAML parse failed|YAML_PARSE/i.test(errorMsg)) return 'YAML_PARSE';
+  if (/YAMLException|duplicated mapping key|YAML_DUPLICATE_KEY/i.test(errorMsg)) {
+    return 'YAML_DUPLICATE_KEY';
+  }
+  if (/File is empty or whitespace-only|Frontmatter must start with ---|MISSING_OPEN/i.test(errorMsg)) {
+    return 'MISSING_OPEN';
+  }
+  if (/No closing --- delimiter|Heading at line .* found inside frontmatter|MISSING_CLOSE/i.test(errorMsg)) {
+    return 'MISSING_CLOSE';
+  }
+  if (/Frontmatter block is empty|EMPTY_FRONTMATTER/i.test(errorMsg)) return 'EMPTY_FRONTMATTER';
+  if (/Content contains null bytes|NULL_BYTES|null byte/i.test(errorMsg)) return 'NULL_BYTES';
+  if (/Nested double quotes|NESTED_QUOTES/i.test(errorMsg)) return 'NESTED_QUOTES';
+
+  // Generic fallbacks.
+  if (/invalid UTF-?8|INVALID_UTF8/i.test(errorMsg)) return 'INVALID_UTF8';
+  if (/file too large|content too large|FILE_TOO_LARGE/i.test(errorMsg)) return 'FILE_TOO_LARGE';
+  if (/skipping symlink|symlink|SYMLINK_NOT_ALLOWED/i.test(errorMsg)) return 'SYMLINK_NOT_ALLOWED';
+
+  // takes-v2 fence + holder grammar failures.
+  if (/TAKES_TABLE_MALFORMED|TAKES_ROW_NUM_COLLISION|TAKES_FENCE_UNBALANCED/i.test(errorMsg)) {
+    return 'TAKES_TABLE_MALFORMED';
+  }
+  if (/TAKES_HOLDER_INVALID/i.test(errorMsg)) return 'TAKES_HOLDER_INVALID';
+
+  // Embedding error classification.
+  if (/embedding requires [A-Z][A-Z0-9_]+_API_KEY|EMBEDDING_NO_CREDS/i.test(errorMsg)) {
+    return 'EMBEDDING_NO_CREDS';
+  }
+  if (/Anthropic has no embedding model|EMBEDDING_NO_TOUCHPOINT/i.test(errorMsg)) {
+    return 'EMBEDDING_NO_TOUCHPOINT';
+  }
+  // #3875: embed-scoped timeouts (AbortSignal.timeout firing inside the
+  // gateway's per-sub-batch AI_EMBED_TIMEOUT_MS produces
+  // `[embed(provider:model)] The operation timed out.`). Classified BEFORE the
+  // rate-limit/quota checks and distinct from STATEMENT_TIMEOUT (a DB error) —
+  // this is provider-infra unhealth, not file poison, so the auto-skip valve
+  // must never eat it. GBRA-130 A-18: the infra patterns read only the
+  // provider's text (providerText): never the file path, never a bare
+  // `billing` or `429` outside an embed envelope.
+  const provider = providerText(errorMsg, path);
+  if ((provider.enveloped && /\b(?:timed? ?out|timeout)\b/i.test(provider.text.split('\n')[0]!)) || /\bEMBEDDING_TIMEOUT\b/.test(provider.text)) {
+    return 'EMBEDDING_TIMEOUT';
+  }
+  if (RATE_MESSAGE_RE.test(provider.text) || /\brate_limited\b|RateLimit|\bEMBEDDING_RATE_LIMIT\b/.test(provider.text)
+    || (provider.enveloped && /\b429\b/.test(provider.text))) {
+    return 'EMBEDDING_RATE_LIMIT';
+  }
+  if (BILLING_MESSAGE_RE.test(provider.text) || /\bEMBEDDING_QUOTA\b/.test(provider.text)) {
+    return 'EMBEDDING_QUOTA';
+  }
+  if (/maximum context length|max_tokens|context length|input too long|input length exceeds|tokens? exceed|too many tokens|EMBEDDING_OVERSIZE/i.test(errorMsg)) {
+    return 'EMBEDDING_OVERSIZE';
+  }
+
+  // content-sanity reject disposition.
+  if (/PAGE_JUNK_PATTERN/i.test(errorMsg)) return 'PAGE_JUNK_PATTERN';
+
+  return 'UNKNOWN';
+}
+
+/** Group failures by error code and return a sorted summary. */
+export function summarizeFailuresByCode(
+  failures: Array<{ error: string; code?: string; path?: string }>,
+): Array<{ code: string; count: number }> {
+  const counts: Record<string, number> = {};
+  for (const f of failures) {
+    const code = f.code ?? classifyErrorCode(f.error, f.path);
+    counts[code] = (counts[code] ?? 0) + 1;
+  }
+  return Object.entries(counts)
+    .sort(([, a], [, b]) => b - a)
+    .map(([code, count]) => ({ code, count }));
+}
+
+/**
+ * Format a code-grouped summary as a human-readable multi-line string.
+ * Accepts either raw failures (summarized internally) or an already-
+ * summarized `{code, count}[]`. Empty input → empty string.
+ */
+export function formatCodeBreakdown(
+  input: Array<{ error: string; code?: string }> | Array<{ code: string; count: number }>,
+): string {
+  const summary =
+    input.length > 0 && typeof (input[0] as { count?: unknown }).count === 'number'
+      ? (input as Array<{ code: string; count: number }>)
+      : summarizeFailuresByCode(input as Array<{ error: string; code?: string }>);
+  return summary.map(s => `  ${s.code}: ${s.count}`).join('\n');
+}
+
+/**
+ * #4543: name the failing FILES (not just code counts) so a blocked sync is
+ * actionable without opening sync-failures.jsonl by hand. Sentinel rows
+ * (`<head>`, `<rename:…>`) are excluded — they aren't files. Paths are
+ * control-char scrubbed (terminal-escape safety, same policy as
+ * sanitizePathForDisplay) and the list is capped so one pathological run
+ * can't flood stderr. Callers pair this with the
+ * `gbrain frontmatter validate <path>` hint for parse-class failures.
+ */
+export function formatFailedFileList(
+  failures: Array<{ path: string; error: string; code?: string }>,
+  limit = 10,
+): string {
+  const files = failures.filter(f => isSkippablePath(f.path));
+  const shown = files.slice(0, Math.max(0, limit));
+  const scrub = (p: string): string => {
+    // eslint-disable-next-line no-control-regex
+    const cleaned = p.replace(/[\x00-\x1f\x7f]/g, '�');
+    return cleaned.length > 200 ? `${cleaned.slice(0, 197)}...` : cleaned;
+  };
+  const lines = shown.map(f => `    ${scrub(f.path)} (${f.code ?? classifyErrorCode(f.error, f.path)})`);
+  if (files.length > shown.length) {
+    lines.push(`    … and ${files.length - shown.length} more (see sync-failures.jsonl)`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Where `sync-failures.jsonl` lives. Defaults to the gbrain home.
+ *
+ * `GBRAIN_SYNC_FAILURES_DIR` exists for the same reason `GBRAIN_AUDIT_DIR` does
+ * (#2823): the test suite exercises import/sync failure paths with deliberately
+ * broken fixtures, and without an override those fixture rows append into the
+ * operator's REAL ledger — the one `gbrain doctor` reads and warns on until it
+ * is cleaned up. A stray `srcE / notes/bad.md SLUG_MISMATCH` row in a live
+ * brain came from exactly this.
+ *
+ * A dedicated var rather than leaning on `GBRAIN_HOME`: pointing GBRAIN_HOME at
+ * a scratch dir for the whole suite also makes `loadConfig()` return null for
+ * every test that reads the real config, which is a far wider blast radius than
+ * this problem needs (and `test/gbrain-home-isolation.test.ts` asserts the
+ * unset-fallback behavior directly).
+ */
+function _failuresDir(): string {
+  if (process.env.GBRAIN_SYNC_FAILURES_DIR) return process.env.GBRAIN_SYNC_FAILURES_DIR;
+  if (process.env.NODE_ENV === 'test' && !process.env.GBRAIN_HOME) return _testScratchDir();
+  return _gbrainPath();
+}
+
+let _testScratch: string | null = null;
+
+/**
+ * #7144: `bun test` loads `bunfig.toml` (and so every isolation preload) only
+ * from the directory it starts in, so a run started in `test/` or outside the
+ * repo set neither GBRAIN_SYNC_FAILURES_DIR nor GBRAIN_HOME, and broken-fixture
+ * sync tests appended their rows (`srcE / notes/bad.md SLUG_MISMATCH`) to the
+ * operator's real ledger. Bun sets NODE_ENV=test for every test run, so with
+ * neither override a test process gets its own scratch ledger instead.
+ */
+function _testScratchDir(): string {
+  if (!_testScratch) {
+    _testScratch = _mkdtempSync(_joinPath(_tmpdir(), 'gbrain-test-syncfail-'));
+    process.stderr.write(`[sync-failures] NODE_ENV=test without GBRAIN_SYNC_FAILURES_DIR or GBRAIN_HOME (bun test started outside the repo root?): this run's sync failure ledger is ${_testScratch}, not the real one.\n`);
+  }
+  return _testScratch;
+}
+
+export function syncFailuresPath(): string {
+  return _joinPath(_failuresDir(), 'sync-failures.jsonl');
+}
+
+function _ledgerKey(f: { source_id: string; path: string; managed_cursor_key?: string }): string {
+  // NUL separator can't appear in a source id or path.
+  return `${f.source_id}\u0000${f.path}${f.managed_cursor_key ? `\u0000${f.managed_cursor_key}` : ''}`;
+}
+
+// ─── State mirror ───────────────────────────────────────────────────
+
+/**
+ * Keep the legacy `acknowledged`/`acknowledged_at` fields consistent with
+ * `state`. `auto_skipped` is intentionally NOT acknowledged (it is still an
+ * unindexed page) so even a pre-#1939 reader counting `!acknowledged_at`
+ * keeps surfacing it.
+ */
+function _applyMirror(f: SyncFailure): SyncFailure {
+  if (f.state === 'acknowledged') {
+    f.acknowledged = true;
+    f.acknowledged_at = f.resolved_at ?? f.ts;
+  } else {
+    f.acknowledged = false;
+    f.acknowledged_at = null;
+  }
+  return f;
+}
+
+// ─── Load + normalize ────────────────────────────────────────────────
+
+function _normalizeRow(raw: Record<string, unknown>): SyncFailure {
+  const source_id =
+    typeof raw.source_id === 'string' && raw.source_id ? raw.source_id : DEFAULT_SOURCE_ID;
+  const error = String(raw.error ?? '');
+  const code = typeof raw.code === 'string' && raw.code ? raw.code : classifyErrorCode(error);
+  const ts = typeof raw.ts === 'string' && raw.ts ? raw.ts : new Date(0).toISOString();
+  const first_seen =
+    typeof raw.first_seen === 'string' && raw.first_seen ? raw.first_seen : ts;
+  let state: SyncFailureState;
+  if (raw.state === 'open' || raw.state === 'acknowledged' || raw.state === 'auto_skipped') {
+    state = raw.state;
+  } else {
+    state = raw.acknowledged === true || raw.acknowledged_at ? 'acknowledged' : 'open';
+  }
+  const attempts =
+    typeof raw.attempts === 'number' && Number.isFinite(raw.attempts) && raw.attempts > 0
+      ? Math.floor(raw.attempts)
+      : 1;
+  const row: SyncFailure = {
+    ...(typeof raw.managed_cursor_key === 'string' ? { managed_cursor_key: raw.managed_cursor_key,
+      request_id: typeof raw.request_id === 'string' ? raw.request_id : null,
+      run_id: String(raw.run_id ?? ''), observation_id: String(raw.observation_id ?? '') } : {}),
+    source_id,
+    path: String(raw.path ?? ''),
+    error,
+    code,
+    commit: String(raw.commit ?? ''),
+    line: typeof raw.line === 'number' ? raw.line : undefined,
+    first_seen,
+    ts,
+    attempts,
+    ...(typeof raw.infra_isolated_runs === 'number' && raw.infra_isolated_runs > 0 ? { infra_isolated_runs: Math.floor(raw.infra_isolated_runs) } : {}),
+    state,
+    resolved_at:
+      typeof raw.resolved_at === 'string'
+        ? raw.resolved_at
+        : typeof raw.acknowledged_at === 'string'
+          ? raw.acknowledged_at
+          : undefined,
+  };
+  return _applyMirror(row);
+}
+
+/** Merge legacy duplicate rows for one (source_id, path) into a single row. */
+function _mergeGroup(group: SyncFailure[]): SyncFailure {
+  const sorted = [...group].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  const latest = sorted[sorted.length - 1];
+  const first_seen = sorted.reduce(
+    (m, r) => (r.first_seen && r.first_seen < m ? r.first_seen : m),
+    sorted[0].first_seen,
+  );
+  const hasOpen = group.some(r => r.state === 'open');
+  const hasAuto = group.some(r => r.state === 'auto_skipped');
+  const state: SyncFailureState = hasOpen ? 'open' : hasAuto ? 'auto_skipped' : 'acknowledged';
+  // attempts reconstruction: distinct commits is a proxy for distinct runs;
+  // never under-count below the largest recorded attempts.
+  const distinctCommits = new Set(group.map(r => r.commit)).size;
+  const maxAttempts = group.reduce((m, r) => Math.max(m, r.attempts), 0);
+  const attempts = Math.max(distinctCommits, maxAttempts, 1);
+  return _applyMirror({ ...latest, first_seen, state, attempts });
+}
+
+/**
+ * Read the ledger, normalizing every row (backfill source_id/state/attempts/
+ * first_seen) and collapsing duplicate (source_id, path) rows. Skips malformed
+ * lines with a warning. Empty array if the file doesn't exist.
+ */
+export function loadSyncFailures(): SyncFailure[] {
+  const path = syncFailuresPath();
+  if (!_existsSync(path)) return [];
+  const raw = _readFileSync(path, 'utf-8');
+  const rows: SyncFailure[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      rows.push(_normalizeRow(JSON.parse(trimmed) as Record<string, unknown>));
+    } catch {
+      console.warn(`[sync-failures] skipping malformed line: ${trimmed.slice(0, 120)}`);
+    }
+  }
+  const byKey = new Map<string, SyncFailure[]>();
+  for (const r of rows) {
+    const k = _ledgerKey(r);
+    const arr = byKey.get(k);
+    if (arr) arr.push(r);
+    else byKey.set(k, [r]);
+  }
+  const out: SyncFailure[] = [];
+  for (const group of byKey.values()) {
+    out.push(group.length === 1 ? group[0] : _mergeGroup(group));
+  }
+  return out;
+}
+
+/** Unresolved failures (open + auto_skipped). */
+export function unacknowledgedSyncFailures(entries = loadSyncFailures()): SyncFailure[] {
+  return entries.filter(e => e.state !== 'acknowledged');
+}
+
+// ─── Concurrency: cross-process lock + atomic write ──────────────────
+
+function _sleepSync(ms: number): void {
+  // Synchronous sleep without busy-spin; works in Node + Bun.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function _acquireLock(lockPath: string): boolean {
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      _closeSync(_openSync(lockPath, 'wx'));
+      return true;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') return false; // best-effort
+      // Age-based stale break (prefer age over PID liveness, per db-lock learning).
+      try {
+        const st = _statSync(lockPath);
+        if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+          try { _unlinkSync(lockPath); } catch { /* raced; retry */ }
+          continue;
+        }
+      } catch {
+        continue; // lock vanished underfoot; retry acquire
+      }
+      if (Date.now() >= deadline) return false;
+      _sleepSync(LOCK_SPIN_MS);
+    }
+  }
+}
+
+/**
+ * Serialize a read-modify-write of the ledger across processes
+ * (`sync --all`, per-source cron). Falls back to best-effort (no lock) on
+ * acquire timeout so a sync is never deadlocked by a wedged lock holder.
+ */
+export function withLedgerLock<T>(fn: () => T): T {
+  _mkdirSync(_failuresDir(), { recursive: true });
+  const lockPath = syncFailuresPath() + '.lock';
+  const got = _acquireLock(lockPath);
+  if (!got) {
+    console.warn('[sync-failures] could not acquire ledger lock; proceeding best-effort');
+  }
+  try {
+    return fn();
+  } finally {
+    if (got) {
+      try { _unlinkSync(lockPath); } catch { /* already gone */ }
+    }
+  }
+}
+
+function _writeAll(entries: SyncFailure[]): void {
+  _mkdirSync(_failuresDir(), { recursive: true });
+  const target = syncFailuresPath();
+  const tmp = `${target}.tmp-${process.pid}`;
+  const body = entries.map(e => JSON.stringify(e)).join('\n');
+  _writeFileSync(tmp, entries.length ? body + '\n' : '');
+  _renameSync(tmp, target); // atomic on POSIX
+}
+
+// ─── Mutations ───────────────────────────────────────────────────────
+
+/**
+ * Record this run's failures AND clear succeeded paths in ONE locked
+ * transaction. Returns post-state attempts for each failing path.
+ *
+ * Upsert is keyed by (source_id, path) over OPEN rows: an existing open row
+ * increments `attempts` (consecutive); anything else (no row, or an
+ * acknowledged/auto_skipped row) starts a fresh open row at attempts 1 — a
+ * re-failure after a fix is a new streak (#1939 Codex #4).
+ */
+function _recordAndClear(
+  sourceId: string,
+  succeededPaths: string[],
+  failures: Array<{ path: string; error: string; line?: number; code?: string }>,
+  commit: string,
+  run: { systemic?: boolean; isolatedInfra?: boolean } = {},
+): { attempts: Map<string, number>; isolatedInfraRuns: Map<string, number> } {
+  return withLedgerLock(() => {
+    const entries = loadSyncFailures();
+    const byKey = new Map<string, SyncFailure>();
+    for (const e of entries) byKey.set(_ledgerKey(e), e);
+    let mutated = false;
+
+    // Resolve succeeded paths (success fully clears the row — #1939 Codex #4).
+    for (const p of succeededPaths) {
+      if (byKey.delete(_ledgerKey({ source_id: sourceId, path: p }))) mutated = true;
+    }
+
+    const now = new Date().toISOString();
+    for (const f of failures) {
+      const key = _ledgerKey({ source_id: sourceId, path: f.path });
+      const ex = byKey.get(key);
+      const code = f.code ?? classifyErrorCode(f.error, f.path);
+      // GBRA-130 A-18: a systemic run (most files failing) records its
+      // failures but adds no attempt to an open row; an infra code counts
+      // isolated runs only while other files import in the same run.
+      const counted = run.systemic ? 0 : 1;
+      const isolated = isEmbeddingInfraCode(code) && run.isolatedInfra && !run.systemic;
+      if (ex && ex.state === 'open') {
+        ex.attempts += counted;
+        if (isolated) ex.infra_isolated_runs = (ex.infra_isolated_runs ?? 0) + 1;
+        else delete ex.infra_isolated_runs;
+        ex.ts = now;
+        ex.commit = commit;
+        ex.error = f.error;
+        ex.code = code;
+        ex.line = f.line;
+        _applyMirror(ex);
+      } else {
+        byKey.set(
+          key,
+          _applyMirror({
+            source_id: sourceId,
+            path: f.path,
+            error: f.error,
+            code,
+            commit,
+            line: f.line,
+            first_seen: now,
+            ts: now,
+            attempts: 1,
+            ...(isolated ? { infra_isolated_runs: 1 } : {}),
+            state: 'open',
+          }),
+        );
+      }
+      mutated = true;
+    }
+
+    // Skip the write (and avoid creating an empty ledger file) when a clean run
+    // touched nothing — e.g. succeeded paths that had no prior failure rows.
+    if (mutated) _writeAll([...byKey.values()]);
+
+    const attempts = new Map<string, number>();
+    const isolatedInfraRuns = new Map<string, number>();
+    for (const f of failures) {
+      const row = byKey.get(_ledgerKey({ source_id: sourceId, path: f.path }));
+      attempts.set(f.path, row?.attempts ?? 1);
+      isolatedInfraRuns.set(f.path, row?.infra_isolated_runs ?? 0);
+    }
+    return { attempts, isolatedInfraRuns };
+  });
+}
+
+/**
+ * Public single-purpose recorder (no clear). Used by callers outside the
+ * sync gate (e.g. `gbrain import`). Increments attempts like the gate.
+ */
+export function recordFailures(
+  sourceId: string,
+  failures: Array<{ path: string; error: string; line?: number }>,
+  commit: string,
+): void {
+  if (failures.length === 0) return;
+  _recordAndClear(sourceId, [], failures, commit);
+}
+
+/** Remove ledger rows for the given (sourceId, paths) — used on success. */
+export function clearFailures(sourceId: string, paths: string[]): void {
+  if (paths.length === 0) return;
+  withLedgerLock(() => {
+    const entries = loadSyncFailures();
+    const remove = new Set(paths.map(p => _ledgerKey({ source_id: sourceId, path: p })));
+    const kept = entries.filter(e => !remove.has(_ledgerKey(e)));
+    if (kept.length !== entries.length) _writeAll(kept);
+  });
+}
+
+export function mirrorManagedSyncFailure(failure: { source_id: string; path: string; code: string; message: string; target: string | null;
+  cursor_key: string; request_id: string | null; run_id: string; observation_id: string; first_seen: string; attempts: number }): void {
+  withLedgerLock(() => {
+    const entries = loadSyncFailures();
+    const previous = entries.find(row => row.managed_cursor_key === failure.cursor_key);
+    if (previous?.observation_id === failure.observation_id) return;
+    const next = _applyMirror({ source_id: failure.source_id, path: failure.path, code: failure.code, error: failure.message,
+      commit: failure.target ?? '', managed_cursor_key: failure.cursor_key, request_id: failure.request_id, run_id: failure.run_id,
+      observation_id: failure.observation_id, first_seen: failure.first_seen, ts: new Date().toISOString(), attempts: failure.attempts, state: 'open' });
+    _writeAll([...entries.filter(row => row.managed_cursor_key !== failure.cursor_key), next]);
+  });
+}
+
+/** Removes the mirror row(s) under a managed cursor key; true when one was there. */
+export function clearManagedSyncFailure(key: string): boolean {
+  return withLedgerLock(() => {
+    const entries = loadSyncFailures(), kept = entries.filter(row => row.managed_cursor_key !== key);
+    if (kept.length !== entries.length) _writeAll(kept);
+    return kept.length !== entries.length;
+  });
+}
+
+/**
+ * Re-insert previously-cleared rows VERBATIM (attempts, first_seen, ts,
+ * commit, state all preserved) — the undo half of a clear that a
+ * post-clear verification found premature (#3583: the orphan-sentinel
+ * sweep's clear-then-verify restore). Skips any (source_id, path) that
+ * already has a row so it can never double-record or fight a concurrent
+ * re-record. Returns how many rows were actually restored.
+ */
+export function restoreFailures(sourceId: string, rows: SyncFailure[]): number {
+  const mine = rows.filter(r => r.source_id === sourceId);
+  if (mine.length === 0) return 0;
+  return withLedgerLock(() => {
+    const entries = loadSyncFailures();
+    const present = new Set(entries.map(e => _ledgerKey(e)));
+    const missing = mine.filter(r => !present.has(_ledgerKey(r)));
+    if (missing.length > 0) _writeAll([...entries, ...missing]);
+    return missing.length;
+  });
+}
+
+/**
+ * Acknowledge OPEN or AUTO_SKIPPED file failures (human `--skip-failed`).
+ * Scoped to one source when `sourceId` is given (never acks another source
+ * — #1939 Codex #2). Sentinels (`<head>`) are NEVER acknowledged this way.
+ */
+export function acknowledgeFailures(sourceId?: string): AcknowledgeResult {
+  return withLedgerLock(() => {
+    const entries = loadSyncFailures();
+    const now = new Date().toISOString();
+    let changed = 0;
+    const acked: SyncFailure[] = [];
+    for (const e of entries) {
+      if (e.state !== 'open' && e.state !== 'auto_skipped') continue;
+      if (e.managed_cursor_key) continue;
+      if (sourceId !== undefined && e.source_id !== sourceId) continue;
+      if (!isSkippablePath(e.path)) continue;
+      e.state = 'acknowledged';
+      e.resolved_at = now;
+      _applyMirror(e);
+      changed++;
+      acked.push(e);
+    }
+    if (changed > 0) _writeAll(entries);
+    return { count: changed, summary: summarizeFailuresByCode(acked) };
+  });
+}
+
+/**
+ * Mark the given chronic file paths `auto_skipped` (valve fired). Only OPEN,
+ * non-sentinel rows transition. Auto-skipped rows stay UNRESOLVED so doctor
+ * keeps warning until the file imports cleanly or a human acknowledges them.
+ */
+export function autoSkipFailures(sourceId: string, paths: string[], codes: ReadonlyMap<string, string> = new Map()): AcknowledgeResult {
+  if (paths.length === 0) return { count: 0, summary: [] };
+  return withLedgerLock(() => {
+    const entries = loadSyncFailures();
+    const target = new Set(
+      paths.filter(isSkippablePath).map(p => _ledgerKey({ source_id: sourceId, path: p })),
+    );
+    const now = new Date().toISOString();
+    let changed = 0;
+    const skipped: SyncFailure[] = [];
+    for (const e of entries) {
+      if (!target.has(_ledgerKey(e))) continue;
+      if (e.state !== 'open') continue;
+      e.state = 'auto_skipped';
+      e.code = codes.get(e.path) ?? e.code;
+      e.resolved_at = now;
+      _applyMirror(e);
+      changed++;
+      skipped.push(e);
+    }
+    if (changed > 0) _writeAll(entries);
+    return { count: changed, summary: summarizeFailuresByCode(skipped) };
+  });
+}
+
+// ─── Legacy shims (re-exported from sync.ts for existing callers) ─────
+
+/** @deprecated use recordFailures(sourceId, …). Defaults to the host source. */
+export function recordSyncFailures(
+  failures: Array<{ path: string; error: string; line?: number }>,
+  commit: string,
+): void {
+  recordFailures(DEFAULT_SOURCE_ID, failures, commit);
+}
+
+/** @deprecated use acknowledgeFailures(sourceId). Acks ALL sources' open files. */
+export function acknowledgeSyncFailures(): AcknowledgeResult {
+  return acknowledgeFailures(undefined);
+}
+
+// ─── Pure decisions (no side effects — the unit-test surface) ─────────
+
+export interface GateDecision {
+  action: 'hard_block' | 'block' | 'advance' | 'advance_then_autoskip';
+  autoSkipPaths: string[];
+}
+
+/**
+ * #3875: error codes that indicate the EMBEDDING PROVIDER is unhealthy, not
+ * that the file is poison. The bounded auto-skip valve exists to route around
+ * a single bad file; letting it fire on provider-infra failures silently
+ * unindexes an unbounded slice of the brain (every file "fails" while the
+ * provider is down/timing out/rate-limited). These codes always BLOCK the
+ * bookmark instead of auto-skipping — the fix is provider health, not
+ * `--skip-failed`.
+ */
+export const EMBEDDING_INFRA_CODES: ReadonlySet<string> = new Set([
+  'EMBEDDING_TIMEOUT',
+  'EMBEDDING_RATE_LIMIT',
+  'EMBEDDING_QUOTA',
+]);
+
+/** True when `code` names a provider-infra embedding failure (see above). */
+export function isEmbeddingInfraCode(code: string | undefined): boolean {
+  return code !== undefined && EMBEDDING_INFRA_CODES.has(code);
+}
+
+/**
+ * Decide what the sync gate should do, given this run's failures and the
+ * current attempt counts. Pure — the caller executes effects in the safe
+ * order (advance THEN ack, so a crash can't mark a file skipped while the
+ * sync stays wedged — #1939 Codex #5).
+ *
+ *   sentinels present                 → hard_block (ALWAYS, even --skip-failed)
+ *   no file failures                  → advance
+ *   --skip-failed                     → advance (ack handled post-advance)
+ *   valve disabled (threshold<=0)     → block (pure fail-closed) if failures
+ *   any fresh (attempts<threshold)    → block
+ *   any embedding-infra code (#3875)  → block (provider unhealthy ≠ file poison;
+ *                                       never auto-skip, regardless of attempts)
+ *   all chronic (attempts>=threshold) → advance_then_autoskip
+ */
+export function decideGateAction(args: {
+  /** `code` (when provided) is a classifyErrorCode() result — #3875. */
+  fileFailures: Array<{ path: string; code?: string }>;
+  sentinels: Array<{ path: string }>;
+  attemptsByPath: Map<string, number>;
+  threshold: number;
+  skipFailed: boolean;
+  /** A-18: consecutive runs each path failed with an infra code while other files imported. */
+  isolatedInfraRunsByPath?: ReadonlyMap<string, number>;
+  /** A-18: most of this run's files failed (the ItemRun breaker tripped). */
+  systemic?: boolean;
+}): GateDecision {
+  if (args.sentinels.length > 0) return { action: 'hard_block', autoSkipPaths: [] };
+  if (args.fileFailures.length === 0) return { action: 'advance', autoSkipPaths: [] };
+  if (args.skipFailed) return { action: 'advance', autoSkipPaths: [] };
+  if (args.threshold <= 0) return { action: 'block', autoSkipPaths: [] };
+  if (args.systemic) return { action: 'block', autoSkipPaths: [] };
+
+  const chronic: string[] = [];
+  let fresh = 0;
+  for (const f of args.fileFailures) {
+    // #3875: provider-infra failures (embed timeout / rate limit / quota) are
+    // never chronic-eligible — auto-skipping them would silently unindex every
+    // file that happened to sync while the provider was unhealthy. Treat them
+    // as fresh so the gate BLOCKS and the operator fixes the provider.
+    if (isEmbeddingInfraCode(f.code)) {
+      if ((args.isolatedInfraRunsByPath?.get(f.path) ?? 0) >= args.threshold) chronic.push(f.path);
+      else fresh++;
+      continue;
+    }
+    const a = args.attemptsByPath.get(f.path) ?? 1;
+    if (a >= args.threshold) chronic.push(f.path);
+    else fresh++;
+  }
+  if (fresh > 0) return { action: 'block', autoSkipPaths: [] };
+  if (chronic.length > 0) return { action: 'advance_then_autoskip', autoSkipPaths: chronic };
+  return { action: 'block', autoSkipPaths: [] };
+}
+
+export interface SeverityResult {
+  status: 'ok' | 'warn' | 'fail';
+  unresolved: number;
+  open: number;
+  auto_skipped: number;
+}
+
+/**
+ * Decide the `sync_failures` doctor severity from ledger entries. Pure;
+ * `nowMs` is injected for deterministic boundary tests. Both doctor surfaces
+ * (local + remote) call this so they can never drift (#1939 Codex #1).
+ *
+ *   unresolved (open|auto_skipped) == 0      → ok
+ *   oldest OPEN older than failHours, OR
+ *     total unresolved >= 10                 → fail
+ *   else (incl. auto_skipped-only)           → warn (stays visible)
+ *   malformed ts → treated as not-old (never crashes doctor)
+ */
+export function decideSyncFailureSeverity(args: {
+  entries: SyncFailure[];
+  nowMs: number;
+  failHours: number;
+}): SeverityResult {
+  const unresolved = args.entries.filter(
+    e => e.state === 'open' || e.state === 'auto_skipped',
+  );
+  const autoSkipped = unresolved.filter(e => e.state === 'auto_skipped').length;
+  const open = unresolved.length - autoSkipped;
+  if (unresolved.length === 0) {
+    return { status: 'ok', unresolved: 0, open: 0, auto_skipped: 0 };
+  }
+  let oldestOpenMs = Infinity;
+  for (const e of unresolved) {
+    if (e.state !== 'open') continue;
+    const ms = Date.parse(e.ts);
+    if (Number.isFinite(ms)) oldestOpenMs = Math.min(oldestOpenMs, ms);
+  }
+  const blockedTooLong =
+    Number.isFinite(oldestOpenMs) && args.nowMs - oldestOpenMs > args.failHours * 3_600_000;
+  // FAIL keys off OPEN (blocking) failures only — many open, or one blocking the
+  // bookmark past the fail cadence. `auto_skipped` rows already advanced the
+  // bookmark (indexing is NOT wedged) so they stay WARN-visible regardless of
+  // count, matching the state-machine contract. (#1939 adversarial finding #3.)
+  const status: 'warn' | 'fail' = open >= 10 || blockedTooLong ? 'fail' : 'warn';
+  return { status, unresolved: unresolved.length, open, auto_skipped: autoSkipped };
+}
+
+// ─── Shared gate orchestrator (incremental + full sync) ──────────────
+
+export interface SyncGateInput {
+  sourceId: string;
+  /** All per-file failures this run, including sentinels like `<head>`; `code` is the import path's structured code (A-18). */
+  failedFiles: Array<{ path: string; error: string; line?: number; code?: string }>;
+  /** File paths that imported successfully this run (clears their rows). */
+  succeededPaths: string[];
+  /** Pin commit the run drained to (stamped on recorded failures). */
+  commit: string;
+  skipFailed: boolean;
+  threshold?: number;
+  /** GBRA-130 A-18: files that imported this run; an infra failure while others import counts toward EMBEDDING_INFRA_ISOLATED. */
+  imported?: number;
+  /** GBRA-130 A-18: most of this run's files failed (ItemRun breaker): record failures, count no attempt, auto-skip nothing. */
+  systemic?: boolean;
+  /** Advances the bookmark + clears checkpoints. Awaited BEFORE any ack. */
+  advance: () => Promise<void> | void;
+}
+
+export interface SyncGateOutcome {
+  advanced: boolean;
+  sentinelBlocked: boolean;
+  fresh: number;
+  chronic: number;
+  autoSkipped: string[];
+  acknowledged: number;
+}
+
+/**
+ * The one gate both sync paths share (#1939 Codex #6). Records/clears the
+ * ledger under a single lock, decides, then on advance runs `advance()`
+ * FIRST and only marks auto_skipped/acknowledged afterwards (#1939 Codex #5).
+ */
+export async function applySyncFailureGate(input: SyncGateInput): Promise<SyncGateOutcome> {
+  const threshold = input.threshold ?? resolveAutoSkipThreshold();
+  const sentinels = input.failedFiles.filter(f => !isSkippablePath(f.path));
+  const fileFailures = input.failedFiles.filter(f => isSkippablePath(f.path));
+
+  // Fast path: clean run touched no failures and no successes — nothing to
+  // reconcile in the ledger, just advance.
+  if (input.failedFiles.length === 0 && input.succeededPaths.length === 0) {
+    await input.advance();
+    return {
+      advanced: true,
+      sentinelBlocked: false,
+      fresh: 0,
+      chronic: 0,
+      autoSkipped: [],
+      acknowledged: 0,
+    };
+  }
+
+  const codes = fileFailures.map(f => ({ path: f.path, code: f.code ?? classifyErrorCode(f.error, f.path) }));
+  const infraFailures = codes.filter(f => isEmbeddingInfraCode(f.code)).length;
+  const { attempts: attemptsByPath, isolatedInfraRuns } = _recordAndClear(
+    input.sourceId,
+    input.succeededPaths,
+    input.failedFiles,
+    input.commit,
+    { systemic: input.systemic, isolatedInfra: (input.imported ?? 0) > infraFailures },
+  );
+
+  const decision = decideGateAction({
+    // #3875: thread the classified error code so provider-infra failures
+    // (embed timeout / rate limit / quota) can never ride the auto-skip valve.
+    fileFailures: codes,
+    sentinels,
+    attemptsByPath,
+    threshold,
+    skipFailed: input.skipFailed,
+    isolatedInfraRunsByPath: isolatedInfraRuns,
+    systemic: input.systemic,
+  });
+
+  let fresh = 0;
+  let chronic = 0;
+  for (const f of fileFailures) {
+    if ((attemptsByPath.get(f.path) ?? 1) >= threshold && threshold > 0 && !input.systemic) chronic++;
+    else fresh++;
+  }
+
+  if (decision.action === 'hard_block' || decision.action === 'block') {
+    return {
+      advanced: false,
+      sentinelBlocked: decision.action === 'hard_block',
+      fresh,
+      chronic,
+      autoSkipped: [],
+      acknowledged: 0,
+    };
+  }
+
+  // ATOMICITY: advance the bookmark BEFORE marking anything skipped/acked.
+  await input.advance();
+
+  let autoSkipped: string[] = [];
+  let acknowledged = 0;
+  if (input.skipFailed) {
+    acknowledged = acknowledgeFailures(input.sourceId).count;
+  } else if (decision.action === 'advance_then_autoskip') {
+    autoSkipped = decision.autoSkipPaths;
+    const isolatedInfra = new Map(codes.filter(f => isEmbeddingInfraCode(f.code)).map(f => [f.path, 'EMBEDDING_INFRA_ISOLATED']));
+    autoSkipFailures(input.sourceId, autoSkipped, isolatedInfra);
+  }
+
+  return {
+    advanced: true,
+    sentinelBlocked: false,
+    fresh,
+    chronic,
+    autoSkipped,
+    acknowledged,
+  };
+}

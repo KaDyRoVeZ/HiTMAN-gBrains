@@ -1,0 +1,688 @@
+import { readProjectionSnapshot, installPageEmbeddings } from './page-state/projections.ts';
+import { prepareEmbeddingProjections, countArchivedEmbeddingWork } from './embedding-readiness.ts';
+import { readContentChunksEmbeddingDim } from './embedding-dim-check.ts';
+/**
+ * Stale-chunk embedding loop, extracted from `src/commands/embed.ts:embedAllStale`
+ * for reuse by the v0.40 `embed-backfill` Minion handler (D15.2 — codex
+ * outside-voice catch).
+ *
+ * Single source of truth for the cursor-paginated, source-grouped, rate-limit-
+ * aware embedding pipeline. Both `gbrain embed --stale` (CLI) and the
+ * `embed-backfill` job (Minion) call this helper so the working machinery
+ * — keyset pagination, batch grouping by `source_id::slug`, merge-with-existing
+ * via `getChunks` + `upsertChunks`, AbortSignal threading into in-flight HTTPs,
+ * 429 backoff — lives in exactly one place.
+ *
+ * Why a separate file (vs. exporting from embed.ts): embed.ts is a CLI command
+ * with logging side-effects and EmbedResult-shaped aggregation. The handler
+ * needs a tighter functional surface (returns embedded count + done state, no
+ * console.log). Extracting kept embed.ts's outer flow intact while letting the
+ * handler call a clean primitive.
+ */
+
+import type { BrainEngine } from './engine.ts';
+import type { Chunk, ChunkInput, StaleChunkRow } from './types.ts';
+import { embedBatchWithBackoff, restampIfDemotedToTitleTier } from './embed-retry.ts';
+import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
+import { healOversizedPageChunks, healedChunksToStaleRows } from './embed-oversize-heal.ts';
+import { healAndReportOverLength } from './embed-overlength-heal.ts';
+import { hasSignatureDrift, invalidateStaleSignatureEmbeddingsGuarded, splitEmbeddingSignature, currentSpaceChunkPredicate } from './embedding-invalidation.ts';
+import {
+  resolveActiveEmbeddingColumnFromEngine,
+  quoteIdentifier,
+} from './search/embedding-column.ts';
+import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
+import { resolveStaleEmbedConcurrency } from './embed-concurrency.ts';
+import { AbortError } from './abort-check.ts';
+import { contentDriftSweepLine, runContentDriftSweep, type ContentDriftSweepStatus } from './content-drift-sweep.ts';
+import { meterPageBatch, spendGrant } from './page-embedding-budget.ts';
+import { acquirePageEmbeddingLease, stillPendingChunks } from './page-embedding-lease.ts';
+import { chunkGenerationFilter, chunkVisibleFilter } from './search/safe-chunks.ts';
+import { embedSegmentedPage, embedSegmentedRows, readSegmentedEmbedPage, type SegmentedEmbedOpts } from './page-body/segmented-embedding.ts';
+
+/**
+ * W0 fix-wave (Tier-1 #3, CONFIRMED): the ONE carry-through field list for
+ * re-embed upserts. upsertChunks writes these columns as EXCLUDED.<col>
+ * (overwrite, not COALESCE), so any re-embed path that omits a field resets
+ * it — omitting `modality` flipped every image chunk to modality='text',
+ * silently zeroing the image search arm (filter `cc.modality = 'image'`).
+ * Pre-fix this list existed twice: here (correct, with modality) and in
+ * commands/embed.ts preserveCodeMetadata (missing modality — the bug). Both
+ * consumers now share THIS list; embedding_image is deliberately NOT carried
+ * (the upsert COALESCEs it, and getChunks returns the pgvector as a string
+ * which upsertChunks would mis-serialize).
+ */
+export function carryChunkMetadata(
+  loaded: Pick<Partial<Chunk>,
+    'modality' | 'language' | 'symbol_name' | 'symbol_type' | 'start_line'
+    | 'end_line' | 'parent_symbol_path' | 'doc_comment' | 'symbol_name_qualified'>,
+  base: ChunkInput,
+): ChunkInput {
+  return {
+    ...base,
+    modality: loaded.modality ?? undefined,
+    language: loaded.language ?? undefined,
+    symbol_name: loaded.symbol_name ?? undefined,
+    symbol_type: loaded.symbol_type ?? undefined,
+    start_line: loaded.start_line ?? undefined,
+    end_line: loaded.end_line ?? undefined,
+    parent_symbol_path: loaded.parent_symbol_path ?? undefined,
+    doc_comment: loaded.doc_comment ?? undefined,
+    symbol_name_qualified: loaded.symbol_name_qualified ?? undefined,
+  };
+}
+
+/** Last visited (page_id, chunk_index) for keyset-resume across runs. */
+export interface StaleCursor {
+  afterPageId: number;
+  afterChunkIndex: number;
+}
+
+export interface EmbedStaleOpts {
+  /** Chunks per cursor page. Default 2000 (matches the legacy CLI default). */
+  batchSize?: number;
+  /** Max parallel slug-keys embedded inside a single batch. Default: half the engine pool, at most 20 (`resolveStaleEmbedConcurrency`, #5902). */
+  concurrency?: number;
+  /** Resume cursor from a prior run. Default: from start. */
+  cursor?: StaleCursor;
+  /** AbortSignal honored at three sites: batch claim, retry sleep, HTTP body. */
+  signal?: AbortSignal;
+  deadline?: number;
+  assertOwned?: (tx?: BrainEngine) => Promise<void>;
+  /**
+   * Fired once per batch with the cursor after that batch finishes. Caller
+   * uses this for crash-resumable progress (Minion `job.updateProgress`).
+   */
+  onProgress?: (state: {
+    embedded: number;
+    chunksProcessed: number;
+    cursor: StaleCursor;
+  }) => void;
+  /**
+   * Optional caller-supplied embed fn. Defaults to `embedBatchWithBackoff`.
+   * Test seam: lets unit tests inject a deterministic fake without mocking
+   * the gateway. Production callers leave it unset.
+   */
+  embedFn?: (texts: string[], opts: { abortSignal?: AbortSignal }) => Promise<Float32Array[]>;
+  /**
+   * v0.41.31: current embedding provenance signature (`<provider:model>:<dims>`).
+   * When set, embeddings stamped under a DIFFERENT signature are invalidated
+   * (NULLed) at the start so they flow through the NULL cursor and get
+   * re-embedded; each page's signature is stamped after its chunks land.
+   * Omit to keep the legacy `embedding IS NULL`-only behavior.
+   */
+  embeddingSignature?: string;
+  /**
+   * DB-contention pacer (paced-backfill). When enabled it (a) supplies the
+   * worker count via the caller passing `concurrency = bundle.maxConcurrency`
+   * — E-1: no separate permit on this single-pool path — and (b) the loop
+   * `observe()`s its DB-op latency and `pace()`s between keys. Omit (or pass a
+   * disabled bundle) for a no-op. The pacer is NEVER used to acquire permits
+   * here; concurrency is the worker count.
+   */
+  pacer?: DbPacer;
+}
+
+export interface EmbedStaleResult {
+  blocked?: number;
+  remaining?: number;
+  failures?: number;
+  complete?: boolean;
+  /** Chunks newly embedded in this call. */
+  embedded: number;
+  /** Total chunks pulled across all batches (including ones that errored). */
+  chunksProcessed: number;
+  /** Pages whose embeddings landed. */
+  pagesProcessed: number;
+  /**
+   * #4283: chunks whose embeddings THIS run set to NULL (signature drift +
+   * content drift). Callers use `invalidated > 0 && embedded === 0` as the
+   * mass-null-without-replacement failure signal.
+   */
+  invalidated: number;
+  /**
+   * #4283: set when signature-drifted chunks existed but the pre-invalidation
+   * embedder probe failed, so nothing was NULLed. The run degrades to
+   * NULL-embedding-only staleness instead of destroying working vectors.
+   */
+  invalidationSkipped?: 'embedder_probe_failed';
+  /** #7117: this run's content-drift sweep (core/content-drift-sweep.ts); its invalidations are in `invalidated`. */
+  contentDrift?: ContentDriftSweepStatus;
+  /** Last cursor reached. null iff zero stale chunks existed at start. */
+  lastCursor: StaleCursor | null;
+  /** True iff the loop exited because every stale chunk was processed. */
+  done: boolean;
+  /** True iff the loop exited because `signal.aborted` fired. */
+  aborted: boolean;
+}
+
+/** Per-drain stamp context: the signature plus the registry-active column
+ *  it is judged against. Resolved ONCE per drain by `resolveProvenanceStamp`
+ *  — resolving inside the stamp helper cost a config round-trip per stamped
+ *  page per batch, from both keyset drains. */
+export interface ProvenanceStamp { signature: string; column: string }
+
+/** Undefined when no signature is known (gateway unconfigured): nothing to stamp. */
+export async function resolveProvenanceStamp(
+  engine: BrainEngine,
+  signature: string | undefined,
+): Promise<ProvenanceStamp | undefined> {
+  if (!signature) return undefined;
+  const column = (await resolveActiveEmbeddingColumnFromEngine(engine, { fallbackToLegacy: true })).name;
+  return { signature, column };
+}
+
+/**
+ * Stamp `pages.embedding_signature` once EVERY chunk on the page carries an
+ * active-column vector written by the signature's model against the CURRENT
+ * chunk_text (`embedded_text_hash = md5(chunk_text)`) at the signature's vector
+ * width. Judged from DB state,
+ * not from the caller's batch: `listStaleChunks` pages by ROW with no page
+ * alignment, so a page straddling a batch boundary is never wholly in one
+ * batch — the batch that lands its last chunk stamps it here. A partially
+ * stale page whose preserved chunks carry another model (or a NULL model or
+ * hash) stays unstamped. Both keyset drains (`embed --stale` and the minion
+ * `embed-backfill` handler via `embedStaleForSource`) route through this.
+ * Returns whether the stamp landed.
+ */
+export async function stampIfPageProvenanceComplete(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+  { signature, column }: ProvenanceStamp,
+): Promise<boolean> {
+  return engine.transaction(async tx => {
+    await tx.lockPageKeys([{ sourceId, slug }]);
+    // Signature is `<provider:model>:<dims>`; the model part is what
+    // upsertChunks records in content_chunks.model.
+    const { model, dims } = splitEmbeddingSignature(signature);
+    const colId = quoteIdentifier(column);
+    const rows = await tx.executeRaw<{ complete: boolean }>(
+      `SELECT count(*) > 0
+              AND bool_and(${currentSpaceChunkPredicate(colId, 1, 4)}) AS complete
+         FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+        WHERE p.slug = $2 AND p.source_id = $3 AND ${chunkVisibleFilter('p', 'cc')}
+          AND EXISTS (SELECT 1 FROM sources s WHERE s.id=p.source_id AND NOT s.archived)`,
+      [model, slug, sourceId, dims],
+    );
+    if (rows[0]?.complete !== true) return false;
+    await tx.setPageEmbeddingSignature(slug, { sourceId, signature });
+    return true;
+  });
+}
+
+/** Probe input for `probeEmbedder`. Exported so tests can detect probe calls. */
+export const EMBED_PROBE_TEXT = 'gbrain embedder preflight probe';
+
+/**
+ * #4283: live embedder health check, run BEFORE any signature-drift
+ * invalidation NULLs working vectors. A misresolved worker config (e.g. a
+ * temp GBRAIN_HOME resolving the compile-time default model with no API key)
+ * yields a signature that mismatches 100% of the corpus AND an embedder that
+ * cannot write a single vector — pre-probe, that combination stripped every
+ * embedding and reported success. The probe embeds one short string; when
+ * `signature` carries a parseable trailing `:<dims>`, the returned vector
+ * must match it (a wrong-dims vector would fail every upsert AFTER the
+ * NULLing). Any throw or malformed result → false.
+ */
+export async function probeEmbedder(
+  embedFn: (texts: string[], opts: { abortSignal?: AbortSignal }) => Promise<Float32Array[]>,
+  signature?: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    const vecs = await embedFn([EMBED_PROBE_TEXT], { abortSignal: signal });
+    const vec = vecs?.[0];
+    if (vecs.length !== 1 || !vec || vec.length === 0 || !vec.every(Number.isFinite)) return false;
+    const dims = signature ? Number(signature.split(':').pop()) : NaN;
+    if (Number.isFinite(dims) && dims > 0 && vec.length !== dims) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Embed every stale chunk (embedding IS NULL) for a source.
+ *
+ * Re-entrancy contract: if interrupted, the next call resumes from the next
+ * stale row. Idempotent — `embedding IS NULL` predicate naturally excludes
+ * already-embedded chunks even without cursor persistence. The cursor is a
+ * progress optimization, not a correctness mechanism.
+ *
+ * Returns when:
+ *   - every stale chunk has been embedded (`done: true`), OR
+ *   - `signal.aborted` fired (`aborted: true`), OR
+ *   - the per-batch `embedFn` threw with the signal aborted (treated as abort).
+ *
+ * Per-page embed failures (network blip, dim mismatch) do NOT throw — the
+ * embedding stays NULL and the next call retries the chunk. This matches the
+ * existing CLI's "log + skip" semantics so a single bad page doesn't poison
+ * the run. Caller is responsible for surfacing partial-success via the
+ * returned `embedded` vs `chunksProcessed` delta.
+ */
+
+/**
+ * #4216 phase-end closure: embed the NULL-embedding chunks of an EXPLICIT
+ * page list (pages a synthesis phase just wrote with deferEmbeds).
+ * Deliberately NOT a source-wide sweep: no cursor walk over the backlog, no
+ * global signature-invalidation pass (both belong to the budget-tracked
+ * embed-backfill job) — the spend here is exactly the deferred cost of the
+ * caller's own writes. Per-page mechanics mirror embedStaleForSource's
+ * worker: stored-CR-mode wrapping, metadata carry, full-restale signature
+ * stamp, title-tier restamp.
+ */
+/**
+ * Wave B: when the batch's page is segmented, embed these rows by keyset
+ * (`embedSegmentedRows`, never through its body or every chunk), stamp the
+ * page's provenance when it is complete, and return true; false for an inline page.
+ */
+async function embedSegmentedStaleRows(engine: BrainEngine, stale: readonly StaleChunkRow[], result: { embedded: number; pagesProcessed: number },
+  opts: Omit<SegmentedEmbedOpts, 'beforeInstall'> & { stamp?: ProvenanceStamp; pacer: DbPacer; assertOwned?: (tx?: BrainEngine) => Promise<void>; stopped: () => boolean }): Promise<boolean> {
+  const page = await observed(opts.pacer, () => readSegmentedEmbedPage(engine, { id: stale[0]!.page_id }));
+  if (!page) return false;
+  const installed = (await embedSegmentedRows(engine, page, stale, { ...opts,
+    beforeInstall: async tx => { await opts.assertOwned?.(tx); if (opts.stopped()) throw new AbortError(); } }))?.installed;
+  if (opts.stamp && installed) await stampIfPageProvenanceComplete(engine, page.slug, page.source_id, opts.stamp);
+  result.embedded += installed ?? 0;
+  if (installed) result.pagesProcessed += 1;
+  return true;
+}
+
+export async function embedStalePages(
+  engine: BrainEngine,
+  slugs: string[],
+  sourceId: string,
+  opts: {
+    signal?: AbortSignal;
+    embedFn?: (texts: string[], o: { abortSignal?: AbortSignal }) => Promise<Float32Array[]>;
+    embeddingSignature?: string;
+  } = {},
+): Promise<{ embedded: number; pagesProcessed: number; aborted: boolean }> {
+  const embedFn = opts.embedFn ?? (async (texts: string[], fnOpts: { abortSignal?: AbortSignal }) =>
+    embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }));
+  const result = { embedded: 0, pagesProcessed: 0, aborted: false };
+  // S2: stale = NULL in the registry-ACTIVE column (the one upsertChunks
+  // writes) — the literal legacy `embedding` stays NULL forever on a
+  // registry-routed brain, which would re-embed every chunk on every phase
+  // end. Resolved once per call; fallback keeps the per-page log+skip
+  // contract (a broken registry surfaces at the upsert, loudly).
+  const staleColId = quoteIdentifier(
+    (await resolveActiveEmbeddingColumnFromEngine(engine, { fallbackToLegacy: true })).name,
+  );
+  for (const slug of slugs) {
+    if (opts.signal?.aborted) {
+      result.aborted = true;
+      return result;
+    }
+    try {
+      const segmented = await readSegmentedEmbedPage(engine, { sourceId, slug });
+      if (segmented) {
+        const page = await embedSegmentedPage(engine, segmented, { embedFn, signal: opts.signal, signature: opts.embeddingSignature });
+        const stamp = page.complete ? await resolveProvenanceStamp(engine, opts.embeddingSignature) : undefined;
+        if (stamp) await stampIfPageProvenanceComplete(engine, slug, sourceId, stamp);
+        result.embedded += page.embedded;
+        if (page.embedded) result.pagesProcessed += 1;
+        continue;
+      }
+      const [page] = await engine.executeRaw<{ id: number }>('SELECT id FROM pages WHERE source_id = $1 AND slug = $2 AND deleted_at IS NULL', [sourceId, slug]);
+      if (!page) continue;
+      await using lease = await acquirePageEmbeddingLease(engine, page.id, { signal: opts.signal });
+      if (lease.busy) continue;
+      // SUP-3874: split legacy oversized rows before embedding so a single
+      // pre-cap chunk cannot permanently fail the page.
+      await healOversizedPageChunks(engine, slug, { sourceId });
+      const prepared = await readProjectionSnapshot(engine, slug, sourceId, { requireLiveSource: true });
+      if (!prepared || prepared.snapshot.page.id !== page.id) continue;
+      const existing = prepared.chunks;
+      const staleIdx = new Set(
+        (await engine.executeRaw<{ chunk_index: number }>(
+          `SELECT cc.chunk_index
+             FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+            WHERE p.slug = $1 AND p.source_id = $2 AND cc.${staleColId} IS NULL AND ${chunkGenerationFilter('p', 'cc')}
+            ORDER BY cc.chunk_index`,
+          [slug, sourceId],
+        )).map(r => r.chunk_index),
+      );
+      if (staleIdx.size === 0) continue;
+      const pageRow = prepared.snapshot.page;
+      const metered = await meterPageBatch(engine, pageRow, existing.filter(c => staleIdx.has(c.chunk_index)), { signature: opts.embeddingSignature ?? null });
+      if (!metered) continue;
+      const stale = metered.chunks;
+      const embeddings = await spendGrant(metered.grant, () => embedFn(
+        wrapChunkTextsForStoredMode(pageRow, stale),
+        { abortSignal: opts.signal },
+      ));
+      const staleIdxToEmbedding = new Map<number, Float32Array>();
+      for (let j = 0; j < stale.length; j++) {
+        staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
+      }
+      const merged: ChunkInput[] = existing.map((c) => carryChunkMetadata(c, {
+        chunk_index: c.chunk_index,
+        chunk_text: c.chunk_text,
+        chunk_source: c.chunk_source,
+        embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
+        token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
+      }));
+      const install = await engine.transaction(async tx => {
+        await lease.assertHeld(tx);
+        const installed = await installPageEmbeddings(tx, prepared, merged,
+          opts.embeddingSignature && stale.length === existing.length ? opts.embeddingSignature : undefined);
+        if (stale.length === existing.length && installed.complete) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, sourceId);
+        return installed;
+      });
+      if (!install.complete && install.installed === 0) continue;
+      result.embedded += install.installed;
+      result.pagesProcessed += 1;
+    } catch (e) {
+      if (opts.signal?.aborted) {
+        result.aborted = true;
+        return result;
+      }
+      process.stderr.write(`\n  [embed-stale] error on ${sourceId}/${slug}: ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+  }
+  return result;
+}
+
+export async function embedStaleForSource(
+  engine: BrainEngine,
+  sourceId: string,
+  opts: EmbedStaleOpts = {},
+): Promise<EmbedStaleResult> {
+  const batchSize = opts.batchSize ?? 2000;
+  const concurrency = opts.concurrency ?? resolveStaleEmbedConcurrency(engine);
+  const signal = opts.signal;
+  const embedFn = opts.embedFn ?? ((texts, fnOpts) =>
+    embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }));
+  // Defaulted no-op when pacing is off, so the observe()/pace() call sites
+  // below are unconditional and cost ~nothing on the unpaced path.
+  const pacer = opts.pacer ?? createNoopPacer();
+
+  let afterPageId = opts.cursor?.afterPageId ?? 0;
+  let afterChunkIndex = opts.cursor?.afterChunkIndex ?? -1;
+
+  const result: EmbedStaleResult = {
+    embedded: 0,
+    chunksProcessed: 0,
+    pagesProcessed: 0,
+    invalidated: 0,
+    lastCursor: null,
+    done: false,
+    aborted: false,
+  };
+  const signature = opts.embeddingSignature;
+  const stopped = () => !!signal?.aborted || Date.now() >= (opts.deadline ?? Infinity);
+  if (stopped()) return { ...result, aborted: true };
+  await opts.assertOwned?.();
+  if (stopped()) return { ...result, aborted: true };
+  const archivedWork = await countArchivedEmbeddingWork(engine, { sourceId, signature });
+  if (archivedWork) return { ...result, blocked: archivedWork, failures: archivedWork, complete: false, done: true,
+    remaining: await engine.countStaleChunks({ sourceId, ...(signature && { signature }) }) };
+  const readinessOptions = { sourceId, existingChunksOnly: true, activeSourcesOnly: true, stale: { signature }, signal,
+    deadline: opts.deadline, assertOwned: opts.assertOwned };
+  let readiness = await prepareEmbeddingProjections(engine, readinessOptions);
+  if (stopped()) return { ...result, aborted: true };
+  if (readiness.blocked) {
+    await opts.assertOwned?.();
+    if (stopped()) return { ...result, aborted: true };
+    const probeOk = await probeEmbedder(embedFn, signature, signal);
+    if (stopped()) return { ...result, aborted: true };
+    await opts.assertOwned?.();
+    if (!probeOk) {
+      return { ...result, blocked: readiness.blocked, complete: false, done: true,
+        remaining: await engine.countStaleChunks({ sourceId }), invalidationSkipped: 'embedder_probe_failed' };
+    }
+    readiness = await prepareEmbeddingProjections(engine, { ...readinessOptions, repair: true });
+    if (stopped()) return { ...result, aborted: true };
+  }
+  // #6223: pages still waiting for a projection never block the rest of the
+  // source; the drain skips their unsealed snapshots and the result stays
+  // incomplete with them counted in `blocked`.
+  const projectionBlocked = readiness.blocked;
+  const stamp = await resolveProvenanceStamp(engine, signature); // column resolved once per drain, not per page
+  if (stopped()) return { ...result, aborted: true };
+  await opts.assertOwned?.();
+
+  // v0.41.31: invalidate embeddings stamped under a prior model signature so
+  // the NULL cursor below re-embeds them. GRANDFATHER: NULL signature
+  // untouched. Best-effort — a failure here must not abort the backfill.
+  //
+  // #4283: NULLing is conditional on a WORKING embedder. The drift pre-check
+  // (one page-first EXISTS; probe only fires when drift exists) keeps the probe's
+  // one embed call off the no-drift common path; a failed probe skips the
+  // invalidation entirely so a misresolved worker can't strip a corpus it
+  // can never re-embed.
+  if (signature) {
+    try {
+      // One page-first EXISTS: no chunk count before the probe, so a large drifted corpus cannot time the pre-check out (#7117 follow-up).
+      if (await hasSignatureDrift(engine, { signature, sourceId })) {
+        await opts.assertOwned?.();
+        if (stopped()) return { ...result, aborted: true };
+        const probeOk = await probeEmbedder(embedFn, signature, signal);
+        if (stopped()) return { ...result, aborted: true };
+        await opts.assertOwned?.();
+        if (probeOk) {
+          // #4306: guarded wrapper — never NULL embed_skip pages the stale
+          // selectors below can't re-embed.
+          result.invalidated += opts.assertOwned ? await engine.transaction(async tx => {
+            await opts.assertOwned!(tx);
+            if (stopped()) throw new AbortError();
+            const invalidated = await invalidateStaleSignatureEmbeddingsGuarded(tx, { signature, sourceId });
+            await opts.assertOwned!(tx);
+            if (stopped()) throw new AbortError();
+            return invalidated;
+          }) : await invalidateStaleSignatureEmbeddingsGuarded(engine, { signature, sourceId });
+        } else {
+          result.invalidationSkipped = 'embedder_probe_failed';
+          process.stderr.write(
+            `\n  [embed-stale] embedded chunk(s) drifted from signature ${signature} but the embedder probe failed — ` +
+            `SKIPPING invalidation (existing vectors preserved). Check embedding provider config/credentials.\n`,
+          );
+        }
+      }
+    } catch {
+      if (stopped()) return { ...result, aborted: true };
+      await opts.assertOwned?.();
+      // Non-fatal: fall through to the NULL-only stale loop.
+    }
+  }
+
+  // #4246: invalidate chunks whose embedding was computed from a PREVIOUS
+  // chunk_text revision (embedded_text_hash <> md5(chunk_text)) so content
+  // edits flow through the NULL cursor. NOT probe-gated: the blast radius is
+  // bounded by real content edits (config-independent, unlike signature
+  // drift) and those vectors point at stale text either way. NULL hash
+  // (pre-v133 rows) is grandfathered.
+  // #7117: bounded batches with a saved cursor (core/content-drift-sweep.ts).
+  // A failed batch is reported in the result and on stderr, not thrown, and
+  // the NULL-only loop still runs; a lost lease propagates.
+  if (stopped()) return { ...result, aborted: true };
+  const sweep = await runContentDriftSweep(engine, {
+    sourceId, signal, deadline: opts.deadline, stopped,
+    assertOwned: opts.assertOwned,
+  });
+  result.contentDrift = sweep;
+  result.invalidated += sweep.drifted;
+  if (sweep.state === 'failed') process.stderr.write(`\n  [embed-stale] ${contentDriftSweepLine(sweep, true)}\n`);
+  if (stopped()) return { ...result, aborted: true };
+
+  for (;;) {
+    if (stopped()) {
+      result.aborted = true;
+      return result;
+    }
+
+    const batch = await observed(pacer, () =>
+      engine.listStaleChunks({
+        batchSize,
+        afterPageId,
+        afterChunkIndex,
+        sourceId,
+      }),
+    );
+    if (batch.length === 0) {
+      const blocked = await countArchivedEmbeddingWork(engine, { sourceId, signature });
+      if (blocked) { result.blocked = blocked; result.failures = (result.failures ?? 0) + blocked; }
+      if (projectionBlocked) result.blocked = (result.blocked ?? 0) + projectionBlocked;
+      const remaining = await engine.countStaleChunks({ sourceId, ...(signature && { signature }) });
+      if (remaining || result.chunksProcessed || result.blocked) {
+        result.remaining = remaining;
+        result.complete = remaining === 0 && !result.blocked;
+      }
+      result.done = true;
+      return result;
+    }
+
+    result.chunksProcessed += batch.length;
+    const last = batch[batch.length - 1];
+    afterPageId = last.page_id;
+    afterChunkIndex = last.chunk_index;
+    result.lastCursor = { afterPageId, afterChunkIndex };
+
+    // Group by composite key (source_id::slug). Within a source-scoped run
+    // every row carries the same source_id, but the helper accepts batches
+    // shaped by `listStaleChunks` which carry source_id per row for parity
+    // with the cross-source CLI path.
+    const byKey = new Map<string, typeof batch>();
+    for (const row of batch) {
+      const key = `${row.source_id}::${row.slug}`;
+      const list = byKey.get(key);
+      if (list) list.push(row);
+      else byKey.set(key, [row]);
+    }
+
+    const keys = Array.from(byKey.keys());
+    let nextIdx = 0;
+
+    async function embedOneKey(key: string): Promise<void> {
+      let stale = byKey.get(key)!;
+      const keySourceId = stale[0]?.source_id ?? sourceId;
+      const slug = stale[0].slug;
+      try {
+        await opts.assertOwned?.();
+        if (stopped() || await embedSegmentedStaleRows(engine, stale, result, { embedFn, signal, signature, stamp, pacer, assertOwned: opts.assertOwned, stopped })) return;
+        await using lease = await acquirePageEmbeddingLease(engine, stale[0].page_id, { signal, deadline: opts.deadline });
+        if (lease.busy) return;
+        // SUP-3874: split legacy oversized chunk_text before embedding.
+        const healed = await observed(pacer, () => engine.transaction(async tx => {
+          await opts.assertOwned?.(tx);
+          if (stopped()) throw new AbortError();
+          const healed = await healOversizedPageChunks(tx, slug, { sourceId: keySourceId });
+          await opts.assertOwned?.(tx);
+          if (stopped()) throw new AbortError();
+          return healed;
+        }));
+        if (healed.changed) {
+          stale = healedChunksToStaleRows(healed.chunks, slug, keySourceId);
+          if (stale.length === 0) {
+            result.pagesProcessed += 1;
+            return;
+          }
+        }
+
+        // #3507: fetch the page row for its title + stored CR mode so the
+        // re-embed reproduces the page's wrapping convention instead of
+        // silently stripping contextual prefixes (mirrors
+        // src/commands/embed.ts:embedAllStale).
+        const prepared = await observed(pacer, () => readProjectionSnapshot(engine, slug, keySourceId, { requireLiveSource: true }));
+        if (!prepared) return;
+        const selected = new Map(stale.map(c => [c.chunk_index, c]));
+        const existing = prepared.chunks;
+        stale = stillPendingChunks(existing, selected);
+        if (!stale.length) return;
+        const pageRow = prepared.snapshot.page;
+        const metered = await meterPageBatch(engine, pageRow, existing.filter(c => !c.embedded_at), { signature });
+        if (!metered) return;
+        if (metered.grant) stale = metered.chunks.map(c => ({ ...(selected.get(c.chunk_index) ?? { source_id: keySourceId, slug, page_id: pageRow.id }), ...c }));
+        await opts.assertOwned?.();
+        if (stopped()) return;
+        const embeddings = await spendGrant(metered.grant, () => embedFn(wrapChunkTextsForStoredMode(pageRow, stale), { abortSignal: signal }));
+        if (stopped()) return;
+        const dimensions = signature ? splitEmbeddingSignature(signature).dims
+          : prepared.embeddingColumn.name === 'embedding' ? (await readContentChunksEmbeddingDim(engine)).dims : prepared.embeddingColumn.dimensions;
+        if (embeddings.length !== stale.length || embeddings.some(v => !v || v.length !== dimensions || !v.every(Number.isFinite))) {
+          throw new Error('Embedding provider returned an incomplete or invalid batch');
+        }
+
+        const staleIdxToEmbedding = new Map<number, Float32Array>();
+        for (let j = 0; j < stale.length; j++) {
+          staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
+        }
+        const merged: ChunkInput[] = existing.map((c) => carryChunkMetadata(c, {
+          chunk_index: c.chunk_index,
+          chunk_text: c.chunk_text,
+          chunk_source: c.chunk_source,
+          embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
+          token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
+        }));
+        // The keyset's last batch stamps complete DB provenance (#4825),
+        // with context demotion in the same transaction as its vector writes.
+        const install = await observed(pacer, () => engine.transaction(async tx => {
+          await opts.assertOwned?.(tx);
+          if (stopped()) throw new AbortError();
+          await lease.assertHeld(tx);
+          const installed = await installPageEmbeddings(tx, prepared, merged);
+          if (stamp) await stampIfPageProvenanceComplete(tx, slug, keySourceId, stamp);
+          if (stale.length === existing.length && installed.complete) await restampIfDemotedToTitleTier(tx, prepared.snapshot.page, slug, keySourceId);
+          await opts.assertOwned?.(tx);
+          if (stopped()) throw new AbortError();
+          return installed;
+        }));
+        result.embedded += install.installed;
+        if (install.complete || install.installed > 0) result.pagesProcessed += 1;
+      } catch (e: unknown) {
+        result.failures = (result.failures ?? 0) + stale.length;
+        // Aborted mid-fetch is expected; treat as graceful exit.
+        if (stopped()) return;
+        await opts.assertOwned?.();
+        // Otherwise log and skip — the chunk stays NULL and next call retries.
+        process.stderr.write(
+          `\n  [embed-stale] error on ${keySourceId}/${slug}: ${
+            e instanceof Error ? e.message : String(e)
+          }\n`,
+        );
+        await healAndReportOverLength(engine, slug, keySourceId, e, stale.map(c => c.chunk_text), line => process.stderr.write(`${line}\n`));
+      }
+    }
+
+    async function worker(): Promise<void> {
+      while (nextIdx < keys.length && !stopped()) {
+        const idx = nextIdx++;
+        await embedOneKey(keys[idx]);
+        // Cooperative DB-contention pace between keys (no-op when unpaced).
+        // pace() throws AbortError on cancel — treat as graceful worker exit;
+        // the for(;;) loop sees signal.aborted and returns aborted next tick.
+        try {
+          await pacer.pace(signal);
+        } catch (e) {
+          if (e instanceof AbortError) return;
+          throw e;
+        }
+      }
+    }
+
+    const numWorkers = Math.min(concurrency, keys.length);
+    await Promise.all(Array.from({ length: numWorkers }, () => worker()));
+    if (stopped()) return { ...result, aborted: true };
+
+    if (opts.onProgress) {
+      opts.onProgress({
+        embedded: result.embedded,
+        chunksProcessed: result.chunksProcessed,
+        cursor: { afterPageId, afterChunkIndex },
+      });
+    }
+
+    // Short batch = end of stale set; advance and exit.
+    if (batch.length < batchSize) {
+      const blocked = await countArchivedEmbeddingWork(engine, { sourceId, signature });
+      if (blocked) { result.blocked = blocked; result.failures = (result.failures ?? 0) + blocked; }
+      if (projectionBlocked) result.blocked = (result.blocked ?? 0) + projectionBlocked;
+      result.remaining = await engine.countStaleChunks({ sourceId, ...(signature && { signature }) });
+      result.complete = result.remaining === 0 && !result.blocked;
+      result.done = true;
+      return result;
+    }
+  }
+}

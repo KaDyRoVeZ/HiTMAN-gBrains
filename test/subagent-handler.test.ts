@@ -1,0 +1,1558 @@
+/**
+ * Subagent handler tests with a mocked Anthropic Messages client.
+ *
+ * Strategy: every test scripts a sequence of Messages API responses, hands
+ * them to a FakeMessagesClient, and inspects (a) the SubagentResult the
+ * handler returns and (b) the persisted rows in subagent_messages +
+ * subagent_tool_executions. Replay tests simulate a crash by constructing
+ * a fresh handler bound to the same job row with partial state already
+ * written.
+ *
+ * PGLite in-memory so the schema, ON CONFLICT, and two-phase persistence
+ * all exercise real SQL.
+ */
+
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { MinionQueue } from '../src/core/minions/queue.ts';
+import {
+  makeSubagentHandler,
+  RateLeaseUnavailableError,
+  stripProviderPrefix,
+  type MessagesClient,
+} from '../src/core/minions/handlers/subagent.ts';
+import type { ToolDef, MinionJobContext } from '../src/core/minions/types.ts';
+import type Anthropic from '@anthropic-ai/sdk';
+import { OperationError } from '../src/core/ops/contract.ts';
+import { __setMaintenanceWriteWaitForTests } from '../src/core/persistence/maintenance-wait.ts';
+
+let engine: PGLiteEngine;
+let queue: MinionQueue;
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({ database_url: '' });
+  await engine.initSchema();
+  queue = new MinionQueue(engine);
+}, 60_000);
+
+afterAll(async () => {
+  await engine.disconnect();
+});
+
+beforeEach(async () => {
+  await engine.executeRaw('DELETE FROM subagent_tool_executions');
+  await engine.executeRaw('DELETE FROM subagent_messages');
+  await engine.executeRaw('DELETE FROM subagent_rate_leases');
+  await engine.executeRaw('DELETE FROM minion_jobs');
+});
+
+// ── FakeMessagesClient ──────────────────────────────────────
+
+type FakeResponse = Partial<Anthropic.Message> & { content: Anthropic.Message['content'] };
+
+class FakeMessagesClient implements MessagesClient {
+  public calls: Anthropic.MessageCreateParamsNonStreaming[] = [];
+  constructor(private responses: FakeResponse[]) {}
+  async create(
+    params: Anthropic.MessageCreateParamsNonStreaming,
+  ): Promise<Anthropic.Message> {
+    this.calls.push(params);
+    if (this.responses.length === 0) throw new Error('FakeMessagesClient: out of scripted responses');
+    const r = this.responses.shift()!;
+    return {
+      id: `msg_${this.calls.length}`,
+      type: 'message',
+      role: 'assistant',
+      model: params.model,
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } as any,
+      ...r,
+    } as Anthropic.Message;
+  }
+}
+
+// Build a synthetic MinionJobContext around a real minion_jobs row. The
+// handler only reads data/id/signal/shutdownSignal/updateTokens — we stub
+// the rest. `subagent` is a protected job name (Lane 4H) so tests submit
+// under the trusted-submit flag.
+async function makeCtx(input: unknown): Promise<MinionJobContext> {
+  const job = await queue.add(
+    'subagent',
+    input as Record<string, unknown>,
+    {},
+    { allowProtectedSubmit: true },
+  );
+  const ac = new AbortController();
+  const shutdown = new AbortController();
+  return {
+    id: job.id,
+    name: job.name,
+    data: (input as Record<string, unknown>) ?? {},
+    attempts_made: 0,
+    signal: ac.signal,
+    deadlineAtMs: null,
+    shutdownSignal: shutdown.signal,
+    async updateProgress() {},
+    async updateTokens() {},
+    async log() {},
+    async isActive() { return true; },
+    async readInbox() { return []; },
+  };
+}
+
+// ── Tiny tool registry for tests ────────────────────────────
+
+function makeEchoTool(name = 'echo', idempotent = true): ToolDef {
+  return {
+    name,
+    description: 'echo input',
+    input_schema: { type: 'object', properties: { value: { type: 'string' } }, required: [] },
+    idempotent,
+    async execute(input) { return { echoed: input }; },
+  };
+}
+
+function makeThrowingTool(name = 'broken'): ToolDef {
+  return {
+    name,
+    description: 'always throws',
+    input_schema: { type: 'object', properties: {}, required: [] },
+    idempotent: true,
+    async execute() { throw new Error('tool broken'); },
+  };
+}
+
+// ── Tests ───────────────────────────────────────────────────
+
+describe('subagent handler happy path', () => {
+  test('an explicit empty binding exposes no tools to the agent loop', async () => {
+    const client = new FakeMessagesClient([{ content: [{ type: 'text', text: 'done' }] as any }]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [makeEchoTool('echo')] });
+    await handler(await makeCtx({ prompt: 'finish', allowed_tools: [] }));
+    expect(client.calls[0]!.tools ?? []).toEqual([]);
+  });
+
+  test('malformed bindings fail before a model request', async () => {
+    for (const allowed_tools of [null, 'echo', [42], ['']]) {
+      const client = new FakeMessagesClient([]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [makeEchoTool('echo')] });
+      await expect(handler(await makeCtx({ prompt: 'finish', allowed_tools }))).rejects.toThrow(/allowed_tools/);
+      expect(client.calls).toHaveLength(0);
+    }
+  });
+  test('no-tool end_turn: returns text response + persists user + assistant rows', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'hello world' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+
+    const result = await handler(ctx);
+
+    expect(result.result).toBe('hello world');
+    expect(result.turns_count).toBe(1);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.tokens.in).toBe(10);
+    expect(result.tokens.out).toBe(5);
+
+    const msgs = await engine.executeRaw<{ count: string }>(
+      `SELECT count(*)::text AS count FROM subagent_messages WHERE job_id = $1`,
+      [ctx.id],
+    );
+    expect(parseInt(msgs[0]!.count, 10)).toBe(2); // user seed + assistant
+  });
+
+  test('single tool_use turn: tool executes, two-phase row goes complete', async () => {
+    const tool = makeEchoTool();
+    const client = new FakeMessagesClient([
+      {
+        content: [
+          { type: 'tool_use', id: 'tu_1', name: 'echo', input: { value: 'v1' } } as any,
+        ],
+        stop_reason: 'tool_use' as any,
+      },
+      {
+        content: [{ type: 'text', text: 'done' }] as any,
+        stop_reason: 'end_turn',
+      },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [tool] });
+    const ctx = await makeCtx({ prompt: 'go' });
+
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.result).toBe('done');
+    expect(client.calls.length).toBe(2);
+
+    // tool_executions row complete with echoed output
+    const rows = await engine.executeRaw<{ status: string; output: unknown }>(
+      `SELECT status, output FROM subagent_tool_executions WHERE job_id = $1`,
+      [ctx.id],
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.status).toBe('complete');
+    const out = typeof rows[0]!.output === 'string' ? JSON.parse(rows[0]!.output as string) : rows[0]!.output;
+    expect(out).toEqual({ echoed: { value: 'v1' } });
+  });
+
+  test('tool throws: row goes failed, model sees error, loop continues', async () => {
+    const tool = makeThrowingTool();
+    const client = new FakeMessagesClient([
+      {
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'broken', input: {} } as any],
+        stop_reason: 'tool_use' as any,
+      },
+      {
+        content: [{ type: 'text', text: 'recovered' }] as any,
+        stop_reason: 'end_turn',
+      },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [tool] });
+    const ctx = await makeCtx({ prompt: 'try' });
+
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.result).toBe('recovered');
+
+    const rows = await engine.executeRaw<{ status: string; error: string | null }>(
+      `SELECT status, error FROM subagent_tool_executions WHERE job_id = $1`,
+      [ctx.id],
+    );
+    expect(rows[0]!.status).toBe('failed');
+    expect(rows[0]!.error).toContain('tool broken');
+  });
+
+  test('unknown tool name fails execution but loop continues', async () => {
+    const client = new FakeMessagesClient([
+      {
+        content: [{ type: 'tool_use', id: 'tu_nope', name: 'no_such_tool', input: {} } as any],
+        stop_reason: 'tool_use' as any,
+      },
+      { content: [{ type: 'text', text: 'ok' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'x' });
+
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+
+    const rows = await engine.executeRaw<{ status: string; error: string | null }>(
+      `SELECT status, error FROM subagent_tool_executions WHERE job_id = $1`,
+      [ctx.id],
+    );
+    expect(rows[0]!.status).toBe('failed');
+    expect(rows[0]!.error).toContain('not in the registry');
+  });
+
+  test('max_turns exceeded returns stop_reason=max_turns', async () => {
+    // Model keeps calling tool_use forever; we cap at 2 turns.
+    const echoing: FakeResponse[] = Array.from({ length: 5 }).map((_, i) => ({
+      content: [{ type: 'tool_use', id: `tu_${i}`, name: 'echo', input: {} } as any],
+      stop_reason: 'tool_use' as any,
+    }));
+    const client = new FakeMessagesClient(echoing);
+    const tool = makeEchoTool();
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [tool] });
+    const ctx = await makeCtx({ prompt: 'loop', max_turns: 2 });
+
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('max_turns');
+    expect(result.turns_count).toBe(2);
+  });
+});
+
+describe('subagent handler replay (crash recovery)', () => {
+  test('resumes from persisted messages when prior rows exist', async () => {
+    // Seed an in-progress conversation by running the first client, then
+    // running a second handler on the SAME job with responses starting at
+    // turn 2. No duplicate user-seed row (ON CONFLICT DO NOTHING).
+    const tool = makeEchoTool();
+    const client1 = new FakeMessagesClient([
+      {
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'echo', input: { v: 1 } } as any],
+        stop_reason: 'tool_use' as any,
+      },
+    ]);
+    const handler1 = makeSubagentHandler({ engine, client: client1, toolRegistry: [tool] });
+    const ctx = await makeCtx({ prompt: 'start' });
+
+    // Run handler1 until it WOULD make a second LLM call — force that
+    // second call to error so we persist only the first assistant message.
+    try {
+      const client1b = new FakeMessagesClient([
+        {
+          content: [{ type: 'tool_use', id: 'tu_1', name: 'echo', input: { v: 1 } } as any],
+          stop_reason: 'tool_use' as any,
+        },
+      ]);
+      const interrupted = makeSubagentHandler({ engine, client: client1b, toolRegistry: [tool] });
+      await interrupted(ctx);
+    } catch {
+      // Out-of-scripted-responses — simulates worker kill before turn 2.
+    }
+
+    // Confirm partial state: 1 user + 1 assistant + 1 synthesized user
+    // (tool_result) + 1 tool_exec complete.
+    const preRows = await engine.executeRaw<{ c: string }>(
+      `SELECT count(*)::text AS c FROM subagent_messages WHERE job_id = $1`,
+      [ctx.id],
+    );
+    const preCount = parseInt(preRows[0]!.c, 10);
+    expect(preCount).toBeGreaterThanOrEqual(1);
+
+    // Resume with a fresh handler + client that supplies ONE more response.
+    const client2 = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'resumed ok' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler2 = makeSubagentHandler({ engine, client: client2, toolRegistry: [tool] });
+    const result = await handler2(ctx);
+
+    expect(result.result).toBe('resumed ok');
+    expect(result.stop_reason).toBe('end_turn');
+    // Second client should see the prior conversation in the messages
+    // array — at minimum the user seed + prior assistant + tool_result.
+    expect(client2.calls[0]!.messages.length).toBeGreaterThan(1);
+  });
+
+  test('prior completed tool exec is replayed without re-invoking execute', async () => {
+    // Prior state: a completed tool row. We assert the tool's execute is
+    // NOT called on resume. Use a tool that throws if invoked — passing
+    // means we used the replay path.
+    const throwingTool = makeThrowingTool('pre_done');
+    const ctx = await makeCtx({ prompt: 'start' });
+
+    // Seed prior state manually: user, assistant with tool_use, tool_exec complete.
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+       VALUES ($1, 0, 'user', $2::jsonb)`,
+      [ctx.id, JSON.stringify([{ type: 'text', text: 'start' }])],
+    );
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks, model)
+       VALUES ($1, 1, 'assistant', $2::jsonb, 'claude-sonnet-4-6')`,
+      [
+        ctx.id,
+        JSON.stringify([
+          { type: 'tool_use', id: 'tu_seeded', name: 'pre_done', input: {} },
+        ]),
+      ],
+    );
+    await engine.executeRaw(
+      `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status, output)
+       VALUES ($1, 1, 'tu_seeded', 'pre_done', '{}'::jsonb, 'complete', $2::jsonb)`,
+      [ctx.id, JSON.stringify({ replayed: true })],
+    );
+
+    // Handler MUST NOT call the throwing execute and MUST end the loop on
+    // the next LLM response.
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'finished after replay' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [throwingTool] });
+    const result = await handler(ctx);
+
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.result).toBe('finished after replay');
+    // Only one LLM call made on this resume (we had 2 persisted messages +
+    // the tool result synthesis happened when resuming, then model spoke).
+    expect(client.calls.length).toBe(1);
+  });
+
+  // v0.37.7.0 #1151 regression — terminal-on-resume.
+  // Pre-fix, this scenario dead-lettered the job: replay reconciler saw
+  // last=assistant with zero tool_uses, did nothing, main loop called
+  // messages.create against a conversation ending in assistant → Sonnet
+  // 4.6+ rejects assistant-prefill with HTTP 400 → 3 retries → dead.
+  // Post-fix, the reconciler short-circuits: reconstructs finalText from
+  // the persisted text blocks and returns stop_reason='end_turn' without
+  // any LLM call.
+  test('text-only assistant tail on resume returns terminal without LLM call (#1151)', async () => {
+    const ctx = await makeCtx({ prompt: 'start' });
+    // Seed prior state: user prompt, then a TERMINAL assistant turn
+    // (text-only, no tool_use blocks). This is the exact shape the
+    // #1151 reporter found in their dead jobs (job 190's last message
+    // was a synthesis summary listing 3 written slugs).
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+       VALUES ($1, 0, 'user', $2::jsonb)`,
+      [ctx.id, JSON.stringify([{ type: 'text', text: 'start' }])],
+    );
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks, model, tokens_in, tokens_out)
+       VALUES ($1, 1, 'assistant', $2::jsonb, 'claude-sonnet-4-6', 100, 50)`,
+      [
+        ctx.id,
+        JSON.stringify([
+          { type: 'text', text: 'wrote 3 pages: wiki/notes/a, wiki/notes/b, wiki/notes/c' },
+        ]),
+      ],
+    );
+
+    // The FakeMessagesClient has ZERO scripted responses. If the handler
+    // tries to call messages.create, it throws. The fix guarantees we
+    // never reach that path.
+    const client = new FakeMessagesClient([]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const result = await handler(ctx);
+
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.result).toBe('wrote 3 pages: wiki/notes/a, wiki/notes/b, wiki/notes/c');
+    // Crucial assertion: no messages.create call was made on resume.
+    expect(client.calls.length).toBe(0);
+    // Token totals from the persisted assistant message rolled up.
+    expect(result.tokens.in).toBe(100);
+    expect(result.tokens.out).toBe(50);
+  });
+
+  // Companion: the existing tool-use replay path is unchanged.
+  test('text-only terminal short-circuit does NOT affect tool-use replay path', async () => {
+    // This is a smoke test that the new else-branch doesn't accidentally
+    // swallow the pending-tool-use case. If we have a persisted assistant
+    // with a tool_use block (no synthesized user turn yet), the existing
+    // tool-synthesis path must still fire.
+    const echoTool = makeEchoTool('echo_x');
+    const ctx = await makeCtx({ prompt: 'start' });
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+       VALUES ($1, 0, 'user', $2::jsonb)`,
+      [ctx.id, JSON.stringify([{ type: 'text', text: 'start' }])],
+    );
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks, model)
+       VALUES ($1, 1, 'assistant', $2::jsonb, 'claude-sonnet-4-6')`,
+      [
+        ctx.id,
+        JSON.stringify([
+          { type: 'tool_use', id: 'tu_pending', name: 'echo_x', input: { v: 'r' } },
+        ]),
+      ],
+    );
+    // No prior tool_exec row — replay reconciler will dispatch.
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'done after tool' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [echoTool] });
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.result).toBe('done after tool');
+    // The handler DID call messages.create (one call) after synthesizing
+    // the tool_result wrapper.
+    expect(client.calls.length).toBe(1);
+  });
+
+  test('pending non-idempotent tool exec rejects on resume', async () => {
+    const nonIdempotent = { ...makeEchoTool('do_once'), idempotent: false };
+    const ctx = await makeCtx({ prompt: 'start' });
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+       VALUES ($1, 0, 'user', $2::jsonb)`,
+      [ctx.id, JSON.stringify([{ type: 'text', text: 'start' }])],
+    );
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+       VALUES ($1, 1, 'assistant', $2::jsonb)`,
+      [
+        ctx.id,
+        JSON.stringify([{ type: 'tool_use', id: 'tu_x', name: 'do_once', input: {} }]),
+      ],
+    );
+    await engine.executeRaw(
+      `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status)
+       VALUES ($1, 1, 'tu_x', 'do_once', '{}'::jsonb, 'pending')`,
+      [ctx.id],
+    );
+
+    const client = new FakeMessagesClient([]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [nonIdempotent] });
+    await expect(handler(ctx)).rejects.toThrow(/non-idempotent/);
+  });
+});
+
+describe('subagent handler lease behavior', () => {
+  test('acquires + releases a lease around the LLM call', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'ok' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({
+      engine, client, toolRegistry: [], maxConcurrent: 1, rateLeaseKey: 'k1',
+    });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    await handler(ctx);
+    // No leases should remain after completion.
+    const rows = await engine.executeRaw<{ c: string }>(
+      `SELECT count(*)::text AS c FROM subagent_rate_leases`,
+    );
+    expect(parseInt(rows[0]!.c, 10)).toBe(0);
+  });
+
+  test('v0.41 Bug 3: stripProviderPrefix strips `anthropic:` qualified model', async () => {
+    expect(stripProviderPrefix('anthropic:claude-sonnet-4-6')).toBe('claude-sonnet-4-6');
+  });
+
+  test('v0.41 Bug 3: stripProviderPrefix is idempotent on bare names', async () => {
+    expect(stripProviderPrefix('claude-sonnet-4-6')).toBe('claude-sonnet-4-6');
+  });
+
+  test('v0.41 Bug 3: stripProviderPrefix handles edge inputs', async () => {
+    expect(stripProviderPrefix('')).toBe('');
+    // Leading colon = no valid provider name; pass through unchanged.
+    // The `idx > 0` guard (not `>= 0`) makes this intentional.
+    expect(stripProviderPrefix(':')).toBe(':');
+    expect(stripProviderPrefix('a:b:c')).toBe('b:c'); // only strips first prefix
+  });
+
+  test('v0.41 Bug 3: handler passes bare model id to Anthropic SDK when data.model is qualified', async () => {
+    const calls: Array<Anthropic.MessageCreateParamsNonStreaming> = [];
+    const client: MessagesClient = {
+      async create(params) {
+        calls.push(params);
+        return {
+          content: [{ type: 'text', text: 'ok' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+          role: 'assistant',
+        } as unknown as Anthropic.Message;
+      },
+    };
+    const handler = makeSubagentHandler({
+      engine, client, toolRegistry: [], maxConcurrent: 100, rateLeaseKey: 'k_prefix',
+    });
+    const ctx = await makeCtx({
+      prompt: 'hello',
+      model: 'anthropic:claude-sonnet-4-6', // qualified — the field-report bug case
+    });
+    await handler(ctx);
+    expect(calls.length).toBe(1);
+    // The SDK MUST receive the bare model id, not the prefixed one.
+    expect(calls[0]!.model).toBe('claude-sonnet-4-6');
+  });
+
+  test('throws RateLeaseUnavailableError when cap full', async () => {
+    // Preload the cap with a stale-looking-but-live lease owned by a
+    // different job.
+    const owner = await queue.add('holder', {});
+    await engine.executeRaw(
+      `INSERT INTO subagent_rate_leases (key, owner_job_id, expires_at)
+       VALUES ('k_cap', $1, now() + interval '1 minute')`,
+      [owner.id],
+    );
+    const client = new FakeMessagesClient([]);
+    const handler = makeSubagentHandler({
+      engine, client, toolRegistry: [], maxConcurrent: 1, rateLeaseKey: 'k_cap',
+    });
+    const ctx = await makeCtx({ prompt: 'blocked' });
+    await expect(handler(ctx)).rejects.toBeInstanceOf(RateLeaseUnavailableError);
+  });
+});
+
+describe('subagent handler input validation', () => {
+  test('missing prompt throws', async () => {
+    const client = new FakeMessagesClient([]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({});
+    await expect(handler(ctx)).rejects.toThrow(/prompt/);
+  });
+
+  test('allowed_tools unknown name rejected at dispatch', async () => {
+    const tool = makeEchoTool('real');
+    const client = new FakeMessagesClient([]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [tool] });
+    const ctx = await makeCtx({ prompt: 'x', allowed_tools: ['real', 'ghost_tool'] });
+    await expect(handler(ctx)).rejects.toThrow(/unknown tool/);
+  });
+});
+
+describe('makeSubagentHandler default client construction', () => {
+  test('factory default wires sdk.messages through to the handler', async () => {
+    // Regression guard for the v0.16.0 shipped bug: makeSubagentHandler
+    // was casting `new Anthropic()` (top-level SDK class) to MessagesClient,
+    // but `.create()` lives at sdk.messages.create. Every subagent job in
+    // production died with "client.create is not a function" on first LLM
+    // call. This test exercises the default-client path (no `deps.client`
+    // injected) via the makeAnthropic dep-injection seam, so the exact
+    // default-branch construction is covered without a real API call.
+    const calls: Anthropic.MessageCreateParamsNonStreaming[] = [];
+    const fakeSdk = {
+      messages: {
+        async create(
+          params: Anthropic.MessageCreateParamsNonStreaming,
+        ): Promise<Anthropic.Message> {
+          calls.push(params);
+          return {
+            id: 'msg_regression',
+            type: 'message',
+            role: 'assistant',
+            model: params.model,
+            stop_reason: 'end_turn',
+            stop_sequence: null,
+            content: [{ type: 'text', text: 'ok' }],
+            usage: {
+              input_tokens: 1,
+              output_tokens: 1,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          } as unknown as Anthropic.Message;
+        },
+      },
+    } as unknown as Anthropic;
+
+    // Crucial: do NOT pass `client`. Only `makeAnthropic`. This forces the
+    // factory to hit the default-client branch (`deps.client ?? makeAnthropic().messages`).
+    const handler = makeSubagentHandler({
+      engine,
+      makeAnthropic: () => fakeSdk,
+      toolRegistry: [],
+    });
+    const ctx = await makeCtx({ prompt: 'hello' });
+    const result = await handler(ctx);
+
+    expect(calls.length).toBe(1);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.result).toBe('ok');
+  });
+});
+
+// ── #2778: per-turn output-token cap + max_tokens stop handling ─────
+
+import { resolveMaxOutputTokens } from '../src/core/minions/handlers/subagent.ts';
+
+describe('resolveMaxOutputTokens (#2778)', () => {
+  test('defaults to 8192 when nothing set', () => {
+    expect(resolveMaxOutputTokens(undefined, null)).toBe(8192);
+    expect(resolveMaxOutputTokens(undefined, undefined)).toBe(8192);
+  });
+
+  test('per-job value wins over config', () => {
+    expect(resolveMaxOutputTokens(2048, '5000')).toBe(2048);
+  });
+
+  test('config value used when per-job unset', () => {
+    expect(resolveMaxOutputTokens(undefined, '5000')).toBe(5000);
+  });
+
+  test('invalid values fall through to next tier', () => {
+    expect(resolveMaxOutputTokens(0, '5000')).toBe(5000);
+    expect(resolveMaxOutputTokens(-1, null)).toBe(8192);
+    expect(resolveMaxOutputTokens(Number.NaN, 'garbage')).toBe(8192);
+    expect(resolveMaxOutputTokens(undefined, '')).toBe(8192);
+    expect(resolveMaxOutputTokens(undefined, '0')).toBe(8192);
+  });
+});
+
+describe('subagent handler output-token cap (#2778)', () => {
+  test('default: SDK call carries max_tokens=8192 (was hardcoded 4096)', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'ok' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    await handler(ctx);
+    expect(client.calls[0]!.max_tokens).toBe(8192);
+  });
+
+  test('data.max_tokens flows to the SDK call', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'ok' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi', max_tokens: 2048 });
+    await handler(ctx);
+    expect(client.calls[0]!.max_tokens).toBe(2048);
+  });
+
+  test('agent.max_output_tokens config flows to the SDK call', async () => {
+    await engine.setConfig('agent.max_output_tokens', '5000');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'ok' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await handler(ctx);
+      expect(client.calls[0]!.max_tokens).toBe(5000);
+    } finally {
+      await engine.executeRaw(`DELETE FROM config WHERE key = 'agent.max_output_tokens'`);
+    }
+  });
+
+  test('final turn hitting the cap surfaces stop_reason=max_tokens, not a silent end_turn', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'truncated tex' }] as any, stop_reason: 'max_tokens' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hi' });
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('max_tokens');
+    expect(result.result).toBe('truncated tex');
+  });
+
+  test('max_tokens stop with tool_use: truncation note injected so the model re-issues the dropped call', async () => {
+    const tool = makeEchoTool();
+    const client = new FakeMessagesClient([
+      {
+        // A complete tool_use survived, but the turn stopped on max_tokens —
+        // the API dropped whatever came after (e.g. a big put_page call).
+        content: [{ type: 'tool_use', id: 'tu_1', name: 'echo', input: { value: 'v1' } } as any],
+        stop_reason: 'max_tokens' as any,
+      },
+      { content: [{ type: 'text', text: 'recovered' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [tool] });
+    const ctx = await makeCtx({ prompt: 'go' });
+
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.result).toBe('recovered');
+
+    // The synthesized user turn (persisted + fed to the second call) must
+    // carry the truncation note alongside the tool_result. Assert on the
+    // persisted row — client.calls[].messages is the live array the loop
+    // keeps mutating, so positional checks there are unreliable.
+    const rows = await engine.executeRaw<{ content_blocks: unknown }>(
+      `SELECT content_blocks FROM subagent_messages
+        WHERE job_id = $1 AND role = 'user' AND message_idx > 0
+        ORDER BY message_idx ASC`,
+      [ctx.id],
+    );
+    expect(rows.length).toBe(1);
+    const blocks = (typeof rows[0]!.content_blocks === 'string'
+      ? JSON.parse(rows[0]!.content_blocks as string)
+      : rows[0]!.content_blocks) as Array<{ type: string; text?: string }>;
+    expect(blocks.some(b => b.type === 'tool_result')).toBe(true);
+    const texts = blocks.filter(b => b.type === 'text').map(b => b.text ?? '');
+    expect(texts.some(t => t.includes('truncated') && t.includes('DROPPED'))).toBe(true);
+  });
+});
+
+describe('handler-entry capability gate on the config-resolved model', () => {
+  test('config-resolved models.subagent lacking tool calling is refused at dispatch', async () => {
+    // The queue submit gate only sees explicit data.model. A job that omits
+    // data.model resolves `models.subagent` inside the handler — pre-fix that
+    // path bypassed the capability check entirely and a tool-incapable model
+    // (declared supports_tools: false) ran the loop anyway. Fixture is the
+    // nvidia recipe: it still declares supports_tools: false (minimax flipped
+    // to true in #4782, so it no longer exercises the no_tools path).
+    await engine.setConfig('models.subagent', 'nvidia:nvidia/nemotron-3-super-120b-a12b');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'should never run' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' }); // no data.model → queue gate passes
+      await expect(handler(ctx)).rejects.toThrow(/lacks native tool calling/);
+      expect(client.calls.length).toBe(0); // refused before any provider call
+    } finally {
+      await engine.unsetConfig('models.subagent');
+    }
+  });
+
+  test('already-terminal replay is NOT refused when config points at a tool-incapable model', async () => {
+    // #1151 precedent: a job whose last persisted message is a terminal
+    // assistant turn needs no provider call — the replay short-circuit
+    // returns the committed result. A capability refusal here (config
+    // repointed between submit and replay) would dead-letter completed work.
+    // Gateway loop ON: that's the only routing where the capability gate is
+    // the deciding check (the legacy path's Anthropic pin refuses
+    // non-Anthropic models regardless). The gateway path's terminal
+    // early-return runs before any provider client is constructed, so no
+    // API key is needed.
+    await engine.setConfig('models.subagent', 'nvidia:nvidia/nemotron-3-super-120b-a12b');
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    try {
+      const client = new FakeMessagesClient([]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      // Persist a completed transcript: seed user + terminal assistant.
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES ($1, 0, 'user', $2::text::jsonb), ($1, 1, 'assistant', $3::text::jsonb)`,
+        [
+          ctx.id,
+          JSON.stringify([{ type: 'text', text: 'hi' }]),
+          JSON.stringify([{ type: 'text', text: 'committed answer' }]),
+        ],
+      );
+      const result = await handler(ctx);
+      expect(result.result).toBe('committed answer');
+      // Replay short-circuit: no new turns persisted beyond the 2 seeded rows
+      // (a provider call would have appended an assistant row — and would have
+      // failed anyway, since no gateway credentials are configured here).
+      const rows = await engine.executeRaw<{ count: string }>(
+        `SELECT count(*)::text AS count FROM subagent_messages WHERE job_id = $1`,
+        [ctx.id],
+      );
+      expect(parseInt(rows[0]!.count, 10)).toBe(2);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+  });
+
+  test('non-terminal gateway replay (pending tool-call) IS still refused on a tool-incapable model', async () => {
+    // A gateway transcript persists pending dispatch as `tool-call` blocks.
+    // A replay that still needs the loop to resume on the provider must NOT
+    // slip past the capability gate via the terminal exception.
+    await engine.setConfig('models.subagent', 'nvidia:nvidia/nemotron-3-super-120b-a12b');
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    try {
+      const client = new FakeMessagesClient([]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES ($1, 0, 'user', $2::text::jsonb), ($1, 1, 'assistant', $3::text::jsonb)`,
+        [
+          ctx.id,
+          JSON.stringify([{ type: 'text', text: 'hi' }]),
+          JSON.stringify([{ type: 'tool-call', toolCallId: 'tc_1', toolName: 'echo', input: {} }]),
+        ],
+      );
+      await expect(handler(ctx)).rejects.toThrow(/lacks native tool calling/);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+  });
+
+  test('a BARE Anthropic id in models.subagent still runs (not refused as unknown provider)', async () => {
+    // A bare `claude-*` id (no `provider:` prefix) is a supported config value
+    // everywhere else: isAnthropicProvider() has an explicit bare-`claude-`
+    // branch and the legacy path strips the prefix before calling the Messages
+    // API. classifyCapabilities() resolves through the recipe registry, which
+    // requires an explicit provider, so classifying the raw value would report
+    // `unknown` and this gate would refuse a config that works.
+    await engine.setConfig('models.subagent', 'claude-sonnet-4-6');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'ran on the bare id' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' }); // no data.model → config resolves
+      const result = await handler(ctx);
+      expect(result.result).toBe('ran on the bare id');
+      // The provider call carries the bare id (the legacy path strips any prefix).
+      expect(client.calls.length).toBe(1);
+      expect(client.calls[0]!.model).toBe('claude-sonnet-4-6');
+    } finally {
+      await engine.unsetConfig('models.subagent');
+    }
+  });
+
+  test('a bare NON-Anthropic id in models.subagent is still refused', async () => {
+    // The normalization above is deliberately narrow: only bare ids that
+    // isAnthropicProvider() recognizes get an `anthropic:` prefix for the
+    // verdict. A bare `gpt-5` is not a recipe-resolvable model, so the gate
+    // must keep reporting `unknown` rather than classifying it as Anthropic.
+    await engine.setConfig('models.subagent', 'gpt-5');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'should never run' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await expect(handler(ctx)).rejects.toThrow(/references an unknown provider/);
+      expect(client.calls.length).toBe(0);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+    }
+  });
+});
+
+// ── #4217 structural write accounting ───────────────────────
+
+describe('write accounting (#4217)', () => {
+  test('gateway text-only completion fails required writes and replay spends no more tokens (#5098)', async () => {
+    const { configureGateway, resetGateway, __setChatTransportForTests } = await import('../src/core/ai/gateway.ts');
+    configureGateway({ env: {} });
+    let calls = 0;
+    __setChatTransportForTests(async () => {
+      calls++;
+      return {
+        model: 'openai:gpt-5.2', providerId: 'openai', text: 'brain_put_page({"slug":"notes/example"})',
+        blocks: [{ type: 'text', text: 'brain_put_page({"slug":"notes/example"})' }], stopReason: 'end',
+        usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      };
+    });
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    try {
+      const handler = makeSubagentHandler({ engine, client: new FakeMessagesClient([]), toolRegistry: [makePutPageTool('ok')] });
+      const ctx = await makeCtx({ prompt: 'write a page', model: 'openai:gpt-5.2', require_writes: true });
+      await expect(handler(ctx)).rejects.toThrow('zero required put_page writes');
+      await expect(handler(ctx)).rejects.toThrow('zero required put_page writes');
+      expect(calls).toBe(1);
+      expect(await engine.executeRaw('SELECT id FROM subagent_tool_executions WHERE job_id = $1', [ctx.id])).toEqual([]);
+      const readOnly = await handler({ ...ctx, data: { ...ctx.data, require_writes: false } });
+      expect(readOnly.stop_reason).toBe('end_turn');
+      expect(readOnly.pages_written).toBe(0);
+      expect(calls).toBe(1);
+    } finally {
+      __setChatTransportForTests(null);
+      resetGateway();
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+  });
+
+  function makePutPageTool(behavior: 'ok' | 'fail' | ((input: unknown) => 'ok' | 'fail')): ToolDef {
+    return {
+      name: 'brain_put_page',
+      description: 'write a page',
+      input_schema: { type: 'object', properties: { slug: { type: 'string' } }, required: [] },
+      idempotent: true,
+      async execute(input) {
+        const mode = typeof behavior === 'function' ? behavior(input) : behavior;
+        if (mode === 'fail') throw new Error('expected 1024 dimensions, not 1280');
+        return { slug: (input as { slug?: string }).slug ?? 'wiki/x', status: 'created' };
+      },
+    };
+  }
+
+  const putPageTurn = (slug: string, id: string) => ({
+    content: [{ type: 'tool_use', id, name: 'brain_put_page', input: { slug } }] as any,
+    stop_reason: 'tool_use' as const,
+  });
+  const endTurn = { content: [{ type: 'text', text: 'done' }] as any, stop_reason: 'end_turn' as const };
+
+  test('require_writes + ALL writes failed → UnrecoverableError with first error', async () => {
+    const client = new FakeMessagesClient([putPageTurn('wiki/a', 'tu_1'), endTurn]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [makePutPageTool('fail')] });
+    const ctx = await makeCtx({ prompt: 'write pages', require_writes: true });
+    await expect(handler(ctx)).rejects.toThrow(/all 1 put_page write\(s\) failed.*1024 dimensions/);
+  });
+
+  test('all writes failed WITHOUT require_writes → completed, truthful counts', async () => {
+    // CDX-12: open-ended agent runs keep the generic contract — a failed write
+    // plus a useful text answer is still a completion, but the counts tell the truth.
+    const client = new FakeMessagesClient([putPageTurn('wiki/a', 'tu_1'), endTurn]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [makePutPageTool('fail')] });
+    const ctx = await makeCtx({ prompt: 'write pages' });
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.pages_attempted).toBe(1);
+    expect(result.pages_written).toBe(0);
+    expect(result.pages_failed).toBe(1);
+  });
+
+  test('partial failure with require_writes → completed with counts', async () => {
+    const client = new FakeMessagesClient([
+      {
+        content: [
+          { type: 'tool_use', id: 'tu_ok', name: 'brain_put_page', input: { slug: 'wiki/ok' } },
+          { type: 'tool_use', id: 'tu_bad', name: 'brain_put_page', input: { slug: 'FAIL' } },
+        ] as any,
+        stop_reason: 'tool_use',
+      },
+      endTurn,
+    ]);
+    const tool = makePutPageTool((input) => ((input as { slug?: string }).slug === 'FAIL' ? 'fail' : 'ok'));
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [tool] });
+    const ctx = await makeCtx({ prompt: 'write pages', require_writes: true });
+    const result = await handler(ctx);
+    expect(result.pages_attempted).toBe(2);
+    expect(result.pages_written).toBe(1);
+    expect(result.pages_failed).toBe(1);
+  });
+
+  test('zero attempts cannot satisfy require_writes even when the model claims a skip', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'nothing met the bar' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [makePutPageTool('ok')] });
+    const ctx = await makeCtx({ prompt: 'write pages', require_writes: true });
+    await expect(handler(ctx)).rejects.toThrow('zero required put_page writes');
+    await expect(handler(ctx)).rejects.toThrow('zero required put_page writes');
+    expect(client.calls).toHaveLength(1);
+
+    const result = await handler({ ...ctx, data: { ...ctx.data, require_writes: false } });
+    expect(result.result).toBe('nothing met the bar');
+    expect(result.pages_attempted).toBe(0);
+    expect(result.pages_written).toBe(0);
+    expect(result.pages_failed).toBe(0);
+  });
+
+  test('allow_clean_zero_writes: a clean finish after a completed read completes; without it the job dead-letters (#5540)', async () => {
+    const searchTurn = {
+      content: [{ type: 'tool_use', id: 'tu_s', name: 'brain_search', input: { value: 'themes' } }] as any,
+      stop_reason: 'tool_use' as const,
+    };
+    const strict = makeSubagentHandler({
+      engine, client: new FakeMessagesClient([searchTurn, endTurn]),
+      toolRegistry: [makeEchoTool('brain_search'), makePutPageTool('ok')],
+    });
+    const strictCtx = await makeCtx({ prompt: 'find patterns', require_writes: true });
+    await expect(strict(strictCtx)).rejects.toThrow('zero required put_page writes');
+
+    const handler = makeSubagentHandler({
+      engine, client: new FakeMessagesClient([searchTurn, endTurn]),
+      toolRegistry: [makeEchoTool('brain_search'), makePutPageTool('ok')],
+    });
+    const ctx = await makeCtx({ prompt: 'find patterns', require_writes: true, allow_clean_zero_writes: true });
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.pages_attempted).toBe(0);
+    expect(result.pages_written).toBe(0);
+  });
+
+  test('allow_clean_zero_writes does not excuse a run whose only tool failed (#5540)', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'tool_use', id: 'tu_b2', name: 'broken', input: {} }] as any, stop_reason: 'tool_use' },
+      endTurn,
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [makeThrowingTool('broken')] });
+    const ctx = await makeCtx({ prompt: 'find patterns', require_writes: true, allow_clean_zero_writes: true });
+    await expect(handler(ctx)).rejects.toThrow('zero required put_page writes');
+  });
+
+  test('non-put_page tool failures do not count toward write accounting', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'tool_use', id: 'tu_b', name: 'broken', input: {} }] as any, stop_reason: 'tool_use' },
+      endTurn,
+    ]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [makeThrowingTool('broken')] });
+    const ctx = await makeCtx({ prompt: 'do stuff', require_writes: true });
+    await expect(handler(ctx)).rejects.toThrow('zero required put_page writes');
+    const result = await handler({ ...ctx, data: { ...ctx.data, require_writes: false } });
+    expect(result.pages_attempted).toBe(0);
+  });
+});
+
+// ── #4087/CDX-6 model-aware output-cap default ──────────────
+
+describe('resolveMaxOutputTokens model-aware default', () => {
+  const { resolveMaxOutputTokens } = require('../src/core/minions/handlers/subagent.ts');
+  test('thinking-by-default Claude 5 model gets 32000 when nothing is configured', () => {
+    expect(resolveMaxOutputTokens(undefined, null, 'openrouter:anthropic/claude-sonnet-5')).toBe(32000);
+    expect(resolveMaxOutputTokens(undefined, null, 'anthropic:claude-fable-5')).toBe(32000);
+  });
+  test('recipe-declared thinking models (DeepSeek v4) get 32000 too (#4172)', () => {
+    expect(resolveMaxOutputTokens(undefined, null, 'deepseek:deepseek-v4-flash')).toBe(32000);
+  });
+  test('non-thinking models keep 8192', () => {
+    expect(resolveMaxOutputTokens(undefined, null, 'anthropic:claude-sonnet-4-6')).toBe(8192);
+    expect(resolveMaxOutputTokens(undefined, null, 'anthropic:claude-3-5-sonnet-20241022')).toBe(8192);
+    expect(resolveMaxOutputTokens(undefined, null, undefined)).toBe(8192);
+  });
+  test('per-job and config overrides still win over the thinking default', () => {
+    expect(resolveMaxOutputTokens(12000, null, 'anthropic:claude-fable-5')).toBe(12000);
+    expect(resolveMaxOutputTokens(undefined, '9000', 'anthropic:claude-fable-5')).toBe(9000);
+  });
+});
+
+// ── #4216 oneshot mode dispatch ─────────────────────────────
+
+describe('oneshot mode dispatch (#4216)', () => {
+  const PREFIXES = ['wiki/personal/reflections/*', 'wiki/originals/*'];
+  const SUFFIX = 'abc123';
+  const SLUG_A = `wiki/personal/reflections/2026-08-16-topic-${SUFFIX}`;
+  const SLUG_B = `wiki/originals/ideas/2026-08-16-idea-${SUFFIX}`;
+  const VALID = JSON.stringify({
+    pages: [
+      { slug: SLUG_A, body: `A. [[${SLUG_B}]]` },
+      { slug: SLUG_B, body: `B. [[${SLUG_A}]]` },
+    ],
+    skipped: false,
+  });
+  const chatStub = (text: string) => (async () => ({
+    text,
+    blocks: [{ type: 'text' as const, text }],
+    stopReason: 'end' as const,
+    usage: { input_tokens: 10, output_tokens: 10, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    model: 'anthropic:claude-sonnet-4-6',
+    providerId: 'anthropic',
+  })) as any;
+
+  test('valid oneshot output: single call, pages written, synth_mode_used=oneshot, accounting scoped', async () => {
+    const client = new FakeMessagesClient([]); // legacy loop must never run
+    const handler = makeSubagentHandler({ engine, client, _chat: chatStub(VALID) });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    const result = await handler(ctx);
+    expect(result.synth_mode_used).toBe('oneshot');
+    expect(result.turns_count).toBe(1);
+    expect(result.pages_written).toBe(2);
+    expect(result.pages_failed).toBe(0);
+    expect(client.calls.length).toBe(0);
+    expect(await engine.getPage(SLUG_A)).not.toBeNull();
+  });
+
+  test('explicit oneshot skip under require_writes completes instead of dead-lettering (#5590)', async () => {
+    const client = new FakeMessagesClient([]);
+    const skip = JSON.stringify({ pages: [], skipped: true, skip_reason: 'verbatim paste of an existing page' });
+    const handler = makeSubagentHandler({ engine, client, _chat: chatStub(skip) });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    const result = await handler(ctx);
+    expect(result.synth_mode_used).toBe('oneshot');
+    expect(result.oneshot_skipped).toBe(true);
+    expect(result.pages_attempted).toBe(0);
+    expect(result.pages_written).toBe(0);
+    expect(client.calls.length).toBe(0);
+  });
+
+  test('a oneshot skip replayed after its transcript persisted still completes without another model call (#5590)', async () => {
+    const client = new FakeMessagesClient([]);
+    const skip = JSON.stringify({ pages: [], skipped: true, skip_reason: 'already captured' });
+    const handler = makeSubagentHandler({ engine, client, _chat: chatStub(skip) });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    expect((await handler(ctx)).oneshot_skipped).toBe(true);
+
+    let chatCalls = 0;
+    const spy = (async (...args: any[]) => { chatCalls++; return chatStub(skip)(...args); }) as any;
+    const replay = await makeSubagentHandler({ engine, client, _chat: spy })({ ...ctx, attempts_made: 1 });
+    expect(replay.synth_mode_used).toBe('oneshot');
+    expect(replay.oneshot_skipped).toBe(true);
+    expect(replay.pages_attempted).toBe(0);
+    expect(chatCalls).toBe(0);
+    expect(client.calls.length).toBe(0);
+  });
+
+  test('an agentic-fallback transcript that merely looks like a skip still dead-letters on replay (#5590)', async () => {
+    const client = new FakeMessagesClient([]);
+    let chatCalls = 0;
+    const spy = (async (...args: any[]) => { chatCalls++; return chatStub('{}')(...args); }) as any;
+    const handler = makeSubagentHandler({ engine, client, _chat: spy });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+       VALUES ($1, 0, 'user', '[{"type":"text","text":"synthesize"}]'::jsonb),
+              ($1, 1, 'assistant', $2::text::jsonb)`,
+      [ctx.id, JSON.stringify([{ type: 'text', text: JSON.stringify({ pages: [], skipped: true }) }])],
+    );
+    await expect(handler({ ...ctx, attempts_made: 1 })).rejects.toThrow('zero required put_page writes');
+    expect(chatCalls).toBe(0);
+  });
+
+  test('oneshot pages:[] without the skip flag still dead-letters when the fallback writes nothing (#5590)', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'nothing met the bar' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, _chat: chatStub(JSON.stringify({ pages: [], skipped: false })) });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    await expect(handler(ctx)).rejects.toThrow('zero required put_page writes');
+  });
+
+  test('invalid oneshot output falls back to the agentic loop IN THE SAME JOB', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'agentic loop answered' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, _chat: chatStub('not json at all') });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot',
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    const result = await handler(ctx);
+    expect(result.result).toBe('agentic loop answered');
+    expect(result.synth_mode_used).toBe('agentic_fallback');
+    expect(result.fallback_reason).toBe('unparseable');
+    expect(client.calls.length).toBe(1); // the loop really ran
+  });
+
+  test('REGRESSION pin: payload without mode keeps the legacy result shape (no synth fields)', async () => {
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'plain job' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, _chat: chatStub(VALID) });
+    const ctx = await makeCtx({ prompt: 'plain' });
+    const result = await handler(ctx);
+    expect(result.result).toBe('plain job');
+    expect('synth_mode_used' in result).toBe(false);
+    expect('fallback_reason' in result).toBe(false);
+  });
+
+  test('mode=agentic stamps synth_mode_used=agentic and never calls the oneshot chat', async () => {
+    let oneshotCalls = 0;
+    const spy = (async (...args: any[]) => { oneshotCalls++; return chatStub(VALID)(...args); }) as any;
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'agentic by request' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({ engine, client, _chat: spy });
+    const ctx = await makeCtx({ prompt: 'synthesize', mode: 'agentic' });
+    const result = await handler(ctx);
+    expect(result.synth_mode_used).toBe('agentic');
+    expect(oneshotCalls).toBe(0);
+  });
+
+  test.each([['echo'], []])('oneshot tool ceiling %j prevents programmatic write escalation', async (...allowedTools) => {
+    // A submitter that scoped its job to read-only tools must not gain
+    // brain_put_page by flipping mode: oneshot — the oneshot registry runs
+    // through the SAME filterAllowedTools as the loop registry.
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'read-only answer' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const handler = makeSubagentHandler({
+      engine, client,
+      toolRegistry: [makeEchoTool(), makeEchoTool('brain_put_page')],
+      _chat: chatStub(VALID),
+    });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot',
+      allowed_tools: allowedTools,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    const result = await handler(ctx);
+    expect(result.synth_mode_used).toBe('agentic_fallback');
+    expect(result.fallback_reason).toBe('no_put_page_tool');
+    // No page write happened anywhere.
+    const rows = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM subagent_tool_executions WHERE job_id = $1 AND tool_name = 'brain_put_page'`,
+      [ctx.id],
+    );
+    expect(rows[0]!.n).toBe(0);
+    if (allowedTools.length === 0) expect(client.calls[0]!.tools ?? []).toEqual([]);
+  });
+
+  test('crash-replayed TRUNCATED terminal turn recovers max_tokens, not end_turn (F1)', async () => {
+    // A length-stopped zero-write run persisted its terminal turn, crashed
+    // before completeJob, and replays. Pre-fix the early-return hardcoded
+    // end_turn, laundering the truncation past the zero-attempt honesty
+    // gate — the job completed with zero pages and consumed the transcript.
+    const client = new FakeMessagesClient([]); // replay path must not call the model
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'synthesize', require_writes: true });
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks, tokens_out)
+       VALUES ($1, 0, 'user', '[{"type":"text","text":"synthesize"}]'::jsonb, NULL),
+              ($1, 1, 'assistant', '[{"type":"text","text":"truncated partial outp"}]'::jsonb, 8192)`,
+      [ctx.id],
+    );
+    await expect(handler(ctx)).rejects.toThrow(/did not finish cleanly.*max_tokens/);
+  });
+
+  test('crash-replayed CLEAN terminal turn still returns end_turn', async () => {
+    const client = new FakeMessagesClient([]);
+    const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+    const ctx = await makeCtx({ prompt: 'hello' });
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks, tokens_out)
+       VALUES ($1, 0, 'user', '[{"type":"text","text":"hello"}]'::jsonb, NULL),
+              ($1, 1, 'assistant', '[{"type":"text","text":"a normal answer"}]'::jsonb, 42)`,
+      [ctx.id],
+    );
+    const result = await handler(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(result.result).toBe('a normal answer');
+  });
+
+  test('half-persisted transcript + oneshot ledger rows → recovery, NEVER an agentic re-call (RT-2)', async () => {
+    // Crash shape: all writes settled, then only the seed user message
+    // landed (the two transcript INSERTs are not atomic). Pre-fix, the
+    // messages>0 gate skipped oneshot entirely and the loop replay re-called
+    // a nondeterministic model with the pages already written.
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'text', text: 'should never run' }] as any, stop_reason: 'end_turn' },
+    ]);
+    let oneshotChatCalls = 0;
+    const spy = (async (...args: any[]) => { oneshotChatCalls++; return chatStub(VALID)(...args); }) as any;
+    const handler = makeSubagentHandler({ engine, client, _chat: spy });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: SUFFIX,
+    });
+    // Seed: one message (no terminal assistant row) + a completed oneshot ledger row.
+    await engine.executeRaw(
+      `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+       VALUES ($1, 0, 'user', '[{"type":"text","text":"synthesize"}]'::jsonb)`,
+      [ctx.id],
+    );
+    await engine.executeRaw(
+      `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status)
+       VALUES ($1, 1, 'oneshot-cafef00d-p0', 'brain_put_page', $2::text::jsonb, 'complete')`,
+      [ctx.id, JSON.stringify({ slug: SLUG_A, content: 'already written' })],
+    );
+    const result = await handler(ctx);
+    expect(result.synth_mode_used).toBe('oneshot');
+    expect((result as { recovered?: boolean }).recovered).toBe(true);
+    expect(oneshotChatCalls).toBe(0); // ledger-first: model never re-called
+    expect(client.calls.length).toBe(0); // agentic loop never ran
+  });
+
+  test('replayed completed oneshot job is NOT stamped agentic_fallback (honesty rule)', async () => {
+    // First invocation completes via oneshot (persists the 2-message terminal
+    // transcript). A second invocation of the SAME job (outcome write lost,
+    // stall requeue) replays from the transcript — no fallback happened, so
+    // stamping 'agentic_fallback' would poison the phase fallback histogram.
+    const replaySuffix = `${SUFFIX}-replay`;
+    const replayOutput = VALID.replaceAll(SUFFIX, replaySuffix);
+    const client = new FakeMessagesClient([]);
+    const handler = makeSubagentHandler({ engine, client, _chat: chatStub(replayOutput) });
+    const ctx = await makeCtx({
+      prompt: 'synthesize', mode: 'oneshot', require_writes: true,
+      allowed_slug_prefixes: PREFIXES, oneshot_slug_suffix: replaySuffix,
+    });
+    const first = await handler(ctx);
+    expect(first.synth_mode_used).toBe('oneshot');
+    const initialWrites = await engine.executeRaw<{ request_id: string; status: string }>(
+      "SELECT input->>'request_id' AS request_id,status FROM subagent_tool_executions WHERE job_id=$1 ORDER BY tool_use_id", [ctx.id]);
+    expect(initialWrites).toHaveLength(2);
+    expect(initialWrites.every(row => typeof row.request_id === 'string' && row.status === 'complete')).toBe(true);
+
+    let chatCalls = 0;
+    const spy = (async (...args: any[]) => { chatCalls++; return chatStub(replayOutput)(...args); }) as any;
+    const handler2 = makeSubagentHandler({ engine, client, _chat: spy });
+    const replayCtx: typeof ctx = { ...ctx, attempts_made: 1 };
+    const replay = await handler2(replayCtx);
+    expect(replay.synth_mode_used).not.toBe('agentic_fallback');
+    expect('fallback_reason' in replay).toBe(false);
+    // The ledger-first recovery path may finalize from rows (oneshot) or the
+    // transcript replay may return unset — either is honest; a fabricated
+    // fallback is not. Either way the model is not re-called by the loop.
+    expect(chatCalls).toBe(0);
+    expect(await engine.executeRaw(
+      "SELECT input->>'request_id' AS request_id,status FROM subagent_tool_executions WHERE job_id=$1 ORDER BY tool_use_id", [ctx.id]))
+      .toEqual(initialWrites);
+  });
+});
+
+// ── #4217 accounting fail-open (transient read error never kills a finished job) ──
+
+describe('finalizeWriteAccounting read-error posture (CX-A3)', () => {
+  const { finalizeWriteAccounting } = require('../src/core/minions/handlers/subagent-persistence.ts');
+  const explodingEngine = {
+    executeRaw: async () => { throw new Error('pool reaped mid-read'); },
+  } as unknown as import('../src/core/engine.ts').BrainEngine;
+  const result = { result: 'done', turns_count: 3, stop_reason: 'end_turn', tokens: { in: 1, out: 1, cache_read: 0, cache_create: 0 } };
+
+  test('open-ended jobs fail OPEN: result returned unchanged on a read error', async () => {
+    const out = await finalizeWriteAccounting(explodingEngine, 999, result, { requireWrites: false });
+    expect(out).toBe(result);
+  });
+
+  test('require_writes jobs fail CLOSED: the read error rethrows (retry re-reads on a healthy pool)', async () => {
+    // Fail-open here would complete an all-writes-failed job on the exact
+    // pool failure the accounting exists to survive.
+    await expect(finalizeWriteAccounting(explodingEngine, 999, result, { requireWrites: true }))
+      .rejects.toThrow('pool reaped mid-read');
+  });
+
+  test('zero attempts + dirty stop_reason + require_writes → UnrecoverableError (CX-A4)', async () => {
+    const okEngine = {
+      executeRaw: async () => [],
+    } as unknown as import('../src/core/engine.ts').BrainEngine;
+    const truncated = { ...result, stop_reason: 'max_tokens' };
+    await expect(finalizeWriteAccounting(okEngine, 999, truncated, { requireWrites: true }))
+      .rejects.toThrow(/did not finish cleanly.*max_tokens/);
+    await expect(finalizeWriteAccounting(okEngine, 999, result, { requireWrites: true }))
+      .rejects.toThrow('zero required put_page writes');
+    const out = await finalizeWriteAccounting(okEngine, 999, result, { requireWrites: false });
+    expect(out.pages_attempted).toBe(0);
+  });
+});
+
+describe('handler-entry capability gate on the resolved model', () => {
+  test('config-resolved models.subagent with supports_subagent_loop: false is refused at dispatch', async () => {
+    // The queue submit gate only sees explicit data.model. A job that omits
+    // data.model resolves `models.subagent` inside the handler — pre-fix that
+    // path bypassed the capability check entirely and a loop-incapable model
+    // (declared supports_subagent_loop: false) ran the loop anyway.
+    await engine.setConfig('models.subagent', 'moonshot:kimi-k2.5');
+    try {
+      const client = new FakeMessagesClient([
+        { content: [{ type: 'text', text: 'should never run' }] as any, stop_reason: 'end_turn' },
+      ]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' }); // no data.model → queue gate passes
+      await expect(handler(ctx)).rejects.toThrow(/supports_subagent_loop/);
+      expect(client.calls.length).toBe(0); // refused before any provider call
+    } finally {
+      await engine.unsetConfig('models.subagent');
+    }
+  });
+
+  test('already-terminal replay is NOT refused when config points at a loop-incapable model', async () => {
+    // #1151 precedent: a job whose last persisted message is a terminal
+    // assistant turn needs no provider call — the replay short-circuit
+    // returns the committed result. A capability refusal here (config
+    // repointed between submit and replay) would dead-letter completed work.
+    // Gateway loop ON: that's the only routing where the capability gate is
+    // the deciding check (the legacy path's Anthropic pin refuses
+    // non-Anthropic models regardless). The gateway path's terminal
+    // early-return runs before any provider client is constructed, so no
+    // API key is needed.
+    await engine.setConfig('models.subagent', 'moonshot:kimi-k2.5');
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    try {
+      const client = new FakeMessagesClient([]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      // Persist a completed transcript: seed user + terminal assistant.
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES ($1, 0, 'user', $2::text::jsonb), ($1, 1, 'assistant', $3::text::jsonb)`,
+        [
+          ctx.id,
+          JSON.stringify([{ type: 'text', text: 'hi' }]),
+          JSON.stringify([{ type: 'text', text: 'committed answer' }]),
+        ],
+      );
+      const result = await handler(ctx);
+      expect(result.result).toBe('committed answer');
+      // Replay short-circuit: no new turns persisted beyond the 2 seeded rows
+      // (a provider call would have appended an assistant row — and would have
+      // failed anyway, since no gateway credentials are configured here).
+      const rows = await engine.executeRaw<{ count: string }>(
+        `SELECT count(*)::text AS count FROM subagent_messages WHERE job_id = $1`,
+        [ctx.id],
+      );
+      expect(parseInt(rows[0]!.count, 10)).toBe(2);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+  });
+
+  test('non-terminal gateway replay (pending tool-call) IS still refused on a loop-incapable model', async () => {
+    // A gateway transcript persists pending dispatch as `tool-call` blocks.
+    // A replay that still needs the loop to resume on the provider must NOT
+    // slip past the capability gate via the terminal exception.
+    await engine.setConfig('models.subagent', 'moonshot:kimi-k2.5');
+    await engine.setConfig('agent.use_gateway_loop', 'true');
+    try {
+      const client = new FakeMessagesClient([]);
+      const handler = makeSubagentHandler({ engine, client, toolRegistry: [] });
+      const ctx = await makeCtx({ prompt: 'hi' });
+      await engine.executeRaw(
+        `INSERT INTO subagent_messages (job_id, message_idx, role, content_blocks)
+         VALUES ($1, 0, 'user', $2::text::jsonb), ($1, 1, 'assistant', $3::text::jsonb)`,
+        [
+          ctx.id,
+          JSON.stringify([{ type: 'text', text: 'hi' }]),
+          JSON.stringify([{ type: 'tool-call', toolCallId: 'tc_1', toolName: 'echo', input: {} }]),
+        ],
+      );
+      await expect(handler(ctx)).rejects.toThrow(/supports_subagent_loop/);
+    } finally {
+      await engine.unsetConfig('models.subagent');
+      await engine.unsetConfig('agent.use_gateway_loop');
+    }
+  });
+});
+
+describe('legacy loop: an accepted tool write that is still pending (#5474)', () => {
+  // A deadline this far out leaves a replay window well past every case below.
+  const farDeadline = () => Date.now() + 10 * 60_000;
+  /** A put_page whose write is pending for `pendingFor` dispatches, then lands in `settles`. */
+  function stagedWrite(pendingFor: number, opts: { throwPending?: boolean; settles?: 'committed' | 'failed'; retryAfterMs?: number } = {}) {
+    const requestIds: unknown[] = [];
+    const tool: ToolDef = { ...makeEchoTool('brain_put_page'), async execute(input) {
+      const request_id = (input as Record<string, unknown>).request_id; requestIds.push(request_id);
+      if (requestIds.length > pendingFor) return { request_id, state: opts.settles ?? 'committed', retry_after_ms: null };
+      const receipt = { request_id, state: 'queued', retry_after_ms: opts.retryAfterMs ?? 10 };
+      if (!opts.throwPending) return receipt;
+      const pending = new OperationError('write_pending', 'The write is accepted and is still pending.', 'Read its receipt.');
+      pending.writeRequest = receipt as never; pending.writeError = 'write_pending';
+      throw pending;
+    } };
+    return { tool, requestIds };
+  }
+  const oneWriteThenDone = () => new FakeMessagesClient([
+    { content: [{ type: 'tool_use', id: 'tu_w', name: 'brain_put_page', input: { slug: 'notes/staged-example', content: 'x' } } as any], stop_reason: 'tool_use' as any },
+    { content: [{ type: 'text', text: 'done' }] as any, stop_reason: 'end_turn' },
+  ]);
+  const rowStatuses = async (jobId: number) =>
+    (await engine.executeRaw<{ status: string }>('SELECT status FROM subagent_tool_executions WHERE job_id = $1', [jobId])).map(r => r.status);
+
+  for (const throwPending of [false, true]) {
+    test(`a ${throwPending ? 'thrown write_pending' : 'returned queued receipt'} is replayed under one request id until it commits`, async () => {
+      const { tool, requestIds } = stagedWrite(4, { throwPending });
+      const client = oneWriteThenDone();
+      const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: farDeadline() };
+      const result = await makeSubagentHandler({ engine, client, toolRegistry: [tool] })(ctx);
+      expect(result.stop_reason).toBe('end_turn');
+      expect(client.calls.length).toBe(2);
+      expect(requestIds).toHaveLength(5);
+      expect(new Set(requestIds).size).toBe(1);
+      expect(await rowStatuses(ctx.id)).toEqual(['complete']);
+    });
+  }
+
+  test('the replay window follows the job deadline, not the shorter maintenance wait', async () => {
+    const restore = __setMaintenanceWriteWaitForTests(0);
+    try {
+      const { tool, requestIds } = stagedWrite(3);
+      const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: farDeadline() };
+      const result = await makeSubagentHandler({ engine, client: oneWriteThenDone(), toolRegistry: [tool] })(ctx);
+      expect(result.stop_reason).toBe('end_turn');
+      expect(requestIds).toHaveLength(4);
+    } finally { restore(); }
+  });
+
+  test('a job without a deadline replays only for the maintenance wait, then stays pending', async () => {
+    const restore = __setMaintenanceWriteWaitForTests(120);
+    try {
+      const { tool, requestIds } = stagedWrite(Number.MAX_SAFE_INTEGER);
+      const client = oneWriteThenDone();
+      const ctx = await makeCtx({ prompt: 'go' });
+      const started = Date.now();
+      const failure = await makeSubagentHandler({ engine, client, toolRegistry: [tool] })(ctx).then(() => null, (e: unknown) => e);
+      expect(failure).toMatchObject({ code: 'write_pending', writeRequest: { request_id: requestIds[0] } });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(100);
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(requestIds.length).toBeGreaterThan(2);
+      expect(new Set(requestIds).size).toBe(1);
+      expect(client.calls.length).toBe(1);
+      expect(await rowStatuses(ctx.id)).toEqual(['pending']);
+    } finally { restore(); }
+  });
+
+  test('a job already inside its deadline reserve does not replay', async () => {
+    const { tool, requestIds } = stagedWrite(Number.MAX_SAFE_INTEGER);
+    const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: Date.now() + 40_000 };
+    await expect(makeSubagentHandler({ engine, client: oneWriteThenDone(), toolRegistry: [tool] })(ctx)).rejects.toMatchObject({ code: 'write_pending' });
+    expect(requestIds).toHaveLength(1);
+    expect(await rowStatuses(ctx.id)).toEqual(['pending']);
+  });
+
+  test('cancelling the job ends a long pause with the pending receipt and dispatches nothing more', async () => {
+    const { tool, requestIds } = stagedWrite(Number.MAX_SAFE_INTEGER, { retryAfterMs: 20_000 });
+    const cancel = new AbortController();
+    const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: farDeadline(), signal: cancel.signal };
+    const started = Date.now();
+    const settled = makeSubagentHandler({ engine, client: oneWriteThenDone(), toolRegistry: [tool] })(ctx).then(() => null, (e: unknown) => e);
+    setTimeout(() => cancel.abort(new Error('example cancel')), 80);
+    expect(await settled).toMatchObject({ code: 'write_pending', writeRequest: { request_id: requestIds[0], state: 'queued' } });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(requestIds).toHaveLength(1);
+    expect(await rowStatuses(ctx.id)).toEqual(['pending']);
+  });
+
+  test('a write that ended failed is reported to the model, not replayed', async () => {
+    const { tool, requestIds } = stagedWrite(0, { settles: 'failed' });
+    const client = oneWriteThenDone();
+    const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: farDeadline() };
+    const result = await makeSubagentHandler({ engine, client, toolRegistry: [tool] })(ctx);
+    expect(result.stop_reason).toBe('end_turn');
+    expect(requestIds).toHaveLength(1);
+    expect(client.calls.length).toBe(2);
+    expect(await rowStatuses(ctx.id)).toEqual(['failed']);
+  });
+
+  test('a tool that is not a journal mutation passes a queued-looking result straight through', async () => {
+    let dispatches = 0;
+    const lookalike: ToolDef = { ...makeEchoTool('brain_search'), async execute() {
+      dispatches++; return { request_id: '00000000-0000-4000-8000-000000000000', state: 'queued', retry_after_ms: 10 };
+    } };
+    const client = new FakeMessagesClient([
+      { content: [{ type: 'tool_use', id: 'tu_s', name: 'brain_search', input: { query: 'x' } } as any], stop_reason: 'tool_use' as any },
+      { content: [{ type: 'text', text: 'done' }] as any, stop_reason: 'end_turn' },
+    ]);
+    const ctx = { ...(await makeCtx({ prompt: 'go' })), deadlineAtMs: farDeadline() };
+    expect((await makeSubagentHandler({ engine, client, toolRegistry: [lookalike] })(ctx)).stop_reason).toBe('end_turn');
+    expect(dispatches).toBe(1);
+  });
+});

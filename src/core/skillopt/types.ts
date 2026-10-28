@@ -1,0 +1,366 @@
+/**
+ * SkillOpt v1 types — single source of truth for the optimization loop.
+ *
+ * The optimizer treats SKILL.md as the trainable parameters of a frozen
+ * agent. See plan: ~/.claude/plans/system-instruction-you-are-working-drifting-falcon.md.
+ *
+ * Per the v0.41.20.0 plan decisions:
+ *  D2: rollout uses gateway.toolLoop (no DB pollution).
+ *  D5: frontmatter mutation is forbidden; edits operate on body slice only.
+ *  D9: applyEdit returns a tagged result, not throws.
+ *  D12: validation gate uses median-of-3 + epsilon=0.05.
+ *  D17: D_sel >= 5 floor enforced at benchmark-load time.
+ */
+
+import type { BrainEngine } from '../engine.ts';
+import type { OperationContext } from '../ops/contract.ts';
+import type { ToolLoopStopReason } from '../ai/gateway.ts';
+import type { ModelUsageRow } from '../budget/models-used.ts';
+import type { NoPricingGuidance } from '../budget/no-pricing.ts';
+import type { ModelsPlanEntry, SkillOptModels, StrictVerdict } from './models-plan.ts';
+
+// ─── Benchmarks + judges ──────────────────────────────────────────────────
+
+/** Rule-check kinds for `judge: rule`. Each is deterministic and free. */
+export type RuleCheckOp =
+  | 'contains'
+  | 'regex'
+  | 'section_present'
+  | 'max_chars'
+  | 'min_citations'
+  | 'tool_called'
+  | 'tool_not_called';
+
+export interface RuleCheck {
+  op: RuleCheckOp;
+  arg: string | number;
+}
+
+export type JudgeKind = 'rule' | 'llm' | 'qrels';
+
+export type Judge =
+  | { kind: 'rule'; checks: RuleCheck[] }
+  | { kind: 'llm'; rubric: string; model?: string }
+  | { kind: 'qrels'; expected_slugs: string[]; k: number };
+
+export interface BenchmarkTask {
+  task_id: string;
+  task: string;
+  judge: Judge;
+}
+
+export interface Benchmark {
+  /** Path the benchmark was loaded from (for error messages). */
+  source_path: string;
+  tasks: BenchmarkTask[];
+  /** SHA-256 of the canonical JSON, truncated to 16 hex. Stable across reorderings. */
+  benchmark_sha8: string;
+}
+
+/** D17: enforced floor for D_sel. */
+export const D_SEL_MIN_SIZE = 5;
+
+export interface BenchmarkSplit {
+  train: BenchmarkTask[];
+  sel: BenchmarkTask[];
+  test: BenchmarkTask[];
+}
+
+// ─── Edit ops ─────────────────────────────────────────────────────────────
+
+/** D9: applyEdit returns a tagged result, not throws. */
+export type EditOp =
+  | { op: 'add'; anchor: string; content: string; reason?: string }
+  | { op: 'replace'; target: string; replacement: string; reason?: string }
+  | { op: 'delete'; target: string; reason?: string };
+
+export type EditRejectionReason =
+  | 'anchor_not_found'
+  | 'anchor_ambiguous'
+  | 'target_not_found'
+  | 'target_ambiguous'
+  | 'inside_code_fence'
+  | 'crosses_frontmatter'
+  | 'working_tree_dirty'
+  | 'install_path'
+  | 'no_change';
+
+export type EditResult =
+  | { outcome: 'applied'; edit: EditOp; newText: string }
+  | { outcome: 'rejected'; edit: EditOp; reason: EditRejectionReason; detail?: string };
+
+// ─── Trajectories + rollouts ──────────────────────────────────────────────
+
+/** What a rollout produced. Captured in-process; never persisted to DB (D2). */
+export interface Trajectory {
+  task_id: string;
+  task: string;
+  /** Final assistant text (typically the user-visible output). */
+  final_text: string;
+  /** Tool calls observed during the rollout, in order. */
+  tool_calls: Array<{ name: string; input: unknown; output?: unknown; failed?: boolean }>;
+  /** Token usage from gateway.toolLoop. */
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+  };
+  /** Number of agent turns the loop took. */
+  turns: number;
+  /** End reason from gateway.toolLoop ('length' = output-cap truncation, #4088). */
+  stop_reason: ToolLoopStopReason;
+  /** Wall-clock duration in ms. */
+  duration_ms: number;
+}
+
+export interface ScoredRollout {
+  trajectory: Trajectory;
+  /** 0..1 score from the judge. */
+  score: number;
+  /** Optional per-task rationale (LLM judge only). */
+  rationale?: string;
+  /** If the judge itself errored (parse fail, timeout), this is set. */
+  judge_error?: string;
+}
+
+// ─── Run state + receipts ─────────────────────────────────────────────────
+
+export interface SkillOptOpts {
+  operationContext?: OperationContext;
+  sharedSkill?: {
+    source_id: string;
+    source_incarnation: string;
+    pack_id: string;
+    expected_revision: string;
+    request_id: string;
+  };
+  /** Kebab-case skill name. Resolves to `skills/<name>/SKILL.md`. */
+  skillName: string;
+  /** Absolute path to the benchmark JSONL file. */
+  benchmarkPath: string;
+  /** Brain engine (required for D14 lock + read-only tool calls during rollouts). */
+  engine: BrainEngine;
+  /** Skills directory root (used for bundled-skill detection, install-path gate). */
+  skillsDir: string;
+
+  // Training knobs.
+  epochs: number;
+  batchSize: number;
+  /** Max edits per step (the LR). */
+  lr: number;
+  lrSchedule: 'cosine' | 'linear' | 'constant';
+  /** Split ratio as 3-tuple, e.g. [4, 1, 5] for 4:1:5. */
+  split: [number, number, number];
+
+  // Models.
+  optimizerModel: string;
+  targetModel: string;
+  judgeModel: string;
+  /**
+   * Explicit optimizer output cap (`--reflect-max-tokens`, MCP / job
+   * `reflect_max_tokens`). Beats `skillopt.reflect_max_tokens` config, which
+   * beats `defaultMaxOutputTokens(optimizerModel)`; resolved once per run.
+   */
+  reflectMaxTokens?: number;
+  /**
+   * #5585: provenance of the three role models (from resolveSkillOptModels).
+   * Absent -> every role reports source `unknown` (fail-closed under strict).
+   */
+  models?: SkillOptModels;
+  /** #5585: `--models-strict`; OR'ed with the `skillopt.models_strict` config. */
+  modelsStrict?: boolean;
+  /**
+   * #5585: invocation banner already printed by a batch / cycle caller; the
+   * run prints only the plan rows that differ from it.
+   */
+  modelsBannerBaseline?: ModelsPlanEntry[];
+
+  // Modes.
+  mode: 'patch' | 'rewrite';
+  dryRun: boolean;
+  noMutate: boolean;
+  allowMutateBundled: boolean;
+  bootstrapReviewed: boolean;
+  /** F10: enable write-capture mode for write-flavored skills. */
+  writeCapture?: boolean;
+  /** F11: optional held-out test set path (validates winner before mutate). */
+  heldOutPath?: string;
+  json: boolean;
+
+  // ─── Eval-internal ablation knobs (NOT exposed on the CLI) ───────────────
+  // These exist so the gbrain-evals ablation (cat31) can run the orchestrator
+  // in degraded modes for an apples-to-apples comparison. Defaults preserve
+  // the full production pipeline. `disableValidationGate` MUST NOT be wired to
+  // any user-facing flag — it disables the core safety gate.
+  /** Ablation: 'failure-only' skips the D7 success reflect call. Default 'both'. */
+  reflectMode?: 'both' | 'failure-only';
+  /** Ablation: greedy-accept every applied edit, skip the D12 median+epsilon gate. Default false. */
+  disableValidationGate?: boolean;
+  /** Ablation: 'one-shot-rewrite' does ONE rewrite call, no loop, no gate. Default 'reflect'. */
+  optimizerMode?: 'reflect' | 'one-shot-rewrite';
+
+  // Safety.
+  /** USD cap for the run. #3516: 0 means UNCAPPED (--no-max-cost) — pricing
+   *  misses then warn-once instead of hard-failing, so unpriced model ids
+   *  (openrouter:*, litellm:*) can run. */
+  maxCostUsd: number;
+  /** Where a positive `maxCostUsd` came from (#5563). `user` (a cap flag; the
+   *  value when unset, so legacy callers and queued jobs keep failing closed)
+   *  refuses an unpriced model with the no_pricing guidance; `default` (no
+   *  flag, the $5 default) warns and runs it while metering priced calls. */
+  maxCostSource?: 'user' | 'default';
+  maxRuntimeMin: number;
+  force: boolean;
+  resumeRunId?: string;
+}
+
+export interface StepRecord {
+  epoch: number;
+  step: number;
+  sel_score_median: number;
+  sel_score_runs: number[];
+  accepted: boolean;
+  edits_attempted: number;
+  edits_applied: number;
+  delta: number;
+  reason?: string;
+  cumulative_cost_usd: number;
+  ts: string;
+}
+
+export interface RunReceipt {
+  run_id: string;
+  skill: string;
+  skill_sha8: string;
+  benchmark_sha8: string;
+  optimizer_model: string;
+  target_model: string;
+  judge_model: string;
+  epochs: number;
+  batch_size: number;
+  lr: number;
+  lr_schedule: 'cosine' | 'linear' | 'constant';
+  max_cost_usd: number;
+  started_at: string;
+  ended_at?: string;
+  outcome?: 'accepted' | 'no_improvement' | 'aborted' | 'errored';
+  baseline_sel_score?: number;
+  best_sel_score?: number;
+  baseline_test_score?: number;
+  test_score?: number;
+  final_cost_usd?: number;
+  total_steps?: number;
+  epochs_completed?: number;
+  // #3516: present when outcome is 'aborted' | 'errored' — machine-readable
+  // reason + the underlying error message, mirrored from the audit trail.
+  abort_reason?: 'budget_exhausted' | 'runtime_exceeded' | 'sigint' | 'error';
+  abort_detail?: string;
+  /** no_pricing abort: look up the model's price and register it (`register_command`), then retry. */
+  no_pricing?: NoPricingGuidance;
+  /** #5584: why the loop stopped. */
+  stop_reason?: 'completed' | 'early_stop_unusable_output' | 'aborted';
+  /** #5584: optimizer-reply errors (reflect + one-shot), deduped, max 20 x 300 chars. */
+  reflect_errors?: string[];
+  /** #5584: malformed edits dropped from otherwise-usable optimizer replies. */
+  reflect_invalid_edits_dropped?: number;
+  /** #5584: set when the skill body had to be truncated to fit the optimizer window. */
+  skill_body_truncated?: { sent_chars: number; total_chars: number };
+  /** #5584: one entry per distinct error code in reflect_errors / abort_detail. */
+  remediation?: Array<{ code: string; fix: string; docs: string }>;
+  /** #5584: effective optimizer output cap and where it came from. */
+  reflect_max_tokens?: number;
+  reflect_max_tokens_source?: 'flag' | 'config' | 'default';
+  /** #5584: exact command that resumes this run (present when the checkpoint is retained). */
+  resume_command?: string;
+  /** #5585: every model the run called, one row per (requested, served, touchpoint, purpose). */
+  models_used?: ModelUsageRow[];
+  /** #5585: `since_resume` when an earlier segment's checkpoint predates ledger persistence. */
+  models_used_scope?: 'full_run' | 'since_resume';
+  /** #5585: spend banked by earlier segments of a resumed run; `final_cost_usd` is this segment. */
+  prior_segments_cost_usd?: number;
+  /** #5585: every touchpoint the run can call, with the source that chose its model. */
+  models_plan?: ModelsPlanEntry[];
+  /** #5585: strict-mode verdict over `models_plan` (computed even when strict mode is off). */
+  models_strict?: StrictVerdict;
+  // Ablation provenance (cat31 replayability) — present when a non-default
+  // ablation knob was set.
+  reflect_mode?: 'both' | 'failure-only';
+  validation_gate_disabled?: boolean;
+  optimizer_mode?: 'reflect' | 'one-shot-rewrite';
+}
+
+export interface HistoryRow {
+  /** D8: pending → committed two-phase commit. */
+  status: 'pending' | 'committed';
+  run_id: string;
+  version_n: number;
+  ts: string;
+  edits: EditOp[];
+  sel_score: number;
+  delta: number;
+}
+
+// ─── Validation gate (D12) ────────────────────────────────────────────────
+
+/** D12: epsilon margin floor for accepting a candidate. */
+export const VALIDATION_EPSILON = 0.05;
+/** D12: number of judge runs per sel-task for noise rejection. */
+export const VALIDATION_RUNS_PER_TASK = 3;
+/**
+ * Score at/above which a forward-pass rollout counts as a "success" (fed to the
+ * success-reflect call) vs a "failure" (fed to the failure-reflect call). Single
+ * source of truth for the D7 partition — used by every forward-pass site.
+ */
+export const ROLLOUT_SUCCESS_THRESHOLD = 0.5;
+
+/** #5585: `purpose` stamped on skillopt's gateway calls, one BudgetTracker ledger row per role. */
+export const SKILLOPT_PURPOSE = {
+  optimizer: 'skillopt.optimizer',
+  target: 'skillopt.target',
+  judge: 'skillopt.judge',
+} as const;
+
+export interface GateInput {
+  candidateSkillText: string;
+  selSet: BenchmarkTask[];
+  /** Best score so far on D_sel (epsilon-margin compare against this). */
+  bestScore: number;
+}
+
+export interface GateResult {
+  accepted: boolean;
+  /** Per-task median across N runs. */
+  perTaskMedians: Array<{ task_id: string; median: number; runs: number[] }>;
+  /** Mean of per-task medians. */
+  selScore: number;
+  reason?: 'no_margin' | 'below_baseline' | 'all_judge_errors';
+  /**
+   * Every scored rollout this gate produced, in selSet order (runs per task
+   * flattened). Used by the orchestrator's forward pass to partition into
+   * successes/failures for reflect. Sel-side gates also surface this but the
+   * orchestrator only reads it for the forward path (runsPerTask=1).
+   */
+  scoredRollouts: ScoredRollout[];
+}
+
+// ─── Bootstrap sentinel (D15) ─────────────────────────────────────────────
+
+/** D15: sentinel line written at the end of bootstrap-from-routing output. */
+export const BOOTSTRAP_PENDING_REVIEW = '# BOOTSTRAP_PENDING_REVIEW';
+
+// ─── Bundled-skill gate (D16) ─────────────────────────────────────────────
+
+/**
+ * D16: a skill is "bundled" when its SKILL.md lives under the repo's
+ * canonical `skills/` directory (relative to the gbrain install root).
+ * Bundled skills require `--allow-mutate-bundled` to overwrite.
+ */
+export interface BundledSkillContext {
+  skillName: string;
+  skillsDir: string;
+  /** Resolved absolute path to skills/<name>/SKILL.md. */
+  skillPath: string;
+  /** True when the skillsDir is the repo's `skills/` (install path). */
+  isBundled: boolean;
+}

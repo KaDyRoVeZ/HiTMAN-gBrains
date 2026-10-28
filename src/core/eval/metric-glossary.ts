@@ -1,0 +1,459 @@
+/**
+ * v0.32.3 — Single source of truth for evaluation-metric plain-English
+ * glosses. Drives `gbrain search stats` JSON output (`_meta.metric_glossary`
+ * block), `gbrain eval compare` reports, and the auto-generated
+ * `docs/eval/METRIC_GLOSSARY.md` file.
+ *
+ * Per [CDX-25]: glosses live in one `_meta.metric_glossary` block per
+ * response, NOT as sibling `_gloss` fields on every metric. Less invasive
+ * to machine-readable consumers (gbrain-evals repo, CI gates).
+ *
+ * Every entry has THREE fields:
+ *   - industry_term: the canonical name used in IR / NLP literature
+ *     (preserved verbatim so users searching the literature find what we
+ *     report)
+ *   - eli10: plain-English explanation a 16-year-old could follow
+ *   - range: explicit numeric range + interpretation ("higher is better",
+ *     "0..1 where 1 = perfect")
+ *
+ * The doc generator at `scripts/generate-metric-glossary.ts` consumes this
+ * module and writes `docs/eval/METRIC_GLOSSARY.md`. A CI guard
+ * (`scripts/check-eval-glossary-fresh.sh`) regenerates the doc and diffs
+ * against the committed version — out-of-date docs fail the build.
+ */
+
+export interface MetricGlossEntry {
+  industry_term: string;
+  eli10: string;
+  range: string;
+}
+
+export const METRIC_GLOSSARY: Readonly<Record<string, Readonly<MetricGlossEntry>>> = Object.freeze({
+  // ────────────────────────────────────────────────────────────────────────
+  // Retrieval metrics (IR literature)
+  // ────────────────────────────────────────────────────────────────────────
+  'precision@k': Object.freeze({
+    industry_term: 'Precision at k (P@k)',
+    eli10: 'Of the top k unique pages the engine returned, what fraction were actually relevant? Multiple chunks from one page count once. High precision means few junk pages in the top of the list.',
+    range: '0..1, higher is better. The denominator stays k even when fewer than k unique pages are returned; P@10 = 0.7 means 7 relevant pages in the top 10 slots.',
+  }),
+  'recall@k': Object.freeze({
+    industry_term: 'Recall at k (R@k)',
+    eli10: 'Of all the relevant pages that exist in the brain, what fraction did the engine find in its first k unique pages? Multiple chunks from one page count once. High recall means few missed answers.',
+    range: '0..1, higher is better. R@10 = 0.81 means 81% of all labeled relevant pages appeared in the first 10 unique results.',
+  }),
+  'mrr': Object.freeze({
+    industry_term: 'Mean Reciprocal Rank (MRR)',
+    eli10: 'On average, how far down the unique-page list is the FIRST relevant result? Repeated chunks do not consume ranks. An MRR of 1.0 means the first page is always right; an MRR of 0.5 means it\'s typically at rank 2.',
+    range: '0..1, higher is better. Computed as the average of 1/rank-of-first-relevant-result across all test queries.',
+  }),
+  'ndcg@k': Object.freeze({
+    industry_term: 'Normalized Discounted Cumulative Gain at k (nDCG@k)',
+    eli10: 'Like precision@k, but the engine gets MORE credit for putting good pages near the top than near rank k. Each page earns gain once even if several chunks matched. A perfect ordering scores 1.0; a totally random ordering scores near 0.',
+    range: '0..1, higher is better. nDCG@10 above 0.65 is the common "ship it" threshold for hybrid retrieval on technical corpora.',
+  }),
+
+  // ────────────────────────────────────────────────────────────────────────
+  // NamedThingBench (retrieval-quality) + the agent-facing evidence contract
+  // ────────────────────────────────────────────────────────────────────────
+  'hit@1': Object.freeze({
+    industry_term: 'Hit rate at 1 (Hit@1)',
+    eli10: 'Fraction of queries where the right page is the very first result. NamedThingBench hard-gates title-substring Hit@1 >= 0.95 and alias Hit@1 >= 0.98 — a query that is a page\'s name or title phrase should land it at rank 1, not "somewhere in the top 10".',
+    range: '0..1, higher is better.',
+  }),
+  'hit@3': Object.freeze({
+    industry_term: 'Hit rate at 3 (Hit@3)',
+    eli10: 'Fraction of queries where the right page is in the top 3 results. NamedThingBench requires the multi-chunk-dilution family to hit 1.0 — a page with one strong chunk among many weak ones must never be buried.',
+    range: '0..1, higher is better.',
+  }),
+  'avg_rank1_score': Object.freeze({
+    industry_term: 'Average rank-1 match score',
+    eli10: 'The mean base (pre-boost) retrieval score of the TOP result across recent searches, from `gbrain search stats`. It is NOT a labeled accuracy number — it is a drift signal: if this trends DOWN over time, retrieval quality is regressing (the early warning that would have caught the duplicate-page incident before a human did).',
+    range: '0..1. Watch the trend, not the absolute value; pair with the <0.6 / 0.6-0.85 / >=0.85 bucket counts for shape.',
+  }),
+  'create_safety': Object.freeze({
+    industry_term: 'Create-safety hint (evidence contract)',
+    eli10: 'A result\'s answer to "is this page already in the brain — safe to NOT write a new one?" Derived from the strongest evidence, NOT a raw score: exists (alias_hit / exact_title_match / high_vector_match — do not duplicate), probable (solid keyword match — prefer updating), unknown (weak match — look closer). An agent keys its don\'t-duplicate decision off this, which is what prevents the incident\'s duplicate-stub class.',
+    range: 'enum: exists | probable | unknown',
+  }),
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Set-similarity / stability metrics (replay + regression checks)
+  // ────────────────────────────────────────────────────────────────────────
+  'jaccard@k': Object.freeze({
+    industry_term: 'Jaccard similarity at k (set Jaccard @k)',
+    eli10: 'How much do two result lists overlap? Compare the top k slugs from the captured baseline against the current run; Jaccard@10 = 1.0 means perfect agreement, 0.0 means zero overlap.',
+    range: '0..1, higher = more stable. Below 0.5 on a stable corpus means retrieval changed significantly.',
+  }),
+  'top1_stability': Object.freeze({
+    industry_term: 'Top-1 stability rate',
+    eli10: 'Fraction of queries where the #1 result is the same between two runs. The most aggressive stability check — small ranking shifts that don\'t change the top answer don\'t hurt it.',
+    range: '0..1, higher = more stable. Above 0.85 typically means safe-to-merge for retrieval changes.',
+  }),
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Statistical-significance metrics (per-mode comparison)
+  // ────────────────────────────────────────────────────────────────────────
+  'p_value': Object.freeze({
+    industry_term: 'p-value (paired sign-flip randomization test)',
+    eli10: 'How likely the observed difference between two runs is just noise. Lower = stronger evidence the difference is real. Computed from per-question rows by randomly flipping which run each question\'s result belongs to, then Holm-corrected across every comparison in the report.',
+    range: '0..1, lower = stronger signal. Below 0.05 is the common "statistically significant" threshold; below 0.01 is strong evidence.',
+  }),
+  'confidence_interval': Object.freeze({
+    industry_term: '95% Confidence Interval (CI)',
+    eli10: 'The range we\'re 95% sure the true value falls inside, given the sample we measured. Narrower CI = more reliable estimate. Computed by resampling questions with replacement (paired bootstrap).',
+    range: 'Two-tuple [low, high]. If 0 is inside the CI for a Δ, the difference isn\'t statistically significant.',
+  }),
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Operational / cost metrics
+  // ────────────────────────────────────────────────────────────────────────
+  'cache_hit_rate': Object.freeze({
+    industry_term: 'Cache hit rate',
+    eli10: 'Fraction of searches that reused a recent cached answer instead of running fresh. Higher hit rate = lower latency + lower LLM spend, but stale results may slip through if the threshold is too loose.',
+    range: '0..1, higher generally better. 0.7-0.9 is the sweet spot for a busy brain; above 0.9 may indicate the similarity threshold is too loose.',
+  }),
+  'avg_results': Object.freeze({
+    industry_term: 'Average results returned',
+    eli10: 'Mean number of search-result rows the engine returned per call. Should be near the active mode\'s searchLimit unless the brain is small or the budget is dropping results.',
+    range: '0..searchLimit. Far below searchLimit suggests budget pressure or sparse retrieval.',
+  }),
+  'avg_tokens': Object.freeze({
+    industry_term: 'Average tokens delivered',
+    eli10: 'Estimated tokens (chars / 4) in the chunk text returned per search call. The direct measure of how much context an agent loop is paying for each search.',
+    range: '0..tokenBudget. Approximates OpenAI tiktoken count for English; off by ~5-10% for Anthropic and worse for non-English.',
+  }),
+  'cost_per_query_usd': Object.freeze({
+    industry_term: 'Cost per query (USD)',
+    eli10: 'Sum of LLM + embedding API charges for one search call. Includes the expansion call when expansion is on (off by default) + embedding cost + downstream answer-model cost if measured.',
+    range: '0..unbounded. Conservative mode is typically <\\$0.001 per call; tokenmax with answer-gen can exceed \\$0.01.',
+  }),
+  'p99_latency_ms': Object.freeze({
+    industry_term: 'p99 latency (ms)',
+    eli10: '99th percentile wall-clock time per search call. The latency that 1% of users see — long-tail experience, not the average.',
+    range: '0..unbounded. Warm-cache hits should be <50ms; a query with expansion on can exceed 1s due to the expansion call.',
+  }),
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Result-sizing metrics (v0.42.3.0 autocut)
+  // ────────────────────────────────────────────────────────────────────────
+  'autocut.signal': Object.freeze({
+    industry_term: 'Autocut signal',
+    eli10: "Which signal autocut used to size the result set. 'rerank' means it found a real score cliff in the cross-encoder rerank scores and cut there; 'none' means no trustworthy cliff (no reranker, <2 scored results, or the gap was too small) so it returned the full list.",
+    range: "'rerank' | 'none'. 'none' is not a failure — it means autocut declined to cut because the signal didn't justify it.",
+  }),
+  'autocut.gap_ratio': Object.freeze({
+    industry_term: 'Autocut gap ratio',
+    eli10: 'The size of the largest score drop autocut found, as a fraction of the top result\'s score. A gap of 0.40 means the score fell by 40% of the top score at the steepest point. Autocut cuts there only when this clears the sensitivity threshold (autocut_jump, default 0.20).',
+    range: '0..1, higher = a sharper cliff (more confident cut). Below the autocut_jump threshold → no cut.',
+  }),
+
+  // ────────────────────────────────────────────────────────────────────────
+  // BrainBench — cross-harness memory conformance suite
+  // (`gbrain eval brainbench`; docs/eval/BRAINBENCH.md)
+  // ────────────────────────────────────────────────────────────────────────
+  'know_to_ask_failure_rate': Object.freeze({
+    industry_term: 'Know-to-ask failure rate (BrainBench)',
+    eli10: 'Of the conversation turns where memory SHOULD have surfaced something unprompted, the fraction where nothing relevant was injected. This is the thesis failure mode every agent harness shares: the agent can\'t ask for what it doesn\'t know it forgot — the memory layer has to volunteer it.',
+    range: '0..1, LOWER is better. 0.15 means memory stayed silent on 15% of the turns where it had the answer.',
+  }),
+  'false_fire_rate': Object.freeze({
+    industry_term: 'False-fire rate (BrainBench)',
+    eli10: 'Of the turns where memory should have stayed SILENT, the fraction where it injected anyway. The anti-gaming companion to the know-to-ask rate — "always inject" would ace one and bomb the other. Silence beats noise.',
+    range: '0..1, LOWER is better.',
+  }),
+  'push_precision': Object.freeze({
+    industry_term: 'Push precision (BrainBench)',
+    eli10: 'Of everything the memory layer volunteered into context, what fraction was actually relevant to the turn? Micro-averaged over injected pointers, so a 3-pointer turn weighs three times a 1-pointer turn — the way a token budget experiences it.',
+    range: '0..1, higher is better.',
+  }),
+  'push_recall': Object.freeze({
+    industry_term: 'Push recall (BrainBench)',
+    eli10: 'Of everything that SHOULD have been volunteered (the gold pointers), what fraction actually was? Pointer budgets cap this by design: a seam that may inject only 1 fragment cannot reach full recall on a 3-entity turn — that constraint is what the per-harness rows measure.',
+    range: '0..1, higher is better.',
+  }),
+  'write_back_fidelity': Object.freeze({
+    industry_term: 'Write-back fidelity (BrainBench)',
+    eli10: 'Of the facts stated in a conversation, what fraction survived the PRODUCTION conversation→memory pipeline (segmentation, insertion, dedup) and are findable afterward with the right entity attached? Measures the write path users actually run, not a test-only insert.',
+    range: '0..1, higher is better.',
+  }),
+  'provenance_accuracy': Object.freeze({
+    industry_term: 'Provenance accuracy (BrainBench)',
+    eli10: 'Of the facts that survived write-back, what fraction carry correct provenance — the right source tag, session id, and origin page? A fact you can\'t trace is a fact you can\'t trust, audit, or expire.',
+    range: '0..1, higher is better.',
+  }),
+  'continuity_rate': Object.freeze({
+    industry_term: 'Cross-session continuity rate (BrainBench)',
+    eli10: 'A decision is recorded in one session and persisted through the production write path; a different harness asks about it later on the same brain. What fraction of those decision probes were recalled — by pointer injection or stored-fact lookup? This is the continuity-that-survives-the-harness-hop moat, measured.',
+    range: '0..1, higher is better. Scored per reader harness (the v1 write path is harness-independent, disclosed in docs/eval/BRAINBENCH.md).',
+  }),
+  'source_isolation_violations': Object.freeze({
+    industry_term: 'Source-isolation violations (BrainBench)',
+    eli10: 'Count of injected pointers that belong to a source other than the active one. Cross-source leakage is gbrain\'s must-never-violate invariant (a missed source filter is a data leak), so this gates at ZERO — any baseline, any run.',
+    range: '0..n, count. MUST be 0; any value above 0 fails the gate.',
+  }),
+  'avg_injected_tokens': Object.freeze({
+    industry_term: 'Average injected tokens per turn (BrainBench)',
+    eli10: 'Estimated tokens of volunteered context per replayed turn (chars/4 heuristic). The intrusion-budget diagnostic: two seams with equal precision can differ 3x in how much context they spend to get it. Reported, not gated, until calibration data exists.',
+    range: '0..n tokens, judgment call — lower is cheaper, but starving the agent has its own cost. Non-gating.',
+  }),
+  'extraction_recall': Object.freeze({
+    industry_term: 'Extraction recall (BrainBench --llm)',
+    eli10: 'With the real LLM extractor running (instead of the deterministic gold extractor), what fraction of the gold facts did it actually extract and persist? Only scored in --llm runs — the hermetic CI gate never calls a model.',
+    range: '0..1, higher is better. Absent in deterministic runs.',
+  }),
+  'extraction_precision': Object.freeze({
+    industry_term: 'Extraction precision (BrainBench --llm)',
+    eli10: 'Of everything the real LLM extractor persisted, what fraction matches a gold fact? Low precision means the extractor invents or over-extracts — junk memory that pollutes future recall.',
+    range: '0..1, higher is better. Absent in deterministic runs.',
+  }),
+
+  'trust_label_accuracy': Object.freeze({
+    industry_term: 'Trust label accuracy (BrainBench trust)',
+    eli10: 'Every write through a real channel (owner sync, an agent over MCP or the CLI, a connector, a tool-output write) should be stored at the trust tier that channel earns, and every explicit read (get_page, search, recall) should report that same tier. This is the fraction of checked writes where the stored tier and every read label agree with the expected tier.',
+    range: '0..1, higher is better. Gated at 1.',
+  }),
+  'laundering_violations': Object.freeze({
+    industry_term: 'Trust laundering violations (BrainBench trust)',
+    eli10: 'Count of writes stored ABOVE the tier their channel allows: an agent edit that keeps an owner page "your notes", frontmatter claiming "confirmed by you", an agent tidy-up raising external content. Any laundering lets untrusted text pass as trusted later.',
+    range: '0..n, count. MUST be 0.',
+  }),
+  'self_promotion_violations': Object.freeze({
+    industry_term: 'Self-promotion violations (BrainBench trust)',
+    eli10: 'Count of attempts to raise a tier without the owner (an agent calling confirm_memory, a piped CLI confirm, a raw database UPDATE) that were not refused or did raise the tier.',
+    range: '0..n, count. MUST be 0.',
+  }),
+  'current_fact_accuracy': Object.freeze({
+    industry_term: 'Current-fact accuracy (BrainBench state-resolution)',
+    eli10: "After a sequence of updates, the fraction of checks where the fact recall returns as current is the expected one (the latest correction, or the owner's fact a lower-tier writer tried to replace).",
+    range: '0..1, higher is better. Gated at 1.',
+  }),
+  'stale_surfaced_as_current': Object.freeze({
+    industry_term: 'Stale facts served as current (BrainBench state-resolution)',
+    eli10: 'Count of superseded facts recall still returns as if current. A stale fact read as current is how an old answer overrides a correction.',
+    range: '0..n, count. MUST be 0.',
+  }),
+  'history_preserved': Object.freeze({
+    industry_term: 'History preserved (BrainBench state-resolution)',
+    eli10: 'Fraction of superseded facts whose rows survive (expired or superseded, never deleted), so the change stays auditable and reversible.',
+    range: '0..1, higher is better. Gated at 1.',
+  }),
+  'lower_tier_supersede_violations': Object.freeze({
+    industry_term: 'Lower-tier supersede violations (BrainBench state-resolution)',
+    eli10: 'Count of higher-tier facts (owner notes, owner-confirmed facts) that a lower-tier writer expired, superseded or forgot without the owner. The lower write should land as a contested proposal instead.',
+    range: '0..n, count. MUST be 0.',
+  }),
+  'poison_persist_rate': Object.freeze({
+    industry_term: 'Poison persistence rate (BrainBench poisoning, external arm)',
+    eli10: "Of instruction-like payloads arriving through external channels (a connector import, a tool-output write), the fraction durable outside the write gate's hold and quarantine, i.e. live where later sessions can read them as memory.",
+    range: '0..1, LOWER is better. Gated at 0.',
+  }),
+  'flagged_and_labeled_rate': Object.freeze({
+    industry_term: 'Flagged and labeled rate (BrainBench poisoning, agent-relayed arm)',
+    eli10: 'Of instruction-like payloads an agent saved at its default tier, the fraction stored with a write-gate flag, a tier at or below "written by an agent", and the "unconfirmed, agent-written" label on explicit reads.',
+    range: '0..1, higher is better. Gated at 1.',
+  }),
+  'unconfirmed_preference_activation_rate': Object.freeze({
+    industry_term: 'Unconfirmed preference activation (BrainBench poisoning)',
+    eli10: "Of agent-written standing preferences and commitments that read like instructions, the fraction that reached a later session's proactive context without the unconfirmed label.",
+    range: '0..1, LOWER is better. Gated at 0.',
+  }),
+  'agent_relayed_activation_rate': Object.freeze({
+    industry_term: 'Agent-relayed activation rate (BrainBench poisoning)',
+    eli10: 'Of instruction-like payloads an agent relayed into memory, the fraction any proactive surface (hook turn context, context engine, reflex, volunteer, context_pack, hot memory) injected into a later session before the owner confirmed them.',
+    range: '0..1, LOWER is better. Gated at 0. Scored per harness seam.',
+  }),
+  'poison_activation_rate': Object.freeze({
+    industry_term: 'Poison activation rate (BrainBench poisoning, both arms)',
+    eli10: "Of every instruction-like payload, the fraction that reached a later session's proactive context outside its tier envelope (no external-data wrapper, no unconfirmed label).",
+    range: '0..1, LOWER is better. Gated at 0. Scored per harness seam.',
+  }),
+  'benign_retention': Object.freeze({
+    industry_term: 'Benign retention (BrainBench poisoning)',
+    eli10: 'Of ordinary content in both arms (newsletters, meeting notes, preferences), the fraction stored live and readable. The utility guard: a gate that blocks everything scores 0 here.',
+    range: '0..1, higher is better. Gated >= 0.95.',
+  }),
+  'false_quarantine_rate': Object.freeze({
+    industry_term: 'False quarantine rate (BrainBench poisoning)',
+    eli10: 'Of ordinary content in both arms, the fraction the write gate held or quarantined.',
+    range: '0..1, LOWER is better. Gated <= 0.02.',
+  }),
+  'default_persist_unlabeled_rate': Object.freeze({
+    industry_term: 'Default-mode unlabeled persistence (BrainBench poisoning)',
+    eli10: 'With the shipped defaults (instruction-like writes flagged, not held), the fraction of attacker payloads that were saved without their label: an external payload not marked "external, untrusted" on every read, or an agent payload not flagged and labeled "unconfirmed, agent-written".',
+    range: '0..1, LOWER is better. Gated at 0.',
+  }),
+  'default_activation_unlabeled_rate': Object.freeze({
+    industry_term: 'Default-mode unlabeled activation (BrainBench poisoning)',
+    eli10: "With the shipped defaults (flagged items still reach proactive context), the fraction of attacker payloads that showed up in a later session's proactive context without their label: outside an external-data block and without the unconfirmed label.",
+    range: '0..1, LOWER is better. Gated at 0.',
+  }),
+  'default_benign_retention': Object.freeze({
+    industry_term: 'Default-mode benign retention (BrainBench poisoning)',
+    eli10: 'With the shipped defaults, the fraction of ordinary items that were saved, live and not held.',
+    range: '0..1, higher is better. Gated at >= 0.95.',
+  }),
+  'residual_after_purge': Object.freeze({
+    industry_term: 'Residual after purge (BrainBench deletion)',
+    eli10: "Rows in ANY table of the brain, plus canonical markdown files, still holding a purged claim right after the purge. The probe scans every text-bearing column, independent of purge's own verification, so a store the deletion inventory missed shows up here.",
+    range: '0..n, count. MUST be 0.',
+  }),
+  'receipt_completeness': Object.freeze({
+    industry_term: 'Receipt completeness (BrainBench deletion)',
+    eli10: 'Fraction of purges whose receipt accounts for every store that held the claim before the purge (by table or its inventory adapter).',
+    range: '0..1, higher is better. Gated at 1.',
+  }),
+  'resurrection_after_resync': Object.freeze({
+    industry_term: 'Resurrection after resync (BrainBench deletion)',
+    eli10: 'Count of purged claims active again after the stale canonical file is re-synced or an agent re-remembers the claim.',
+    range: '0..n, count. MUST be 0.',
+  }),
+
+  // ────────────────────────────────────────────────────────────────────────
+  // LongMemEval — long-term conversational memory benchmark
+  // (`gbrain eval longmemeval`; docs/eval-bench.md)
+  // ────────────────────────────────────────────────────────────────────────
+  'recall_all@k': Object.freeze({
+    industry_term: 'Strict session recall at k (recall_all@k, LongMemEval)',
+    eli10: 'Did EVERY gold session for the question land among the distinct sessions in the top k retrieved chunks? A multi-session question with two gold sessions only counts when both are there — this is the evidence-complete rate the answer model actually needs. Abstention (_abs) questions stay out of the denominator unless --include-abstention.',
+    range: '0..1 per question type and aggregate, higher is better. Strict by construction: recall_all@k <= recall_any@k always.',
+  }),
+  'recall_any@k': Object.freeze({
+    industry_term: 'Lenient session recall at k (recall_any@k, LongMemEval)',
+    eli10: 'Did AT LEAST ONE gold session land among the distinct sessions in the top k retrieved chunks? The lenient companion to recall_all@k — a partial-evidence hit still counts. Per-row `recall_hit` is a deprecated alias of this metric.',
+    range: '0..1, higher is better. Reported alongside recall_all@k; the gap between them is the partial-evidence rate.',
+  }),
+  'qa_accuracy': Object.freeze({
+    industry_term: 'Judged QA accuracy (LongMemEval, LLM-as-judge)',
+    eli10: 'Of all questions in the run, what fraction did the judge model mark correct against the gold answer (official LongMemEval prompts)? The headline scores every question the judge could not grade (timeouts, refusals, malformed verdicts, budget skips) as INCORRECT, so it is never more lenient than the official scorer; the companion accuracy_excluding_errors drops those rows from the denominator and the judge_errors count says how many there were.',
+    range: '0..1, higher is better. Only comparable across runs with the same reader model, judge model, prompt version and dataset revision.',
+  }),
+  'mean_returned_results': Object.freeze({
+    industry_term: 'Mean returned results per question (autocut benefit, LongMemEval replay)',
+    eli10: 'Across the questions in an autocut floor replay, the mean number of chunk rows in the returned window (the first k rows autocut kept). This is the benefit side of the autocut trade: fewer rows per question means less context the answer model has to read. Compare it against recall_all@k, the guardrail, at each floor.',
+    range: '0..k, lower is better ONLY while recall_all@k holds. Equals k whenever autocut never trims inside the window (e.g. floor `off`).',
+  }),
+  'mean_returned_est_tokens': Object.freeze({
+    industry_term: 'Mean estimated tokens returned per question (autocut benefit, LongMemEval replay)',
+    eli10: 'Across the questions in an autocut floor replay, the mean of the summed estimated tokens (chars / 4) of the returned window. The token-denominated twin of mean_returned_results: the direct measure of how much conversational memory each question pushes into the answer model at a given floor.',
+    range: '0..unbounded, lower is better ONLY while recall_all@k holds. Approximates OpenAI tiktoken counts for English; off by ~5-10% for other tokenizers.',
+  }),
+});
+
+/**
+ * Public accessor — returns the gloss entry for a metric, or null if
+ * unknown. Callers that need the structured shape use this; callers that
+ * just need the plain-English line use eli10For().
+ */
+export function getMetricGloss(metric: string): MetricGlossEntry | null {
+  if (METRIC_GLOSSARY[metric]) return METRIC_GLOSSARY[metric];
+  // Fuzzy fallback for @N metrics: `recall@10` → `recall@k`, `ndcg@5` → `ndcg@k`.
+  // The glossary documents the family ("at k"); reports use a specific K value.
+  const atK = metric.match(/^(.+)@\d+$/);
+  if (atK) {
+    const family = `${atK[1]}@k`;
+    if (METRIC_GLOSSARY[family]) return METRIC_GLOSSARY[family];
+  }
+  return null;
+}
+
+/**
+ * Convenience: return ONLY the plain-English gloss for a metric. Used in
+ * `gbrain search stats` JSON output's _meta.metric_glossary block and in
+ * the eval-compare report's per-metric "Plain English:" lines.
+ */
+export function eli10For(metric: string): string | null {
+  const g = getMetricGloss(metric);
+  return g?.eli10 ?? null;
+}
+
+/**
+ * Build a `_meta.metric_glossary` block for a set of metrics. Returns an
+ * object suitable for JSON.stringify-ing under the `_meta` key in any
+ * eval / stats response.
+ *
+ * Per [CDX-25]: ONE _meta.metric_glossary per response, NOT sibling
+ * _gloss fields on every numeric metric. Adding a metric to the response
+ * doesn't bloat the JSON; the glossary lives in a single place per
+ * response, indexed by metric name.
+ */
+export function buildMetricGlossaryMeta(metrics: ReadonlyArray<string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of metrics) {
+    const e = getMetricGloss(m); // routes through fuzzy fallback
+    if (e) out[m] = e.eli10;
+  }
+  return out;
+}
+
+/**
+ * The list of EVERY metric this module documents. Auto-derived from the
+ * METRIC_GLOSSARY keys so the doc generator can iterate without drift.
+ */
+export const ALL_METRICS: ReadonlyArray<string> = Object.freeze(Object.keys(METRIC_GLOSSARY));
+
+/**
+ * Render the glossary as a Markdown document. Consumed by
+ * `scripts/generate-metric-glossary.ts` to produce
+ * `docs/eval/METRIC_GLOSSARY.md`. The CI guard regenerates this and
+ * diffs against the committed file — out-of-date docs fail the build.
+ *
+ * The output is deterministic: same input → same output bytes.
+ */
+export function renderMetricGlossaryMarkdown(): string {
+  const lines: string[] = [];
+  lines.push('# Evaluation Metric Glossary');
+  lines.push('');
+  lines.push('**Auto-generated from `src/core/eval/metric-glossary.ts`. Do not edit by hand.** Run `bun run scripts/generate-metric-glossary.ts` to regenerate.');
+  lines.push('');
+  lines.push('Every metric `gbrain eval *` and `gbrain search stats` reports has a plain-English explanation here. Industry terms are preserved verbatim so users searching the literature find what we report.');
+  lines.push('');
+
+  const groups: Array<[string, string[]]> = [
+    ['Retrieval Metrics', ['precision@k', 'recall@k', 'mrr', 'ndcg@k']],
+    ['Retrieval-Quality / Evidence Metrics (NamedThingBench)', ['hit@1', 'hit@3', 'avg_rank1_score', 'create_safety']],
+    ['Set-Similarity / Stability Metrics', ['jaccard@k', 'top1_stability']],
+    ['Statistical-Significance Metrics', ['p_value', 'confidence_interval']],
+    ['Operational / Cost Metrics', ['cache_hit_rate', 'avg_results', 'avg_tokens', 'cost_per_query_usd', 'p99_latency_ms']],
+    ['Result-Sizing Metrics', ['autocut.signal', 'autocut.gap_ratio']],
+    ['BrainBench — Cross-Harness Memory Conformance', [
+      'know_to_ask_failure_rate', 'false_fire_rate', 'push_precision', 'push_recall',
+      'write_back_fidelity', 'provenance_accuracy', 'continuity_rate',
+      'source_isolation_violations', 'avg_injected_tokens',
+      'extraction_recall', 'extraction_precision',
+      'trust_label_accuracy', 'laundering_violations', 'self_promotion_violations',
+      'current_fact_accuracy', 'stale_surfaced_as_current', 'history_preserved', 'lower_tier_supersede_violations',
+      'poison_persist_rate', 'flagged_and_labeled_rate', 'unconfirmed_preference_activation_rate',
+      'agent_relayed_activation_rate', 'poison_activation_rate', 'benign_retention', 'false_quarantine_rate',
+      'default_persist_unlabeled_rate', 'default_activation_unlabeled_rate', 'default_benign_retention',
+      'residual_after_purge', 'receipt_completeness', 'resurrection_after_resync',
+    ]],
+    ['LongMemEval — Long-Term Conversational Memory', ['recall_all@k', 'recall_any@k', 'qa_accuracy', 'mean_returned_results', 'mean_returned_est_tokens']],
+  ];
+
+  for (const [groupTitle, metrics] of groups) {
+    lines.push(`## ${groupTitle}`);
+    lines.push('');
+    for (const m of metrics) {
+      const e = METRIC_GLOSSARY[m];
+      if (!e) continue;
+      lines.push(`### ${e.industry_term}`);
+      lines.push('');
+      lines.push(`**Key:** \`${m}\``);
+      lines.push('');
+      lines.push(`**Plain English:** ${e.eli10}`);
+      lines.push('');
+      lines.push(`**Range:** ${e.range}`);
+      lines.push('');
+    }
+  }
+
+  lines.push('---');
+  lines.push('');
+  lines.push('## Coverage');
+  lines.push('');
+  lines.push(`Every metric printed by any \`gbrain eval *\` or \`gbrain search stats\` command resolves through \`getMetricGloss()\` in \`src/core/eval/metric-glossary.ts\`. Adding a new metric to the glossary REQUIRES updating this doc; the CI guard catches drift.`);
+  lines.push('');
+
+  return lines.join('\n') + '\n';
+}

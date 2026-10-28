@@ -1,0 +1,297 @@
+/**
+ * v0.41.16.0 — Conversation parser type surface.
+ *
+ * The orchestrator's contract surface. Built-in patterns + user-
+ * declared simple_patterns + LLM polish + LLM fallback all flow
+ * through the same `ParseResult`.
+ *
+ * Per D4: parser uses `ParsePhase` (per-page axis). The progressive-
+ * batch primitive uses `Stage` (corpus-rollout axis). Different
+ * concepts, different audit JSONLs, no cross-pollution.
+ *
+ * Per D7: every PatternEntry carries `test_positive[]` + `test_negative[]`
+ * so module-load validation runs at startup.
+ *
+ * Per D9: PatternEntry.speaker_clean is optional; orchestrator falls
+ * back to `DEFAULT_SPEAKER_CLEAN`.
+ *
+ * Per D5: every PatternEntry has explicit `multi_line` flag.
+ *
+ * Per D11: every PatternEntry has optional `quick_reject` for O(1)
+ * prefix screening.
+ *
+ * Per D19: every PatternEntry declares `timezone_policy`.
+ *
+ * Per D16: arbitrary user regex is OUT. v1 only supports user-declared
+ * `simple_pattern` (a structured spec compiled by gbrain to a known-
+ * safe regex). The simple_pattern shape lives in `simple-pattern.ts`.
+ */
+
+import type { Page } from '../types.ts';
+
+/**
+ * Parsed message after orchestrator runs. Matches the existing
+ * `ConversationMessage` shape from extract-conversation-facts.ts so
+ * downstream callers don't need adapter code.
+ */
+export interface MatchedMessage {
+  speaker: string;
+  /** ISO 8601 timestamp. May be `1970-01-01T00:00:00Z` for time-only
+   *  formats when no frontmatter date is available. */
+  timestamp: string;
+  text: string;
+}
+
+/**
+ * Which per-page phase produced the result.
+ *   - 'regex_match': a built-in or user simple_pattern matched.
+ *   - 'polish': LLM polished a regex-matched output.
+ *   - 'llm_fallback': all regex paths returned 0 messages; LLM
+ *     fallback was called and returned this output.
+ *   - 'no_match': nothing parsed; returned [] of messages.
+ */
+export type ParsePhase = 'regex_match' | 'polish' | 'llm_fallback' | 'no_match';
+
+/**
+ * Verdict from the orchestrator. Surfaced in audit JSONL and the
+ * `gbrain conversation-parser scan` debug command.
+ */
+export interface ParseResult {
+  messages: MatchedMessage[];
+  /** Which phase produced the final messages. */
+  phase: ParsePhase;
+  /** When phase=regex_match or polish: which pattern won. */
+  matched_pattern_id?: string;
+  /** Number of patterns scored before the winner emerged (D18). */
+  patterns_scored?: number;
+  /** When polish ran: how many messages were merged/dropped/edited. */
+  polish_delta?: {
+    merged: number;
+    dropped: number;
+    edits: number;
+  };
+  /** When llm_fallback ran: model id used. */
+  llm_fallback_model?: string;
+  /** Per-line diagnostics for debug command — only populated when
+   *  caller sets `opts.diagnostic = true`. */
+  unmatched_line_count?: number;
+  /** Once-per-page warn from timezone_policy = utc_assumed_with_warn
+   *  patterns when no frontmatter timezone is set. */
+  timezone_warning?: string;
+  /** #4136 — heading-shaped labels a heading-anchored pattern FOLDED into the
+   *  previous turn's body (or silently dropped before the first anchor)
+   *  instead of anchoring. Deduped, capped, ≤48 chars each, fence-aware.
+   *  Non-empty means speaker attribution on this page may credit one
+   *  speaker with another's words — callers decide whether to warn or
+   *  decline (the parser stays purely descriptive). Undefined when empty so
+   *  healthy-page JSON output is byte-identical. */
+  unrecognized_headings?: string[];
+  /** Matched anchor lines whose date could not be reconstructed (localized
+   *  month names, malformed digits). Each still opens its own message —
+   *  inheriting the previous anchor's timestamp, or the page's fallback date
+   *  at midnight for the first — so its body is never folded into the
+   *  previous speaker. Undefined when zero so healthy-page JSON output is
+   *  byte-identical. */
+  date_fallback_count?: number;
+}
+
+/**
+ * Source of date for time-only formats. Per D8: orchestrator owns
+ * the derivation chain — caller passes the Page, orchestrator
+ * extracts `frontmatter.date` slice OR `effective_date` OR explicit
+ * fallback OR '1970-01-01'.
+ */
+export type DateSource = 'inline' | 'frontmatter' | 'combined';
+
+/** Time-format flavor a pattern's regex emits. */
+export type TimeFormat = '12h_ampm' | '24h' | 'unix' | 'rfc2822';
+
+/**
+ * Per D19: how a pattern handles timezone. The orchestrator uses this
+ * to decide whether to attach a `timezone_warning` to the ParseResult
+ * AND how to construct the ISO timestamp.
+ */
+export type TimezonePolicy =
+  | 'inline_utc'             // Existing: regex captures full ISO/UTC; trust it.
+  | 'frontmatter_tz'         // Caller's frontmatter MUST have `timezone:`; refuse otherwise.
+  | 'utc_assumed_with_warn'; // Default UTC; emit once-per-page warn if no frontmatter timezone.
+
+/**
+ * Capture-group index map. Each pattern declares where its captures
+ * land in the regex's match array (1-indexed per JS conventions).
+ *
+ * Speaker is always required. Other fields depend on the pattern's
+ * shape:
+ *   - inline-date patterns set `date_group`, `hour_group`, `minute_group`.
+ *   - time-only patterns omit `date_group` (derived from frontmatter).
+ *   - 12h patterns also set `ampm_group`.
+ *   - rfc2822 patterns set `date_group` only; orchestrator passes the
+ *     captured string to Date.parse().
+ */
+export interface CaptureMap {
+  speaker_group: number;
+  text_group: number;
+  date_group?: number;
+  hour_group?: number;
+  minute_group?: number;
+  ampm_group?: number;
+}
+
+/**
+ * A built-in pattern OR a user-declared pattern (after `simple_pattern`
+ * compilation).
+ *
+ * Built-ins MUST carry `test_positive` + `test_negative`; module-load
+ * validation runs them via `validatePatternEntry` (D7).
+ *
+ * User patterns from simple_pattern compilation only need test_positive
+ * if the user supplies sample lines.
+ */
+export interface PatternEntry {
+  /** Stable kebab-case id. Examples: 'imessage-slack', 'telegram-bracket'. */
+  id: string;
+  /** Built-in vs user-declared (simple_pattern compiled). */
+  origin: 'builtin' | 'user_simple';
+  /**
+   * The line-matching regex. Built-ins are hand-vetted (no ReDoS risk).
+   * User patterns are compiled from `simple_pattern` spec to a known-
+   * safe regex shape.
+   */
+  regex: RegExp;
+  /** Capture-group index map. */
+  captures: CaptureMap;
+  /** Inline-date vs frontmatter-date vs combined. */
+  date_source: DateSource;
+  /** 12h vs 24h vs unix vs rfc2822. */
+  time_format: TimeFormat;
+  /** D19: timezone handling for time-only formats. */
+  timezone_policy: TimezonePolicy;
+  /**
+   * D5: when true, the regex matches the FIRST line of a multi-line
+   * message; the orchestrator absorbs subsequent lines into
+   * `MatchedMessage.text` until the next anchor.
+   * When false (default), the regex matches a complete one-line
+   * message; continuation logic still applies for orphan lines.
+   */
+  multi_line: boolean;
+  /**
+   * When true, scoring may treat lines that fail `quick_reject` as message
+   * continuation rather than independent evidence. To preserve the global
+   * false-positive floor, the candidate-only score is used only after two
+   * anchors match, or when the first non-blank line is itself an anchor.
+   * Requires `multi_line: true` and a `quick_reject`.
+   */
+  score_continuations_as_body?: boolean;
+  /**
+   * Extra gate on `score_continuations_as_body`: once set, the
+   * candidate-only density score only activates when the anchor lines that
+   * fully match `regex` collectively capture at least this many DISTINCT
+   * `speaker_group` values (not just this many anchor lines). Without this,
+   * a pattern whose anchor grammar is a plausible label in ordinary prose
+   * (e.g. a literal `**You:**` heading in documentation) gets the SAME
+   * density immunity a genuine back-and-forth conversation gets from a
+   * single repeated — or even solitary, via `firstLineAnchored` — anchor.
+   * Requiring multiple DISTINCT speakers (e.g. 2, for a two-party format)
+   * means a page that merely repeats one role's label, or opens with one
+   * anchor, falls back to the ordinary flat-density score instead of
+   * getting density-exclusion immunity. Patterns whose anchor grammar is
+   * ALREADY distinctive enough on its own (e.g. `bold-time-dash`'s bold
+   * name + valid 24h time + dash) can safely leave this unset.
+   */
+  score_continuations_min_distinct_speakers?: number;
+  /**
+   * Extra gate on `score_continuations_as_body`, orthogonal to
+   * `score_continuations_min_distinct_speakers`: once set, the
+   * candidate-only density score only activates when the FIRST fully-
+   * matching anchor line appears at or before this index in the scored
+   * line array. A genuine export's anchor grammar starts near the top of
+   * the body (this tolerates a short title/heading preamble); an anchor
+   * — or anchor pair — merely embedded deep inside an otherwise unrelated
+   * long document sits far past this bound, so it falls back to the
+   * ordinary flat-density score instead of getting the same acceptance
+   * immunity a real transcript gets. Most useful alongside
+   * `score_continuations_min_distinct_speakers` for anchor grammars
+   * (like a bare `**You:**` heading) that are plausible prose labels on
+   * their own: distinct-speaker count alone still lets a single
+   * illustrative example pair anywhere in a long document through.
+   */
+  score_continuations_max_preamble_lines?: number;
+  /**
+   * D11: optional cheap O(1) prefix check. If set, orchestrator runs
+   * this FIRST per line; only tries `regex` if quick_reject matches.
+   * Examples: `/^\*\*\[/` for telegram-bracket.
+   */
+  quick_reject?: RegExp;
+  /**
+   * D9: optional speaker post-processing. When unset, orchestrator
+   * uses `DEFAULT_SPEAKER_CLEAN`.
+   */
+  speaker_clean?: RegExp;
+  /**
+   * v0.41.29.0: when true, the orchestrator recomputes this pattern's
+   * acceptance score over the FULL body (not just the head window)
+   * before applying SCORING_MIN_ACCEPTANCE. Set on broad no-time
+   * patterns (`bold-name-no-time`) whose regex matches a common prose
+   * idiom (`**Label:** text`): without it, a notes page with a few bold
+   * labels CLUSTERED in its first 10 lines scores 0.3 on the head pass,
+   * skips the `< SCORING_HEAD_TRIGGER_THRESHOLD` rescore, and clears the
+   * 0.05 floor — mis-parsing prose as a conversation. Full-body scoring
+   * drops that page below the floor (3/200 ≈ 0.015 → no_match) while a
+   * real transcript stays ~1.0.
+   */
+  score_full_body?: boolean;
+  /**
+   * Conversational-structure gate for broad label-shaped patterns
+   * (gbrain-evals N12-1). When the parsed body has at least this many
+   * turns and no speaker ever speaks twice, the page is a list of one-off
+   * labels (`**Status:** … **Owner:** … **Next step:** …`), not an
+   * exchange, and the orchestrator returns no_match. Density scoring
+   * cannot see this: a short status block clears the 0.05 floor.
+   */
+  repeat_speaker_min_turns?: number;
+  /** D7: module-load validation — known-positive sample lines. */
+  test_positive: string[];
+  /** D7: module-load validation — known-negative sample lines. */
+  test_negative: string[];
+  /** Documentation pointer for future maintainers. */
+  source_doc?: string;
+}
+
+/** Caller opts for `parseConversation`. */
+export interface ParseConversationOpts {
+  /**
+   * Per D8: the Page object. Orchestrator extracts date + timezone +
+   * effective_date from frontmatter. When unset, orchestrator uses
+   * `explicitFallbackDate` (next) then '1970-01-01'.
+   */
+  page?: Page;
+  /**
+   * Explicit ISO date `YYYY-MM-DD` override. Surfaces for callers
+   * (eval CLI, debug command) that don't have a full Page.
+   * Surfaces as `ParseConversationOpts.fallbackDate` for back-compat
+   * with PR #1461's shape.
+   */
+  fallbackDate?: string;
+  /** When true, populate `ParseResult.unmatched_line_count`. Debug only. */
+  diagnostic?: boolean;
+  /** When true, skip LLM polish even if config enables it. */
+  noPolish?: boolean;
+  /** When true, skip LLM fallback even if config enables it. */
+  noFallback?: boolean;
+  /** Caller-supplied patterns to add (e.g. user simple_pattern compiled). */
+  userPatterns?: readonly PatternEntry[];
+  /** Caller-supplied disabled-builtin id list (config or per-call). */
+  disabledBuiltinIds?: readonly string[];
+}
+
+/** Resolved date + timezone for a Page, per D8 derivation chain. */
+export interface DateContext {
+  /** ISO YYYY-MM-DD string. */
+  fallbackDate: string;
+  /** Valid IANA timezone (e.g. 'America/Los_Angeles') or undefined. */
+  timezone?: string;
+  /** #5430: a declared `frontmatter.timezone` that is not a valid IANA zone; timestamps stay UTC and the warning names it. */
+  invalid_timezone?: string;
+  /** Which step of the derivation chain won (for debug). */
+  source: 'frontmatter_date' | 'effective_date' | 'explicit' | 'epoch_default';
+}

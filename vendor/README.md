@@ -1,0 +1,204 @@
+# GBrain's Postgres driver
+
+`postgres/` is the exact published `postgres@3.4.9` package from
+https://github.com/porsager/postgres, with GBrain's checked-in
+`patches/postgres@3.4.9.patch` applied. The package is **Unlicense**, not MIT;
+the original upstream license is preserved in `postgres/UNLICENSE` (the npm
+tarball omits this file, so the updater retrieves and verifies it separately).
+Original package metadata and attribution are retained.
+
+The registry's latest supported release was inspected on 2026-09-27 and was
+still 3.4.9. Its stock reserved and transaction owners do not implement the
+`discard()` capability needed by GBrain's cancellation fence. No version
+upgrade or opaque third-party fork is being substituted for that capability.
+
+## Why source is shipped
+
+The root package-private `#postgres` import maps directly into this directory.
+Every driver import resolves through this one package import. Bun and
+Node ESM use `src/`; CommonJS uses `cjs/src/`; compiled Bun artifacts embed
+those same resolved source bytes. The workerd export receives the identical
+ESM patch, preserving its upstream polyfill imports. GBrain itself does not
+support a workerd runtime.
+
+This deliberately avoids Bun's transitive `file:` dependency resolution, which
+can report a successful packed installation while leaving the driver absent.
+The patched bytes are part of GBrain's checkout and package, not a
+`patchedDependencies` instruction that a global install may ignore. No
+postinstall mutation of another package's node_modules is needed. The patch
+file remains the auditable source of the delta, not an installation hook.
+
+The patch adds abort-aware reservation, reserved/transaction-owner discard,
+CancelRequest settlement tracking and ownership/pipeline fences. It also
+terminates, instead of reusing, a pooled connection or released reservation
+whose last ReadyForQuery status is not idle, and reports each discard through
+the `onpoisoned(status)` option (#5730). Cancellation
+must settle or retire the connection before another query can own it. This
+is necessary for worker admission, query timeout and lease-release safety.
+See issues #5466 and #5560 and `test/e2e/persistence-chaos.test.ts`.
+Reserved and transaction owners also expose `cancelAndDiscard({ timeout })`
+(#6598): a Terminate cannot interrupt the statement already running on a busy
+socket, so it sends the fenced statement's CancelRequest first, refuses new and
+queued statements while it waits for that statement to settle, then discards.
+It rejects `CANCEL_UNCONFIRMED` when the statement does not settle within
+`timeout` (default 2000 ms) or was not fenced, so a socket close is never
+reported as a confirmed server stop
+(`test/postgres-transaction-cancel-order.test.ts`,
+`test/e2e/transaction-cancel-held-lock.test.ts`).
+
+A statement that fails to build is answered in its place in the pipeline
+(#6383; the approach of upstream PR porsager/postgres#1236, which fixes
+porsager/postgres#1082, so this hunk drops when that merges). A statement joins
+a connection's queue before it is built, so when `build` throws
+(`UNDEFINED_VALUE`, `MAX_PARAMETERS_EXCEEDED`) behind an in-flight statement,
+stock postgres.js rejects that head statement with its error, leaves the
+culprit queued with nothing on the wire, and delivers every later reply on the
+socket one statement late until the process restarts. With the patch a query
+the server is certain to refuse goes out in the culprit's place: only the
+culprit rejects, with its own error, a transaction it was part of is aborted
+rather than committed without it, and the pool reports the failure through
+`onbuilderror(code, statement)` (template text with `$n` placeholders, no
+values). The same patch adds the in-flight watchdog: `inflight_timeout`
+(seconds) bounds how long a head statement may wait with nothing coming back;
+past it the statement and its queued followers reject with `CONNECTION_STUCK`,
+the pool parks the connection out of rotation, reports `onstuck({ age_ms,
+queued, statement })` and reconnects. `sql.pool` is a live property getter
+(stock `Object.assign` froze the #6317 numbers at construction) and carries
+`inflight_oldest_ms` and `completed`. Tests:
+`test/e2e/postgres-pipelined-build-failure-postgres.test.ts`,
+`test/e2e/postgres-stuck-connection-postgres.test.ts`.
+
+The patch also lets a pool share the parameter types of a described statement
+across its connections (`shared_types`, on by default; GBrain turns it off with
+`GBRAIN_PG_TYPE_CACHE=0`). Stock postgres.js describes every parameterized
+statement once per connection, and with `prepare: false` (transaction-mode
+poolers) on every run, before it can execute it; that describe costs a round
+trip and stops pipelining behind it. With the types known, the statement is
+parsed, described and executed in one message group. Only built-in types (oid
+below 16384) are shared, since a database's own types (pgvector) can be
+recreated under a new oid; a statement that fails forgets its shared types, and
+`PostgresEngine.initSchema` clears them after applying migrations (#5984,
+`test/e2e/postgres-shared-types.test.ts`). `shared_types` also accepts the Map
+to share types in: GBrain passes one per database target, so every pool in a
+process that reaches one database shares it, and `src/core/pg-type-cache.ts`
+saves it for the next process.
+
+Stock postgres.js runs a `pg_type` query on every new connection before its
+first statement. The patch's `array_types` option takes a `{ rows }` object:
+the first connection that fetches the array types stores them there, and every
+later connection of any pool given the same object applies them without the
+round trip. GBrain passes one per database target, in-process only, since
+extension type OIDs belong to one database's catalog (#6930,
+`test/pathological/pg-round-trips-6930.test.ts`).
+
+A pool built not to pipeline (`max_pipeline: 0`, a transaction-mode pooler,
+#6543) still pipelines up to `transaction_pipeline` statements on a
+connection its owner holds (`sql.begin`, `sql.reserve`) while every statement
+in flight leaves the connection inside a transaction: the last ReadyForQuery
+said `T` or `E`, or an in-flight statement began one, and none since may end
+it (COMMIT, ROLLBACK other than ROLLBACK TO, END, ABORT, PREPARE TRANSACTION).
+The pooler pins one server connection from BEGIN until the transaction ends,
+and nothing is sent behind a statement that may end it, so another owner's
+statements never reach that server connection. Default 0 (stock behaviour);
+GBrain sets 100 on transaction-mode URLs (#6930,
+`test/e2e/pgbouncer-transaction-pipeline-6930.test.ts`).
+
+With `transaction_pipeline` in force, `sql.begin({ first }, fn)` sends the
+transaction's first statement behind BEGIN before BEGIN's answer when
+`first(text)` accepts its text; every later statement, and a first one the
+test refuses, waits for that answer as stock `begin` does. If BEGIN fails,
+the early statement has run in autocommit and the rest are rejected unsent,
+so the test must accept only a read or a transaction-local `set_config`.
+GBrain passes `isPersistenceDeclaration` (`src/core/persistence/protocol.ts`)
+from the persistence transactions that open with the protocol declaration
+(GBRA-156, same test file).
+
+`sql.begin({ early }, fn)` sends every statement `early(text)` accepts, in
+order, behind BEGIN before BEGIN's answer, on any pool that pipelines inside
+a transaction (a pipelining pool, or `transaction_pipeline` in force); the
+first statement it refuses, and every later one, waits for the answer. The
+same rule applies: if BEGIN fails the accepted statements have run in
+autocommit, so the test must accept only reads and transaction-local
+`set_config`. GBrain passes `isPipelinableSearchRead`
+(`src/core/postgres-engine/search-settings.ts`) from its search read
+transactions, so a scoped search read costs one round trip instead of two
+(GBRA-156, `test/e2e/pgbouncer-transaction-pipeline-6930.test.ts` and
+`test/e2e/search-read-pipeline-postgres.test.ts`).
+
+On a reserved connection (`sql.reserve`), where the pool does not pipeline,
+`reservedTransactions().begin({ first }, fn)`
+(`src/core/postgres-engine/reserved-transactions.ts`) makes the same
+exception outside the driver. It replaces each query's `handler` property,
+the function postgres.js calls when it executes a query, with one that waits
+for BEGIN's answer. That code lives in `src`, not in this patch set, so
+`update-postgres.sh --check` does not cover it: after a driver upgrade,
+check that `Query.handler` is still called on execute, and run
+`test/persistence-pipeline-first.test.ts`.
+
+Each statement's row count resets at its ReadyForQuery. Stock postgres.js
+resets it only at CommandComplete. A statement that streams rows and then fails
+never gets there: a runtime error after its first rows, or a cancel or timeout
+while it is still producing them. The next statement on that connection then
+stored its rows after that many empty slots, so a one-row read came back as
+`[empty, row]` (`test/e2e/postgres-driver-row-count-postgres.test.ts`).
+
+An idle connection keeps nothing from its last statement. Stock postgres.js
+left its receive buffer as an empty view over the last message it joined from
+several socket reads, so the buffer stayed allocated until the connection's
+next read. For a 1 MiB bytea row, that buffer is the 2 MiB hex DataRow. The
+desync tripwire keeps only the last statement's text, not the query, whose
+promise holds its rows, and a connection that closes forgets the last
+statement it wrote, with its parameters. Pools hand statements out in turn, so
+before this fix each pooled connection held one segment read
+(`test/e2e/postgres-driver-idle-retention-postgres.test.ts`,
+`test/large-pages/segmented-prior-view.test.ts`).
+
+## Reproduce and update
+
+Run `bash vendor/update-postgres.sh --check` to download the pinned upstream
+tarball, verify SHA-512, apply the checked-in patch to every published runtime
+export, verify the upstream license and compare every byte. Run without
+`--check` to regenerate `postgres/`. This does not read a brain or alter any
+installed service. No driver dependency installation is required after regeneration.
+`bun run verify` runs the check as `check:vendor-postgres`
+(`scripts/check-vendor-postgres.sh`), so a fix in one copy that is missing from
+the patch or the other copies fails CI. The two pinned downloads are retried
+(bounded, with backoff) and kept by content hash in `~/.cache/gbrain-vendor`
+(`GBRAIN_VENDOR_CACHE`; test.yml caches it), and each is hash-checked on use.
+Without network and cache it is a recorded skip locally and a failure under CI.
+
+For security updates, the GBrain release maintainer owns this dependency:
+review upstream security advisories and supported releases, update the exact
+version/URLs/hashes here and in the updater, rebase the patch against pristine
+upstream source, regenerate, then review the entire diff. Never edit only an
+installed node_modules copy. Do not suppress the runtime capability guard.
+
+Before retiring this vendor, prove the candidate upstream release passes the
+same runtime reserved-owner check, interrupted reservation and in-query
+cancellation tests, successor-query fence tests, real Postgres and
+transaction-mode PgBouncer tests, and fresh/upgrade/packed/GitHub-global and
+compiled distribution smokes. An ordinary unsignalled SELECT or matching
+version is not evidence of safe cancellation. Publish the distribution and
+platform results, including any unavailable target, before changing the
+dependency back to the registry.
+
+## Isolated install smoke
+
+With a disposable test-shaped database, run:
+
+```sh
+GBRAIN_TEST_ALLOW_DATABASE_URL=1 GBRAIN_TEST_PACKAGE_SMOKE=1 \
+  DATABASE_URL="$DISPOSABLE_TEST_DATABASE_URL" \
+  bun test test/e2e/postgres-driver-install.test.ts
+```
+
+This uses isolated HOME/cache/install directories, no paid providers, and
+tests a checkout, actual packed installation, global tarball installation,
+an independently installed stock-driver negative fixture, a stale stock
+module alongside the new installation, and a Linux compiled job fixture.
+Each positive runtime validates readiness and cancellation, then completes a
+harmless minion job. The macOS ARM64 fixture is cross-compiled, not run; native
+macOS execution is a separate platform acceptance gate. To test a published
+GitHub revision's global installation instead of the local global tarball,
+also set `GBRAIN_TEST_GITHUB_PACKAGE=github:garrytan/gbrain#<published-sha>`.
+Do not claim GitHub transport validation before that revision is available.

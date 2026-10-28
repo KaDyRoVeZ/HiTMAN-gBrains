@@ -1,0 +1,106 @@
+import { execFile } from '../spawn.ts';
+import { lstatSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { AgentInstallError, assertNoSymlinks } from '../agent-install/state.ts';
+
+const protect = `
+$ErrorActionPreference = 'Stop'
+$path = $env:GBRAIN_BACKUP_PRIVATE_PATH
+if ($env:GBRAIN_BACKUP_PRIVATE_KIND -notin @('directory', 'file')) { throw 'Unexpected path kind' }
+$directory = $env:GBRAIN_BACKUP_PRIVATE_KIND -eq 'directory'
+$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$sids = @($user.Value)
+if ($user.Value -ne 'S-1-5-18') { $sids += 'S-1-5-18' }
+$attributes = [IO.File]::GetAttributes($path)
+if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or (($attributes -band [IO.FileAttributes]::Directory) -ne 0) -ne $directory) { throw 'Unexpected path type' }
+if ($directory) {
+  if ([IO.Directory]::GetFileSystemEntries($path).Length -ne 0) { throw 'Directory is not empty' }
+  $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+  $inheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+} else {
+  if ([IO.FileInfo]::new($path).Length -ne 0) { throw 'File is not empty' }
+  $acl = [System.Security.AccessControl.FileSecurity]::new()
+  $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
+}
+$acl.SetOwner($user)
+$acl.SetAccessRuleProtection($true, $false)
+foreach ($sid in $sids) {
+  $identity = [System.Security.Principal.SecurityIdentifier]::new($sid)
+  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($identity, [System.Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+  $acl.AddAccessRule($rule)
+}
+if ($directory) { [IO.Directory]::SetAccessControl($path, $acl) } else { [IO.File]::SetAccessControl($path, $acl) }
+$actual = if ($directory) { [IO.Directory]::GetAccessControl($path) } else { [IO.File]::GetAccessControl($path) }
+if (!$actual.AreAccessRulesProtected -or $actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $user.Value) { throw 'Owner or inheritance mismatch' }
+$rules = @($actual.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+if ($rules.Count -ne $sids.Count) { throw 'Unexpected access rules' }
+$seen = @{}
+foreach ($rule in $rules) {
+  if ($rule.IsInherited -or $sids -notcontains $rule.IdentityReference.Value -or $seen.ContainsKey($rule.IdentityReference.Value) -or $rule.AccessControlType -ne 'Allow' -or $rule.FileSystemRights -ne 'FullControl' -or $rule.InheritanceFlags -ne $inheritance -or $rule.PropagationFlags -ne 'None') { throw 'Access rule mismatch' }
+  $seen[$rule.IdentityReference.Value] = $true
+}
+[Console]::Write('private')
+`;
+
+const powershellExe = () => join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+
+/**
+ * PowerShell's first start on a cold Windows machine can outrun the protection
+ * step's 15 s bound (measured 3.3-27.7 s on fresh CI runners; later starts take
+ * 0.2-1.5 s), which failed a user's first backup. A trivial launch with its own
+ * 30 s bound warms it once per process; its result is ignored. The protection
+ * step itself still gets exactly one launch under its 15 s bound, so a hung
+ * PowerShell fails as before.
+ */
+let warmed: Promise<void> | null = null;
+function warmPowerShell(): Promise<void> {
+  warmed ??= new Promise<void>(resolve => {
+    try {
+      const child = execFile(powershellExe(), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', 'exit 0'],
+        { timeout: 30_000, windowsHide: true, maxBuffer: 1024 }, () => resolve());
+      child.stdin?.end();
+    } catch { resolve(); }
+  });
+  return warmed;
+}
+
+/** Test seam: forget this process's warm-up. */
+export function __resetPowerShellWarmupForTests(): void { warmed = null; }
+
+export async function protectNewBackupPath(path: string, kind: 'directory' | 'file'): Promise<void> {
+  if (process.platform !== 'win32') return;
+  let timedOut = false;
+  try {
+    await warmPowerShell();
+    assertNoSymlinks(path);
+    const before = lstatSync(path, { bigint: true });
+    if (!before.ino || (kind === 'directory' ? !before.isDirectory() || readdirSync(path).length !== 0 : !before.isFile() || before.size !== 0n || before.nlink !== 1n)) throw new Error('Expected a new empty path with stable identity');
+    const result = await new Promise<string>((resolve, reject) => {
+      let inputFailed = false;
+      const child = execFile(join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+        ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(protect, 'utf16le').toString('base64')], {
+          env: { ...process.env, GBRAIN_BACKUP_PRIVATE_PATH: path, GBRAIN_BACKUP_PRIVATE_KIND: kind },
+          encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024, windowsHide: true,
+        }, (error, stdout) => {
+          if (error?.killed && !inputFailed) timedOut = true;
+          if (error || inputFailed) reject(error ?? new Error('Private path input failed')); else resolve(stdout);
+        });
+      const inputFailure = () => { inputFailed = true; child.kill(); };
+      if (!child.stdin) { inputFailure(); return; }
+      child.stdin.once('error', inputFailure);
+      try { child.stdin.end(); } catch { inputFailure(); }
+    });
+    assertNoSymlinks(path);
+    const after = lstatSync(path, { bigint: true });
+    if (result !== 'private' || before.dev !== after.dev || before.ino !== after.ino
+      || before.birthtimeNs !== after.birthtimeNs
+      || (kind === 'directory' ? readdirSync(path).length !== 0 : after.size !== 0n || after.nlink !== 1n)) throw new Error('Private path verification failed');
+  } catch {
+    // A protection launch killed at its 15 s bound says nothing about this destination's permissions: Windows
+    // PowerShell did not start in time (a cold runner's first starts measured 30 s and more, after the warm-up).
+    if (timedOut) throw new AgentInstallError('private_backup_protection_timeout', "Windows PowerShell did not start within 15 seconds, so GBrain could not establish owner-only access (plus SYSTEM) on this new path. No payload was written to it. This is usually a slow first start of PowerShell on this machine; run the backup again. Existing files and parent permissions were not changed.");
+    // #5312 B(i): the text names what was observed (protection attempted and verified by the script above, and it
+    // did not hold here), not a categorical rule about drive roots; the user profile is the destination that works.
+    throw new AgentInstallError('private_backup_path_unavailable', "This destination's permissions prevented GBrain from establishing owner-only access (plus SYSTEM); use a new path inside your user profile. No payload was written to this new path. The destination must be on a local filesystem with Windows ACL support, with built-in Windows PowerShell available and permitted. Existing files and parent permissions were not changed.");
+  }
+}

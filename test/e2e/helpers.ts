@@ -1,0 +1,393 @@
+/**
+ * E2E test helpers: DB lifecycle, fixture import, and diagnostics.
+ *
+ * Usage in test files:
+ *   import { setupDB, teardownDB, importFixtures } from './helpers.ts';
+ *   beforeAll(async () => { await setupDB(); await importFixtures(); });
+ *   afterAll(async () => { await teardownDB(); });
+ */
+
+import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
+import { join, resolve, relative, dirname, basename, extname } from 'path';
+import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { ORIGIN_INDEX } from '../../src/core/persistence/origin-index.ts';
+import * as db from '../../src/core/db.ts';
+import { importFromContent } from '../../src/core/import-file.ts';
+import { parseMarkdown } from '../../src/core/markdown.ts';
+import { assertSafeE2eDatabaseUrl } from '../helpers/db-guard.ts';
+import { TRUST_BACKFILL_COMPLETED_KEY } from '../../src/core/trust/schema.ts';
+import { WRITE_GATE_SCAN_BASELINE_KEY } from '../../src/core/write-gate-schema.ts';
+import { configureGateway } from '../../src/core/ai/gateway.ts';
+import { runSchemaTransition } from '../../src/core/embedding-migration.ts';
+import { buildDeferredAnnIndexes } from '../../src/core/embedding-ann-build.ts';
+import { LEGACY_EMBEDDING_CONFIG } from '../helpers/legacy-embedding-config.ts';
+
+// Local opt-in configuration; container CI must not import developer credentials.
+const envPath = resolve(import.meta.dir, '../../.env.testing');
+if (process.env.GBRAIN_CI_DISABLE_TEST_ENV_FILE !== '1' && existsSync(envPath)) {
+  const lines = readFileSync(envPath, 'utf-8').split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq);
+    const val = trimmed.slice(eq + 1);
+    if (!process.env[key]) process.env[key] = val;
+  }
+}
+
+const DATABASE_URL = process.env.DATABASE_URL;
+const FIXTURES_DIR = resolve(import.meta.dir, 'fixtures');
+
+let engine: PostgresEngine | null = null;
+
+const ALL_TABLES = [
+  // C4 pinned questions: no FKs (pointers only); cleared so pins never leak across files.
+  'question_evidence',
+  'pinned_questions',
+  'fact_withdrawals',
+  // v0.31: facts must come BEFORE pages too (FK to sources, but tests
+  // seed via direct SQL so the row stays referenced until truncated).
+  'facts',
+  // v0.28: takes + synthesis_evidence MUST come BEFORE pages because they FK pages.id
+  'synthesis_evidence',
+  'takes',
+  'content_chunks',
+  'links',
+  'tags',
+  'raw_data',
+  'timeline_entries',
+  'page_versions',
+  'ingest_log',
+  'files',
+  // v0.43 (#2095): volunteered-context feedback log — no FK to pages (slug
+  // join), but stale rows poison stats/count assertions across runs.
+  'context_volunteer_events',
+  'pages',       // last because of foreign keys
+  'minion_attachments',
+  'minion_inbox',
+  'minion_jobs',
+  // A fresh-database `gbrain init` commits a protocol-2 shared-skill request;
+  // the request guard refuses to delete it (cascading from a source delete)
+  // in any later protocol-1 session. TRUNCATE fires no row guard.
+  'persistence_requests',
+];
+
+/**
+ * Check if a real database is available for E2E tests.
+ */
+export function hasDatabase(): boolean {
+  return !!DATABASE_URL;
+}
+
+/**
+ * Production guard, moved to test/helpers/db-guard.ts so test files outside
+ * test/e2e/ can import it without loading this module. Re-exported here for
+ * existing call sites (setupDB below, test/e2e/db-guard.test.ts).
+ */
+export { assertSafeE2eDatabaseUrl };
+
+/**
+ * Connect to DB and clear fixture data while retaining the migration ledger.
+ * Explicit migration fixtures can opt into replaying the cold migration chain.
+ * Call in beforeAll() of each test file.
+ */
+export async function setupDB(options: { replayMigrations?: boolean } = {}): Promise<PostgresEngine> {
+  if (!DATABASE_URL) {
+    throw new Error('DATABASE_URL not set. Copy .env.testing.example to .env.testing and configure it.');
+  }
+  assertSafeE2eDatabaseUrl(DATABASE_URL);
+
+  // Disconnect any prior connection (clean slate)
+  await db.disconnect();
+
+  // Connect fresh
+  await db.connect({ database_url: DATABASE_URL });
+  await db.initSchema();
+
+  // Truncate all data tables (preserves schema + extensions).
+  // Some tables (e.g. v0.28 takes/synthesis_evidence) only exist after
+  // migrations run via engine.connect() below, so skip non-existent tables.
+  const conn = db.getConnection();
+  const embeddingIdentity = await conn.unsafe<Array<{ key: string; value: string }>>(
+    `SELECT key, value FROM config WHERE key IN ('embedding_model', 'embedding_dimensions')`,
+  );
+  for (const table of ALL_TABLES) {
+    try {
+      await conn.unsafe(`TRUNCATE ${table} CASCADE`);
+    } catch (e: unknown) {
+      const code = (e as { code?: string })?.code;
+      if (code !== '42P01') throw e; // 42P01 = undefined_table; ignore those
+    }
+  }
+
+  // A warm reset keeps what the migrations seeded on the empty brain: the version and the trust bookkeeping
+  // (v226 backfill completion, v227 scan baseline), both still true of the emptied tables.
+  if (options.replayMigrations) await conn.unsafe('TRUNCATE config');
+  else await conn.unsafe('DELETE FROM config WHERE key <> ALL($1::text[])', [['version', TRUST_BACKFILL_COMPLETED_KEY, WRITE_GATE_SCAN_BASELINE_KEY]]);
+
+  // Re-seed config (initSchema inserts default config rows)
+  await conn.unsafe(`
+    INSERT INTO config (key, value) VALUES ('schema_version', '1')
+    ON CONFLICT (key) DO NOTHING
+  `);
+  for (const row of embeddingIdentity) {
+    await conn.unsafe('INSERT INTO config (key, value) VALUES ($1, $2)', [row.key, row.value]);
+  }
+
+  // Reset leaked brain identity: `sources` is not in ALL_TABLES (the default
+  // row must survive), but rows/columns written by earlier files or runs
+  // persist. writeSyncAnchor's ownership guard (#3735) keys on
+  // sources.default.local_path — a stale value from another test makes every
+  // legacy-path performSync classify as first_sync forever. 42P01-tolerant
+  // like the TRUNCATE loop above.
+  try {
+    // A file that activated managed persistence and exited without
+    // deactivating leaves the writer guard armed, and its sources trigger
+    // rejects the reset below (writer_coordinator_required). A fresh-database
+    // `gbrain init` also raises the writer protocol floor to 2 with shared
+    // skill bundles on, after which every protocol-1 request is refused
+    // (writer_upgrade_required). Restore the schema defaults (disabled, floor
+    // 1, bundles off) first. The floor trigger forbids lowering it by UPDATE,
+    // so the singleton row is replaced with its other columns kept.
+    await conn.unsafe(`WITH old AS (DELETE FROM persistence_brain WHERE singleton = 1 RETURNING *)
+      INSERT INTO persistence_brain SELECT (jsonb_populate_record(NULL::persistence_brain, to_jsonb(old)
+        || '{"enabled": false, "activated_at": null, "writer_protocol_floor": 1, "skill_bundles_enabled": false}'::jsonb)).* FROM old`);
+    await conn.unsafe(`DELETE FROM sources WHERE id <> 'default'`);
+    // Only the sync-identity columns: local_path feeds writeSyncAnchor's
+    // ownership guard (#3735) and last_commit/last_sync_at feed first_sync
+    // classification. chunker_version is deliberately left alone — NULLing
+    // it flips extraction-staleness semantics for unrelated suites.
+    await conn.unsafe(
+      `UPDATE sources SET local_path = NULL, last_commit = NULL, last_sync_at = NULL WHERE id = 'default'`,
+    );
+  } catch (e: unknown) {
+    const code = (e as { code?: string })?.code;
+    if (code !== '42P01' && code !== '42703') throw e; // missing table/column on older schemas
+  }
+
+  engine = new PostgresEngine();
+  await engine.connect({ database_url: DATABASE_URL });
+  // Apply MIGRATIONS via the engine path. db.initSchema above only runs the
+  // embedded SCHEMA_SQL baseline; migrations like v31 (takes) live in the
+  // MIGRATIONS array and only run when engine.initSchema() executes them.
+  // Idempotent: re-running migrations on an already-migrated DB is a no-op.
+  await engine.initSchema();
+  // #6948: a test that seeds legacy origin twins drops pages_live_origin_key, which the migrations do not rebuild on
+  // an already-migrated database; the emptied tables hold no twin, so every file starts with the index a fresh brain has.
+  await engine.executeRaw(ORIGIN_INDEX.sql);
+  return engine;
+}
+
+/**
+ * Opt-in setup for fixtures that seed legacy-width text vectors. Bare CLI
+ * init tests can create the shared database at the new-install width; row
+ * truncation alone cannot make those columns fit a later 1536-d fixture.
+ * Ordinary setupDB preserves custom shapes for schema/migration tests.
+ */
+export async function setupLegacyEmbeddingDB(): Promise<PostgresEngine> {
+  configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: {} });
+  const target = await setupDB();
+  const dims = LEGACY_EMBEDDING_CONFIG.embedding_dimensions;
+  const columns = await target.executeRaw<{ table_name: string; type_name: string; dims: number }>(`
+    SELECT c.relname AS table_name, t.typname AS type_name, a.atttypmod AS dims
+      FROM pg_attribute a
+      JOIN pg_class c ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_type t ON t.oid = a.atttypid
+     WHERE n.nspname = 'public'
+       AND c.relname IN ('content_chunks', 'query_cache', 'facts', 'takes')
+       AND a.attname = 'embedding' AND a.attnum > 0 AND NOT a.attisdropped`);
+  if (columns.length !== 4 || columns.some(column => !['vector', 'halfvec'].includes(column.type_name))) {
+    throw new Error('Legacy embedding fixture requires all four text embedding columns');
+  }
+  if (columns.some(column => column.table_name !== 'takes' && Number(column.dims) !== dims)) {
+    // #5088: the transition defers HNSW builds to the migration's build phase; the fixture builds them now.
+    let pending = await runSchemaTransition(target, dims);
+    await buildDeferredAnnIndexes(target, { targetDims: dims, readPending: async () => pending, writePending: async next => { pending = next; }, log: () => {} });
+  }
+  const takes = columns.find(column => column.table_name === 'takes')!;
+  if (Number(takes.dims) !== dims) {
+    // Production transition deliberately leaves takes alone (search is
+    // trigram-based). This empty test table also receives fixed-width seeds.
+    await target.executeRaw(`ALTER TABLE takes ALTER COLUMN embedding TYPE ${takes.type_name}(${dims}) USING NULL`);
+  }
+  await target.transaction(async tx => {
+    await tx.setConfig('embedding_model', LEGACY_EMBEDDING_CONFIG.embedding_model);
+    await tx.setConfig('embedding_dimensions', String(dims));
+  });
+  return target;
+}
+
+/**
+ * Disconnect from DB. Call in afterAll() of each test file.
+ */
+export async function teardownDB(): Promise<void> {
+  if (engine) {
+    await engine.disconnect();
+    engine = null;
+  }
+  await db.disconnect();
+}
+
+/**
+ * Get the current engine instance.
+ */
+export function getEngine(): PostgresEngine {
+  if (!engine) throw new Error('setupDB() must be called first');
+  return engine;
+}
+
+/**
+ * Get a raw DB connection for direct queries.
+ */
+export function getConn() {
+  return db.getConnection();
+}
+
+/**
+ * Import all fixture files from test/e2e/fixtures/ into the brain.
+ * An explicit engine lets a fixture own its database without shared resets.
+ * Returns the list of import results.
+ */
+export async function importFixtures(e: PostgresEngine = getEngine()) {
+  const results: Array<{ slug: string; status: string; chunks: number }> = [];
+
+  const files = findMarkdownFiles(FIXTURES_DIR);
+  for (const filePath of files) {
+    const relPath = relative(FIXTURES_DIR, filePath);
+    const content = readFileSync(filePath, 'utf-8');
+    const parsed = parseMarkdown(content, relPath);
+    const result = await importFromContent(e, parsed.slug, content, { noEmbed: true });
+    results.push(result);
+  }
+
+  return results;
+}
+
+/**
+ * Import a single fixture by its relative path within fixtures/.
+ */
+export async function importFixture(relativePath: string) {
+  const e = getEngine();
+  const filePath = join(FIXTURES_DIR, relativePath);
+  const content = readFileSync(filePath, 'utf-8');
+  const parsed = parseMarkdown(content, relativePath);
+  return importFromContent(e, parsed.slug, content, { noEmbed: true });
+}
+
+/**
+ * Recursively find all .md files in a directory.
+ */
+function findMarkdownFiles(dir: string): string[] {
+  const results: string[] = [];
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    const stat = statSync(full);
+    if (stat.isDirectory()) {
+      results.push(...findMarkdownFiles(full));
+    } else if (extname(entry) === '.md') {
+      results.push(full);
+    }
+  }
+  return results.sort();
+}
+
+/**
+ * Dump DB state for debugging on test failure.
+ */
+export async function dumpDBState(): Promise<string> {
+  const conn = db.getConnection();
+  const pages = await conn.unsafe(`SELECT slug, type, title FROM pages ORDER BY slug`);
+  const chunkCount = await conn.unsafe(`SELECT count(*) as n FROM content_chunks`);
+  const linkCount = await conn.unsafe(`SELECT count(*) as n FROM links`);
+  const tagCount = await conn.unsafe(`SELECT count(*) as n FROM tags`);
+
+  const lines = [
+    `=== DB STATE DUMP ===`,
+    `Pages (${pages.length}):`,
+    ...pages.map((p: any) => `  ${p.slug} [${p.type}] "${p.title}"`),
+    `Chunks: ${chunkCount[0]?.n ?? 0}`,
+    `Links: ${linkCount[0]?.n ?? 0}`,
+    `Tags: ${tagCount[0]?.n ?? 0}`,
+    `=== END DUMP ===`,
+  ];
+  return lines.join('\n');
+}
+
+/**
+ * Get the fixtures directory path.
+ */
+export const FIXTURES_PATH = FIXTURES_DIR;
+
+/**
+ * Rewind schema state to `targetVersion` and re-apply migrations in
+ * version order up to (and including) `targetVersion`.
+ *
+ * Used by the v15→v23 chain E2E to simulate the field report's starting
+ * state (schema at v15, ~100 real rows, kick off full migration). Before
+ * this helper, no CLI flag or test hook existed to stop the migration
+ * chain at an intermediate version — `gbrain init --migrate-only` always
+ * ran to latest.
+ *
+ * Caveats:
+ *   - Postgres-only (the v15→v23 chain only matters for Postgres anyway;
+ *     PGLite's schema is monolithic).
+ *   - Destructive to existing DDL: dropping a migration that created
+ *     a table leaves tables behind. This helper re-runs migrations from
+ *     the CURRENT version (whatever config.version says) upward. It
+ *     does NOT rewind down. Pair with `setupDB()` to truncate first.
+ *   - After calling this, the schema is whatever `v1..targetVersion`
+ *     produced. Columns added by v(targetVersion+1)+ will be missing.
+ *
+ * Call order in a test:
+ *   const engine = await setupDB();         // latest schema, empty tables
+ *   await conn.unsafe('ALTER TABLE ...');   // optional: drop forward columns
+ *   await setConfigVersion(1);              // reset schema version
+ *   await runMigrationsUpTo(engine, 15);    // advance to v15
+ *   // ... seed fixture data at v15 shape ...
+ *   await runMigrationsFromCurrent(engine); // advance to latest
+ */
+export async function runMigrationsUpTo(
+  engine: PostgresEngine,
+  targetVersion: number,
+): Promise<void> {
+  const { MIGRATIONS } = await import('../../src/core/migrate.ts');
+  const sorted = [...MIGRATIONS].sort((a, b) => a.version - b.version);
+
+  const currentStr = await engine.getConfig('version');
+  const current = parseInt(currentStr || '1', 10);
+
+  const pending = sorted.filter(m => m.version > current && m.version <= targetVersion);
+
+  for (const m of pending) {
+    const sql = m.sqlFor?.[engine.kind] ?? m.sql;
+    if (sql) {
+      // Inline the transactional wrap from runMigrationSQL so we can
+      // stop cleanly at targetVersion without re-invoking the full
+      // runMigrations loop.
+      await engine.transaction(async (tx) => {
+        await tx.runMigration(m.version, sql);
+      });
+    }
+    if (m.handler) {
+      await m.handler(engine);
+    }
+    await engine.setConfig('version', String(m.version));
+  }
+}
+
+/**
+ * Reset `config.version` to the given value. Used to simulate a brain
+ * at an older schema state before applying partial migrations via
+ * `runMigrationsUpTo`. Does NOT undo DDL — just moves the version
+ * marker that the migration runner uses to decide what's pending.
+ */
+export async function setConfigVersion(version: number): Promise<void> {
+  const conn = db.getConnection();
+  await conn.unsafe(`
+    INSERT INTO config (key, value) VALUES ('version', $1)
+    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+  `, [String(version)]);
+}

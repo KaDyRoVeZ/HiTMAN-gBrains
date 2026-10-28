@@ -1,0 +1,104 @@
+# CI guard registry (W0 fix-wave, Tier-1 #11 / D5.14).
+# THE single registry of scripts/check-* guards. package.json's `check:all`
+# (a second, stale, hand-synced copy) was deleted; scripts/run-verify-parallel.sh
+# executes guards, and scripts/guard-self-test.sh consumes THIS file to
+# self-test every scanner guard against known-bad/known-good fixtures under
+# test/fixtures/guards/<guard>/{bad,good}/ (env: GBRAIN_GUARD_ROOT).
+#
+# class: scanner   = greps/parses repo sources; MUST eventually carry fixtures
+#                    (selftest yes|todo). A scanner guard with selftest=todo is
+#                    tracked debt — the class that produced two permanently-
+#                    green guards (check-no-double-retry, pcregrep-gated pass).
+#        buildfresh = runs builds/regenerators and diffs outputs; self-tests
+#                    don't apply (the build IS the test). exempt.
+#        repostate = checks repo/file state (modes, symlinks, VERSION stamps);
+#                    exempt with reason.
+#
+# guard	class	selftest	notes
+check-no-double-retry.sh	scanner	yes	regex hole fixed in W0 (could not match `() =>`); perl multi-line pass replaces never-installed pcregrep
+check-jsonb-pattern.sh	scanner	yes	nested-paren hole fixed in W0; safe ::text::jsonb spelling stays unflagged
+check-jsonb-params.mjs	scanner	yes	positional $N::jsonb AST-lite scanner; argv/env root override; in verify CHECKS (check:jsonb-params) over the real tree
+check-batch-audit-site.sh	scanner	yes	auditSite literals in src/ must be in BATCH_AUDIT_SITES (src/core/retry.ts); GBRAIN_GUARD_ROOT seam
+check-bun-test-timeout.sh	scanner	todo	not in verify CHECKS: runs directly as a test.yml verify-job step
+check-fixture-privacy.sh	scanner	yes	conversation-formats + transcripts fixtures (all tokens); evals/ and docs/test-audit/ (real-entity tokens, V-12); GBRAIN_GUARD_ROOT seam
+check-no-legacy-getconnection.sh	scanner	yes	was reachable from neither verify nor CI pre-W0 (check:all only); GBRAIN_GUARD_ROOT seam; bad-<dir> fixtures prove it scans every refactor-wave-1 module dir
+check-no-pii-in-agent-voice.sh	scanner	yes	shape + private-path regex over the agent-voice recipe surface; operator blocklist via AGENT_VOICE_PII_BLOCKLIST; GBRAIN_GUARD_ROOT seam
+check-operations-filter-bypass.sh	scanner	yes	GBRAIN_GUARD_ROOT seam; canonical localOnly filter may live in serve-http.ts or serve-http-mcp.ts; bad-<dir> fixtures cover each refactor-wave-1 module dir
+check-pg-url-redaction.sh	scanner	todo	wired into verify CHECKS (v0.45.x test/eval/CI pass; was registered-but-never-executed)
+check-privacy.sh	scanner	todo
+check-progress-to-stdout.sh	scanner	todo
+check-proposal-pii.sh	scanner	todo
+check-search-path.sh	scanner	yes	GBRAIN_GUARD_ROOT seam; schema base files incl. the generated PGLite template (pglite-schema.generated.ts, refactor wave 1)
+check-skill-brain-first.sh	scanner	yes	runs this checkout's doctor skill_brain_first over <root>/skills; GBRAIN_GUARD_ROOT seam
+check-skill-publication.ts	scanner	yes	A-NEW-3: bundled SKILL.md files (skills/, plugin/, plugin-variants/) through normalizeSkillFiles + skillMetadata; GBRAIN_GUARD_ROOT seam
+check-skill-refs.mjs	scanner	todo
+check-source-config-leak.sh	scanner	yes	GBRAIN_GUARD_ROOT seam; bad-<dir> fixtures cover serve-http-*.ts, engine-sql/, sync/, doctor/checks/
+check-source-id-projection.sh	scanner	yes	GBRAIN_GUARD_ROOT seam; portable word boundaries (mawk has no \b, so the guard matched nothing on Ubuntu before); scans engine façades, module dirs and engine-sql/
+check-source-scope-onboard.sh	scanner	yes	onboard SQL sites need source_id scoping or a brain-wide marker; GBRAIN_GUARD_ROOT seam
+check-synthetic-corpus-privacy.sh	scanner	todo
+check-system-of-record.sh	scanner	todo
+check-test-real-names.sh	scanner	todo
+check-worker-lock-renewal-shape.sh	scanner	todo
+check-worker-pool-atomicity.sh	scanner	todo
+check-gateway-routed-no-direct-anthropic.sh	scanner	yes	no runtime @anthropic-ai/sdk import or new Anthropic() in gateway-routed files; GBRAIN_GUARD_ROOT seam
+check-engine-dynamic-import.sh	scanner	yes	.ts companion is its implementation, not a separate guard; scans engine façades, their module dirs, engine-sql/ and schema-migrations/; GBRAIN_GUARD_ROOT seam
+check-key-files-current-state.sh	scanner	todo
+check-trailing-newline.sh	scanner	yes	tracked src/test/root text files end with a newline (guard fixtures excluded); GBRAIN_GUARD_ROOT seam scans with find
+check-test-isolation.sh	scanner	yes	allowlist data file: check-test-isolation.allowlist; fixture mode (GBRAIN_GUARD_ROOT) lints *.test.fixture.ts (bad: R5, bad-r1: R1, bad-r6: R6)
+check-compile-autoload.sh	scanner	yes	every `bun build --compile` invocation (CLI one-liners + TS spawn arrays) in package.json/.github/scripts/docs/CLAUDE.md/CONTRIBUTING.md must carry --no-compile-autoload-bunfig (a cwd bunfig.toml preload runs before cli-preflight in a compiled binary); also every curated help record in src/cli/command-table.ts loads its src/cli/help/<name>.ts module through a literal () => import() (D3), and every spec module has a record
+check-admin-build.sh	buildfresh	exempt	runs the admin build; the build is the test
+check-admin-embedded.sh	buildfresh	exempt	embed freshness diff; not in verify CHECKS: duplicates check:admin-build's build
+check-admin-scope-drift.sh	buildfresh	exempt	regenerates + diffs
+check-vendor-postgres.sh	buildfresh	exempt	rebuilds vendor/postgres (src, cjs/src, cf/src) from the pinned upstream tarball plus patches/postgres@3.4.9.patch and diffs every byte; networked (fails under CI, a recorded skip offline)
+check-bootstrap-templates.sh	buildfresh	exempt	regenerates template tree + diffs
+check-plugin-tree.sh	buildfresh	exempt	regenerates the plugin tree + diffs (curation record validated by the generator)
+check-eval-glossary-fresh.sh	buildfresh	exempt	regenerates + diffs
+check-fuzz-purity.sh	buildfresh	exempt	executes fuzz corpus
+check-image-decoders-embedded.sh	buildfresh	exempt	binary embed check; in verify CHECKS (check:image-decoders); its smoketest compile bundles a handful of modules (~0.6s)
+check-pglite-embedded.sh	buildfresh	exempt	binary embed check
+check-skills-manifest-fresh.sh	buildfresh	exempt	regenerates + diffs
+check-tool-catalog-fresh.sh	buildfresh	exempt	regenerates + diffs
+check-wasm-embedded.sh	buildfresh	exempt	binary embed check
+check-bootstrap-tag.sh	repostate	exempt	VERSION stamp drift check
+check-cli-executable.sh	repostate	exempt	file-mode check
+check-no-tracked-symlinks.sh	repostate	exempt	git index state check
+check-grok-pin.sh	repostate	exempt	pin-stamp drift check (GROK-CLI-PIN.md stamps vs heavy-tests grok-door env); own bun guard tests in test/check-bootstrap-guards.test.ts
+check-module-size.sh	scanner	yes	committed per-file line ceilings (module-size-limits.tsv); growth + stale-ceiling + missing-row + new-file cap
+check-function-size.ts	scanner	yes	W5 per-function line ratchet (TS compiler API): new >300-line function, growth, shrink-below-limit, stale slack, missing row, raise without issue/TODO id; baseline scripts/function-size-baseline.tsv keyed by path + name path; --transfer for verified move-only commits
+check-item-allowlist-catches.ts	scanner	yes	GBRA-130 per-item allowlist-catch ratchet (TS compiler API): a catch in a loop body or forEach/map callback that tests the caught error code against a set/list/literal and rethrows it; per-file counts in scripts/item-allowlist-catches-baseline.tsv only shrink (growth, stale row, zero/missing-file row, malformed rows fail); --update rewrites for shrinks
+check-engine-sql-ratchet.ts	scanner	yes	goal (a) engine-sql ratchet (TS AST): SQL-bearing engine members (façade classes + pglite-engine/ and postgres-engine/ modules) need a baseline row or an engine-sql-ok marker; stale/duplicate rows and unbacked migrated domains fail; baseline scripts/engine-sql-baseline.tsv; --prune drops stale rows only
+check-page-body-readers.ts	scanner	yes	Wave B segmented storage (spec 1.5 layer 4, TS AST): src units reading .compiled_truth/.timeline, SQL literals naming the body columns or p.* from pages, and whole-body calls (serializePageToMarkdown, putPage, ...) need a baseline row with an action code; stale/duplicate/malformed rows fail; boundedBodyPrefixSql allowed by name; baseline scripts/page-body-readers-baseline.tsv; --prune drops stale rows only
+check-engine-sql-dynamic.ts	scanner	yes	CQ3/EO17 dynamic SQL in src/core/engine-sql/** (TS AST; fragment.ts exempt as the renderer): trustedSql args and composed .query/.unsafe/.executeRaw/executeRawJsonb SQL splice only literals, as-const/allowlisted constants, VETTED_BUILDERS calls or Number.isFinite-checked numbers; no $<digit> in composed strings; no expanded IN lists
+check-engine-sql-brands.ts	scanner	yes	EO4/AR2 RLS read brands (TS AST + text): brand-key mentions outside engine-sql/brands.ts; casts onto ScopedRead/LegacyUnscopedRead or `as unknown as` executor types in src/; unscopedExecutor/LegacyUnscopedRead/scopedRead imports outside their allowlists, src/core/ops/** always denied
+check-sync-run-state.ts	scanner	yes	A17 (W4 sync): SyncRun mutable fields (non-readonly members of interface SyncRun) are never destructured or aliased into locals under src/commands/sync/; @checkpoint fields are assigned only in sync-run.ts (single owner); fixtures cover destructuring, aliasing, a parameter pattern in a nested dir, and an out-of-owner checkpoint write
+check-layering.ts	scanner	yes	EO10 layering (TS AST, every import form): src/core/engine-sql/** imports no engine façade; src/core/schema-migrations/** imports no migrate.ts; src/core/persistence/** imports no ai/gateway.ts (P8 write-inference contract)
+check-ai-sdk-importers.ts	scanner	yes	P8: provider SDKs (ai, @ai-sdk/*, @anthropic-ai/sdk, openai) imported as runtime values only by scripts/ai-sdk-importers.allowlist (shrink-only), so every model call is observable through invokeAI
+check-durable-flush.ts	scanner	yes	#5595/#5475 Windows durability (TS AST, scope-resolved): fsyncSync of a descriptor from a read-only or unreadable-flags openSync in src/ outside src/core/fs-durable.ts fails, file or directory; write-fd flushes pass; reasoned ALLOWLIST, stale entries fail; bad-directory fixture covers an O_RDONLY directory flush
+check-schema-error-predicates.ts	scanner	yes	wave 18b doctor truth (TS AST): a call to isUndefinedColumnError/isUndefinedTableError or a '42703' comparison in src/ outside src/core/utils.ts fails unless the file is in ALLOWLIST (reasoned; stale entries fail); bad-raw-code fixture covers a raw SQLSTATE comparison
+check-windows-hide.ts	scanner	yes	#4992 Windows hidden consoles (TS AST): runtime child_process import or Bun.spawn* outside src/core/spawn.ts fails unless the file is in NOT_YET_MIGRATED (ratchet: a listed file that stops launching directly fails as stale); explicit windowsHide: false outside ALLOWLIST fails, stale entries fail
+check-schema-migrations-fresh.sh	buildfresh	exempt	regenerates src/core/schema-migrations/registry.generated.ts + diffs; generator enforces filename/version/name cross-check and duplicate versions (unit: test/scripts/build-schema-migrations.test.ts)
+check-schema-fresh.sh	buildfresh	exempt	W2: regenerates the schema chain (fragments -> schema.sql regions -> schema-embedded -> PGLite template) into a temp dir and diffs every output; names the source to edit (unit: test/scripts/build-schema.test.ts)
+check-retired-phrases.sh	scanner	yes	W7 (refactor wave 1): retired contributor-workflow phrases (migrations array, two-engine SQL rule, CLI switch case, region policy, hand-synced PGLite schema) fail in CLAUDE.md, AGENTS.md, CONTRIBUTING.md, docs/, skills/; historical records and the porting kit exempt; GBRAIN_GUARD_ROOT seam; bad-<location> fixtures
+check-shared-tree-git.sh	scanner	yes	#6530: unsafe shared-checkout git (pull --rebase, autostash, stash, repo-wide add/commit, reset --hard, bare or force push) fails in fenced code and inline code under skills/, recipes/, templates/, docs/, plugin trees and the three agent docs; allow markers with a reason; multi-agent rules block identical in AGENTS/BOOTSTRAP/INSTALL; GBRAIN_GUARD_ROOT seam; bad-<variant> fixtures
+check-bash32.sh	scanner	todo	#5810: every tracked *.sh parses under bash 3.2 (real parser: GBRAIN_BASH32, stock macOS /bin/bash, or the digest-pinned bash:3.2 image); not in verify CHECKS or this self-test, which must not need Docker; its bad/good fixtures run in test/scripts/check-bash32.test.ts, mandatory in the test.yml verify-job step (GBRAIN_TEST_BASH32_REQUIRE=1)
+check-schema-migration-order.ts	repostate	exempt	EO10: a migration origin/master lacks must be numbered above its latest version; reads the base ref from git (unit: test/scripts/build-schema-migrations.test.ts)
+check-behavior-since.ts	repostate	exempt	A since: 'TBD' BEHAVIOR_CHANGES row never ships: refused on a stamped tree, on master and with --stamped (restamp, Release); reads the base ref from git (unit: test/scripts/check-behavior-since.test.ts)
+check-changelog-headings.ts	repostate	exempt	CHANGELOG.md keeps every release heading origin/master has; reads the base ref from git (unit: test/scripts/check-changelog-headings.test.ts)
+check-structural-manifest.sh	buildfresh	exempt	regenerate+diff of structural-suites.tsv (classify-tests.ts); the diff IS the self-test
+check-opencode-pin.sh	repostate	exempt	pin-stamp drift check (OPENCODE-CLI-PIN.md stamps vs heavy-tests opencode-door env); own bun guard tests in test/check-bootstrap-guards.test.ts
+check-pin-doc-privacy.sh	repostate	exempt	PIN-doc placeholder discipline (no operator paths/key material/emails in docs/mcp/*-CLI-PIN.md); own bun guard tests in test/check-bootstrap-guards.test.ts
+check-origin-assignment.mjs	scanner	yes	#6948: page origin writes (UPDATE pages SET source_path=<non-NULL>, INSERT INTO pages carrying source_path, UPDATE pages SET slug=<rename>) outside src/core/persistence/origin-guard.ts unless marked origin-guard-ok: <reason>; argv root override; fixtures under test/fixtures/guards/; also in verify CHECKS
+check-getpage-scoped-write.mjs	scanner	yes	unscoped-getPage + write co-occurrence scanner (source-isolation bug class); argv root override; fixtures under test/fixtures/guards/; also in verify CHECKS
+check-core-guard-coverage.mjs	scanner	yes	core memory write-path guard coverage: PreparedMutation builders route through preparePageMutation or a reasoned EXEMPT entry, wrappers forward exclusiveSources; argv/GBRAIN_GUARD_ROOT root override; in verify CHECKS
+check-orphan-modules.mjs	scanner	yes	runtime-reachability walk (static+dynamic relative imports) from cli/mcp/plugin/admin entrypoints + package.json exports; hard-fails untested orphans, requires a reasoned PERMITTED_TEST_ONLY entry per test-only module (stale entries fail); fixture root via argv/GBRAIN_GUARD_ROOT; knip v5 evaluated + rejected (crashes on repo layout — see script header)
+check-test-placeholders.mjs	scanner	yes	TypeScript AST (CallExpression) scan of test/**/*.test.ts for no-op expect(true)/expect(1) placeholders; path+test+count allowlist (disabled in fixture mode); fixture root via argv/GBRAIN_GUARD_ROOT; in verify CHECKS
+check-test-discriminates.sh	buildfresh	exempt	manual per-PR discrimination helper (#3665): reverts named source files to their pre-fix state and runs the named test file to prove it fails without the fix — the test run IS the check; not in verify CHECKS or CI
+check-agent-contract.ts	scanner	yes	agent operator contract v1 (B9): syntax-only TS AST; per-rule shrink-only baselines in scripts/agent-contract-baselines/; registry completeness + code naming never baselined; GBRAIN_GUARD_ROOT seam (baselines from <root>/baselines)
+check-test-env-opt-ins.ts	scanner	yes	D7 (GBRA-47): execution-gating process.env.GBRAIN_* reads in test/ and evals/ of names the operator-env preload strips (TS AST); policy shared with test/helpers/operator-env-policy.ts. GBRA-79: module-scope delete/assignment of GBRAIN_PGLITE_SNAPSHOT in a matrix-loaded file (leaks through the shard's one bun process)
+check-postgres-lane-coverage.ts	scanner	yes	GBRA-47 D8 (TS AST): a test file outside test/e2e/ with a DATABASE_URL-gated PostgreSQL arm (testBackends(), gated process.env.DATABASE_URL) must be named by a DATABASE_URL workflow step, a test/e2e registerPostgresTests wrapper, a tests/heavy script or the backend matrix; reasoned ALLOWLIST, stale rows fail
+check-weight-coverage.ts	scanner	yes	C2 (GBRA-47): weight-map entries naming missing files fail; unweighted share per lane warns, failing only on the scheduled run
+check-recipe-pricing.ts	scanner	yes	X1 (wave 9 lane A, D22): every model a recipe touchpoint lists resolves through isModelPriceable or is named in the recipe's unpriced_models; stale markers fail; GBRAIN_GUARD_ROOT seam reads <root>/recipes.json against the real price tables
+check-write-gate-regex.ts	scanner	yes	#5575 ENG-16: write-gate detector patterns (WRITE_GATE_PATTERNS) are bounded (no * + {n,}, bound <= 200, no nested repeats, no backrefs), longest match <= MAX_MATCH_CHARS, preceded contexts $-anchored and <= MAX_PRECEDING_CHARS, non-global with lowercase anchors; GBRAIN_GUARD_ROOT reads <root>/patterns.json
+check-chunk-visibility.ts	scanner	yes	Wave B segmented storage (spec 4.2, TS AST): every FROM/JOIN content_chunks statement in src uses chunkVisibleFilter (or its generation siblings) or carries -- chunk-visibility-ok: <reason>; per-file uncovered counts in scripts/chunk-visibility-baseline.tsv only shrink; --prune lowers rows
+check-file-url-pathname.sh	scanner	yes	#6845: a file URL .pathname in test/ keeps %20 escapes; GBRAIN_GUARD_ROOT seam; skips test/fixtures/guards/
+check-derived-census.ts	scanner	yes	GBRA-161: per-file soft-delete sites (softDeletePage(s), retireDerivedPages(InTransaction), UPDATE pages ... deleted_at =) need a reviewed row with a class in docs/architecture/derived-census.tsv; growth, stale (ceiling above count) and unknown classes fail; --prune lowers ceilings

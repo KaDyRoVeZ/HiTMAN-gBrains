@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "frozen_at": "2026-10-04",
+  "base": "5bd9e84978126689b11cf65107c0a9aa0e91e11b",
+  "selection": "Merged non-merge fix commits from the last 60 days touching persistence, sync, refresh, connectors or managed facts/atoms, whose src/ hunks reverse-apply cleanly (git apply -R -3) on the wave base. Tests in the fix commit are not reverted, so the gate alone decides caught/missed.",
+  "candidates_checked": 30,
+  "clean": 12,
+  "fixes": [
+    {
+      "sha": "382fa73f68a7dca9095e753192375fd92a8558f1",
+      "date": "2026-10-04",
+      "subject": "fix(refresh): recheck recovery under the worktree lock so a publisher finishing mid-probe is not refused; harden 13c",
+      "src_files": [
+        "src/core/persistence/worktree-refresh.ts"
+      ]
+    },
+    {
+      "sha": "08ddd72b717fc5f1d715a0716f5c2dfa8597ff0a",
+      "date": "2026-10-04",
+      "subject": "fix(sync): a drain keeps retrying admission that gave up on counter contention; document group lock order (#5984)",
+      "src_files": [
+        "src/core/persistence/admission-retry.ts",
+        "src/core/persistence/group-publish.ts",
+        "src/core/persistence/sync-drain.ts"
+      ]
+    },
+    {
+      "sha": "f4cdff892cb800500fab92de7305b8f7028de2b4",
+      "date": "2026-10-04",
+      "subject": "fix(sync): no bulk group forms while a foreground write is queued; default group budget 15 s (#5984)",
+      "src_files": [
+        "src/core/persistence/sync-group.ts",
+        "src/core/persistence/sync-run.ts"
+      ]
+    },
+    {
+      "sha": "6e60d6ed081a988c055c6ac2ad081b24b9c3841e",
+      "date": "2026-10-04",
+      "subject": "fix(sync): managed sources drain one at a time under sync --all (#5984)",
+      "src_files": [
+        "src/commands/sync/run.ts"
+      ]
+    },
+    {
+      "sha": "7ffda48ead8163f3662da344e800e46d8f43d654",
+      "date": "2026-10-04",
+      "subject": "fix(sync): hold rows never store a declared slug; fail-closed fixtures pin sync.holds=fail (#5988)",
+      "src_files": [
+        "src/core/persistence/sync-screen.ts"
+      ]
+    },
+    {
+      "sha": "5a5505335109fb6dba7d9964be3830a0b55a7800",
+      "date": "2026-10-01",
+      "subject": "fix(persistence): a concurrent CLI call waits for the PGLite lock instead of owner_unavailable (N5-2)",
+      "src_files": [
+        "src/core/persistence/local-client.ts"
+      ]
+    },
+    {
+      "sha": "6fe43935ebe63c44e33f329913ead3b9222ed8a0",
+      "date": "2026-09-30",
+      "subject": "v0.60.21.0 fix(persistence): SIGTERM a stopped git child before SIGKILL so it can release index.lock (#5793)",
+      "src_files": [
+        "src/core/brain-repo-durability.ts"
+      ]
+    },
+    {
+      "sha": "cc7c9956ae173100c3ddf5306cb120ed9f9aa9fd",
+      "date": "2026-10-02",
+      "subject": "fix(persistence): a write reaching a row that awaits its revision backfill settles as revision_backfill_pending, not storage_error (#5216)",
+      "src_files": [
+        "src/core/persistence/coordinator.ts"
+      ]
+    },
+    {
+      "sha": "33ab99d659c21717915fda45934c43edd0d8928a",
+      "date": "2026-10-03",
+      "subject": "fix(persistence): startup refresh recovery scans only interrupted rows; test admission's lazy completion",
+      "src_files": [
+        "src/core/persistence/worktree-refresh.ts"
+      ]
+    },
+    {
+      "sha": "3b2320e1fe9c54421194f7fb164a96014c72a233",
+      "date": "2026-10-02",
+      "subject": "fix(connectors): retained-publication recovery waits the configured write wait instead of a fixed 5 s (#5232)",
+      "src_files": [
+        "src/core/persistence/connector-sync.ts",
+        "src/core/persistence/write-wait.ts"
+      ]
+    },
+    {
+      "sha": "05d5fe6a28fbe0c1f468d3f5509c7baed4f04564",
+      "date": "2026-10-01",
+      "subject": "fix(atoms): invalidate earlier extractions as each retirement commits; retry identity ignores the generation",
+      "src_files": [
+        "src/core/persistence/atom-maintenance.ts"
+      ]
+    },
+    {
+      "sha": "e01e9824dc645d02331e28d5703a22a774745814",
+      "date": "2026-10-01",
+      "subject": "fix(repair): extractor-facts restores only onto the previewed page id",
+      "src_files": [
+        "src/core/repair/extractor-facts.ts"
+      ]
+    }
+  ]
+}

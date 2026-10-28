@@ -1,0 +1,131 @@
+/**
+ * T4 — evidence + create_safety contract. This is the agent-facing signal that
+ * prevents the incident's duplicate-stub class: the don't-write decision keys
+ * off WHY a page matched, not a raw blended score.
+ */
+
+import { describe, test, expect } from 'bun:test';
+import { classifyEvidence, createSafetyFor, stampEvidence, markKeywordHits, HIGH_MATCH_FLOOR, SOLID_MATCH_FLOOR } from '../../src/core/search/evidence.ts';
+import type { SearchResult } from '../../src/core/types.ts';
+
+function r(partial: Partial<SearchResult>): SearchResult {
+  return { slug: 's', title: 't', chunk_text: '', type: 'note', source_id: 'default', chunk_index: 0, chunk_id: 1, score: 0.5, ...partial } as SearchResult;
+}
+
+describe('classifyEvidence precedence', () => {
+  test('alias_hit wins over everything', () => {
+    expect(classifyEvidence(r({ alias_hit: true, title_match_boost: 1.25, base_score: 0.99 }))).toBe('alias_hit');
+  });
+  test('exact_title_match when title boost fired', () => {
+    expect(classifyEvidence(r({ title_match_boost: 1.25, base_score: 0.2 }))).toBe('exact_title_match');
+  });
+  test('RE-PINNED (v0.46.15 #3963 + #3783): a high BLENDED score with neither cosine nor keyword hit is weak_semantic', () => {
+    // Was (v0.46.15): base_score >= SOLID_MATCH_FLOOR → keyword_exact with
+    // ZERO keyword verification. #3783: keyword_exact requires actual
+    // lexical-arm membership (keyword_hit). A pure-vector row with a solid
+    // blended score honestly reads weak_semantic / 'unknown'.
+    expect(classifyEvidence(r({ base_score: HIGH_MATCH_FLOOR }))).toBe('weak_semantic');
+    expect(classifyEvidence(r({ base_score: 0.90 }))).toBe('weak_semantic');
+  });
+  test('high_vector_match fires ONLY on a real cosine at/above the floor', () => {
+    expect(classifyEvidence(r({ base_score: 0.3, cosine: 0.85 }))).toBe('high_vector_match');
+    expect(classifyEvidence(r({ base_score: 0.3, cosine: 0.8 }))).toBe('high_vector_match');
+    expect(classifyEvidence(r({ base_score: 0.95, cosine: 0.5, keyword_hit: true }))).toBe('keyword_exact');
+    expect(classifyEvidence(r({ base_score: 0.95, cosine: 0.5 }))).toBe('weak_semantic');
+  });
+  test('cosine floor is overridable (per-model calibration knob)', () => {
+    expect(classifyEvidence(r({ base_score: 0.3, cosine: 0.7 }), { cosineFloor: 0.65 })).toBe('high_vector_match');
+    expect(classifyEvidence(r({ base_score: 0.3, cosine: 0.7 }), { cosineFloor: 0.9 })).toBe('weak_semantic');
+  });
+  test('#3783: keyword_exact requires a keyword hit AND the solid band', () => {
+    expect(classifyEvidence(r({ base_score: SOLID_MATCH_FLOOR, keyword_hit: true }))).toBe('keyword_exact');
+    expect(classifyEvidence(r({ base_score: 0.7, keyword_hit: true }))).toBe('keyword_exact');
+    // Solid band WITHOUT a keyword hit — the #3783 lie, now weak_semantic.
+    expect(classifyEvidence(r({ base_score: SOLID_MATCH_FLOOR }))).toBe('weak_semantic');
+    expect(classifyEvidence(r({ base_score: 0.7 }))).toBe('weak_semantic');
+    // Keyword hit BELOW the solid band stays weak_semantic (low-confidence tail).
+    expect(classifyEvidence(r({ base_score: 0.4, keyword_hit: true }))).toBe('weak_semantic');
+  });
+  test('weak_semantic below the solid floor (the incident: 0.64 body chunk... 0.5 here)', () => {
+    expect(classifyEvidence(r({ base_score: 0.4 }))).toBe('weak_semantic');
+  });
+  test('RE-PINNED (#3783): score fallback without cosine still honors the keyword-hit gate', () => {
+    expect(classifyEvidence(r({ score: 0.95, base_score: undefined, keyword_hit: true }))).toBe('keyword_exact');
+    expect(classifyEvidence(r({ score: 0.95, base_score: undefined }))).toBe('weak_semantic');
+  });
+  test('keyless fall-through: no cosine anywhere → create_safety never claims exists via vector', () => {
+    const rs = [r({ base_score: 0.99, keyword_hit: true }), r({ base_score: 0.7, keyword_hit: true })];
+    stampEvidence(rs);
+    expect(rs[0].evidence).toBe('keyword_exact');
+    expect(rs[0].create_safety).toBe('probable'); // degraded from 'exists' — safe direction
+    expect(rs[1].create_safety).toBe('probable');
+  });
+  test('#3783: legacy rows without the keyword_hit field degrade to weak_semantic (safe direction)', () => {
+    // r() never sets keyword_hit — this models a legacy cached row.
+    const legacy = r({ base_score: 0.9 });
+    expect(legacy.keyword_hit).toBeUndefined();
+    expect(classifyEvidence(legacy)).toBe('weak_semantic');
+  });
+});
+
+describe('markKeywordHits (#3783)', () => {
+  test('stamps every row, idempotent', () => {
+    const rs = [r({}), r({ slug: 'b' })];
+    markKeywordHits(rs);
+    markKeywordHits(rs);
+    expect(rs.every(x => x.keyword_hit === true)).toBe(true);
+  });
+});
+
+describe('createSafetyFor', () => {
+  test('strong evidence → exists (do NOT duplicate)', () => {
+    expect(createSafetyFor('alias_hit')).toBe('exists');
+    expect(createSafetyFor('exact_title_match')).toBe('exists');
+    expect(createSafetyFor('high_vector_match')).toBe('exists');
+  });
+  test('keyword_exact → probable', () => {
+    expect(createSafetyFor('keyword_exact')).toBe('probable');
+  });
+  test('weak_semantic → unknown', () => {
+    expect(createSafetyFor('weak_semantic')).toBe('unknown');
+  });
+});
+
+describe('stampEvidence', () => {
+  test('stamps both fields on every result', () => {
+    const rs = [r({ alias_hit: true }), r({ base_score: 0.3 })];
+    stampEvidence(rs);
+    expect(rs[0].evidence).toBe('alias_hit');
+    expect(rs[0].create_safety).toBe('exists');
+    expect(rs[1].evidence).toBe('weak_semantic');
+    expect(rs[1].create_safety).toBe('unknown');
+  });
+
+  test('the incident: a 0.64 KEYWORD-hit body-chunk match reads as probable (prefer update over create)', () => {
+    const incident = r({ base_score: 0.64, score: 0.64, keyword_hit: true });
+    stampEvidence([incident]);
+    expect(incident.evidence).toBe('keyword_exact'); // 0.64 is in the solid band AND keyword-verified
+    expect(incident.create_safety).toBe('probable');  // not 'unknown' — prefer update over create
+  });
+
+  test('#3783: the same 0.64 WITHOUT a keyword hit reads weak/unknown (look closer, do not trust the blend)', () => {
+    const vectorOnly = r({ base_score: 0.64, score: 0.64 });
+    stampEvidence([vectorOnly]);
+    expect(vectorOnly.evidence).toBe('weak_semantic');
+    expect(vectorOnly.create_safety).toBe('unknown');
+  });
+
+  test('after the fix: the same page via alias/title reads as exists (do not duplicate)', () => {
+    const fixed = r({ base_score: 0.64, alias_hit: true });
+    stampEvidence([fixed]);
+    expect(fixed.evidence).toBe('alias_hit');
+    expect(fixed.create_safety).toBe('exists');
+  });
+});
+
+describe('A4-2: OR-relaxed lexical rows are not lexically verified', () => {
+  test('a relaxed keyword hit with a solid score is weak_semantic, not keyword_exact', () => {
+    expect(classifyEvidence(r({ keyword_hit: true, keyword_relaxed: true, base_score: 0.9 }))).toBe('weak_semantic');
+    expect(classifyEvidence(r({ keyword_hit: true, base_score: 0.9 }))).toBe('keyword_exact');
+  });
+});

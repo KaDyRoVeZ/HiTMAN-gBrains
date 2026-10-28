@@ -1,0 +1,176 @@
+import type { BrainEngine } from '../engine.ts';
+import { opError, OperationError } from '../ops/contract.ts';
+import type { SqlEngine, WriteRequest } from './model.ts';
+import { managedPersistenceEnabled } from './ownership.ts';
+import { isConnectorSourceKind } from './connector-identity.ts';
+import { detachRestoredPage } from './detached-pages.ts';
+
+/**
+ * #5254: a Postgres page write to a filesystem source with no canonical owner
+ * (#6449: also a PGLite write to a source activation listed database-only,
+ * where the automatic first-write claim is off). Refused by default; `persistence.unbound_write=database_only` lets every
+ * page mutation (#5393) write a page with no recorded canonical file to the
+ * database only. Those pages
+ * carry `pages.database_only_reason='unbound_source'` so writes and sync after
+ * binding keep them database-only instead of materializing or overwriting them.
+ */
+export const UNBOUND_WRITE_KEY = 'persistence.unbound_write';
+export const UNBOUND_WRITE_VALUES = ['refuse', 'database_only'] as const;
+export type UnboundWritePolicy = typeof UNBOUND_WRITE_VALUES[number];
+export const UNBOUND_SOURCE_DOCS = 'docs/guides/write-refusals.md#unbound-sources-on-postgres';
+export const UNBOUND_PUBLICATION_MESSAGE = 'The source was bound, or the page gained a canonical file, after this database-only write was accepted.';
+export const CONNECTOR_BOUND_HINT = 'Nothing was written. Read the page again and submit the write with a new request_id; the bound source publishes it to its canonical file.';
+export const CONNECTOR_BOUND_MESSAGE = 'The connector source gained a canonical owner after this database-only write was accepted.';
+export const UNBOUND_COLLISION_MESSAGE = 'A database-only page written while its source was unbound already uses this slug.';
+
+/**
+ * #6449: the rooted sources `writer activate` accepted without an owner because
+ * `sync.write_through` was off (activation.ts writes the list, deactivation
+ * clears it). A PGLite page write to one of them never runs the automatic
+ * first-write claim, so turning `sync.write_through` back on refuses with the
+ * claim named instead of starting to publish files into an unreviewed checkout.
+ */
+export const DATABASE_ONLY_SOURCES_KEY = 'persistence.database_only_sources';
+export async function readDatabaseOnlyActivatedSources(engine: Pick<BrainEngine, 'getConfig'>): Promise<string[]> {
+  try {
+    const parsed: unknown = JSON.parse(await engine.getConfig(DATABASE_ONLY_SOURCES_KEY) ?? '[]');
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+  } catch { return []; }
+}
+
+export function parseUnboundWriteValue(value: string): UnboundWritePolicy {
+  if ((UNBOUND_WRITE_VALUES as readonly string[]).includes(value)) return value as UnboundWritePolicy;
+  throw opError('invalid_params', `${UNBOUND_WRITE_KEY} must be one of: ${UNBOUND_WRITE_VALUES.join(', ')} (got '${value}').`,
+    `Set it with gbrain config set ${UNBOUND_WRITE_KEY} ${UNBOUND_WRITE_VALUES[0]} (the default) or ${UNBOUND_WRITE_VALUES[1]}.`);
+}
+
+/** A missing or unreadable value keeps the refusal. */
+export async function readUnboundWritePolicy(engine: Pick<BrainEngine, 'getConfig'>): Promise<UnboundWritePolicy> {
+  return await engine.getConfig(UNBOUND_WRITE_KEY) === 'database_only' ? 'database_only' : 'refuse';
+}
+
+export function unboundBindCommand(sourceId: string, path: string | null): string {
+  return `run gbrain sources writer status ${sourceId} --json and note admin_state, then run gbrain sources writer claim ${sourceId} `
+    + `--path ${path ?? '<checkout path on the brain host>'} --admin-intent writer_claim --expected-state <admin_state>`;
+}
+
+/**
+ * `path` is filled only for trusted local callers; remote callers get a
+ * placeholder instead of a host path.
+ */
+export function unboundSourceError(sourceId: string, path: string | null, scope: 'database_only_eligible' | 'file_backed', classic = false): OperationError {
+  const bind = `bind the source on the brain host: ${unboundBindCommand(sourceId, path)} `
+    + '(if an operator has locked writer administration, ask the operator to unlock it first)';
+  // #6122: on a brain whose managed persistence is not activated, a claim alone fences classic sync of the source,
+  // so the working path is the file plus classic sync; claiming is named with that consequence.
+  // Classic sync imports commits, not the working tree, so the hint names the commit; a remote caller cannot reach the checkout.
+  const edit = path
+    ? `write the page as ${path}/<slug>.md (check generated frontmatter with gbrain frontmatter validate --stdin --path <slug>.md), commit it in that checkout, then run gbrain sync --source ${sourceId}`
+    : `ask the user to write the page as <slug>.md in the source's checkout on the brain host, commit it, and run gbrain sync --source ${sourceId}`;
+  const trap = `For a gbrain-owned checkout instead (a brain-wide change: ask the user first), ${bind}, then activate managed persistence (preview first: gbrain sources writer activate --confirm-quiesced --dry-run --json). `
+    + `Managed persistence is not activated on this brain, so a claim without activation blocks classic sync of ${sourceId} until it is activated or the claim is released with gbrain sources writer deactivate.`;
+  const suggestion = classic ? scope === 'database_only_eligible'
+    ? `Source '${sourceId}' has a checkout path but no canonical owner. Choose one: ${edit}; or allow database-only writes to unbound sources `
+      + `with gbrain config set ${UNBOUND_WRITE_KEY} database_only. Pages written that way stay database-only and are not materialized into canonical files after binding. ${trap}`
+    : `Source '${sourceId}' has a checkout path but no canonical owner. To change this page, ${edit}. `
+      + `${UNBOUND_WRITE_KEY}=database_only does not apply: this page came from a canonical file, and a database-only edit would be lost on the next sync. ${trap}`
+    : scope === 'database_only_eligible'
+    ? `Source '${sourceId}' has a checkout path but no canonical owner. Choose one: ${bind}; or allow database-only writes to unbound sources `
+      + `with gbrain config set ${UNBOUND_WRITE_KEY} database_only. Pages written that way stay database-only and are not materialized into canonical files after binding.`
+    : `Source '${sourceId}' has a checkout path but no canonical owner. To write this page, ${bind}. `
+      + `${UNBOUND_WRITE_KEY}=database_only does not apply: this page came from a canonical file, and a database-only edit would be lost on the owner's next sync.`;
+  const error = new OperationError('owner_unavailable', 'This source has no designated canonical owner.', suggestion, UNBOUND_SOURCE_DOCS);
+  error.detail = 'unbound_source';
+  // A configuration state, not a transient one: a retry gets the same refusal, and every way out is the user's choice.
+  error.retryable = false;
+  error.fix = {
+    ask_user: true,
+    consent: [],
+    actor: path ? 'agent' : 'user',
+    why: classic
+      ? `The brain is in classic mode: the checkout of '${sourceId}' is the source of truth and gbrain only reads it, so a page is saved as a committed file followed by gbrain sync. Don't retry, claim the source or activate managed mode to get one write through.`
+      : `Source '${sourceId}' has no canonical owner; binding it or allowing database-only pages is a brain-wide decision for the user.`,
+    user_message: classic
+      ? path
+        ? `Your brain is in classic mode, so pages are saved as files in the checkout. I can write it as <slug>.md in ${path}, commit it and run gbrain sync --source ${sourceId}. Or I can explain the two other options: database-only pages, or managed mode.`
+        : `Your brain is in classic mode, so I can't save pages directly. Save it as <slug>.md in the ${sourceId} folder, commit it, and run gbrain sync --source ${sourceId}. Or I can explain the two other options: database-only pages, or managed mode.`
+      : `Source '${sourceId}' has no canonical owner, so I can't save this page. You can bind the source on the brain host, or allow database-only pages${scope === 'file_backed' ? ' (not for this page, which came from a file)' : ''}; I can explain what each changes.`,
+    docs: UNBOUND_SOURCE_DOCS,
+    requires_exclusive: false,
+  };
+  return error;
+}
+
+export type UnboundWriteDecision = { kind: 'claim' } | { kind: 'database_only'; reason: 'connector_database' | 'unbound_source' };
+
+/**
+ * The one rule for a write-through write to a source with a checkout root but
+ * no worktree binding, shared by page writers and fact writers (#6608):
+ * a connector source is database-only by design and never claimed; PGLite
+ * claims the source automatically unless activation listed it database-only
+ * (#6449); otherwise a target with a recorded canonical file, or any
+ * `persistence.unbound_write` other than `database_only`, refuses with
+ * `unboundSourceError`, and the rest is written database-only (`unbound_source`).
+ * `path` names the checkout in the refusal; pass it only for trusted local callers.
+ */
+export async function decideUnboundWrite(engine: BrainEngine,
+  input: { sourceId: string; sourceKind: string | null; fileBacked: boolean; path: string | null }): Promise<UnboundWriteDecision> {
+  if (isConnectorSourceKind(input.sourceKind)) return { kind: 'database_only', reason: 'connector_database' };
+  if (engine.kind === 'pglite' && !(await readDatabaseOnlyActivatedSources(engine)).includes(input.sourceId)) return { kind: 'claim' };
+  if (input.fileBacked || await readUnboundWritePolicy(engine) !== 'database_only') {
+    throw unboundSourceError(input.sourceId, input.path, input.fileBacked ? 'file_backed' : 'database_only_eligible', !await managedPersistenceEnabled(engine));
+  }
+  return { kind: 'database_only', reason: 'unbound_source' };
+}
+
+export function unboundPublicationHint(sourceId: string): string {
+  return `Source '${sourceId}' gained a canonical owner, or the page gained a canonical file, after this database-only write was accepted, so nothing was written. `
+    + 'Read the page again and submit the write with a new request_id; a bound source publishes it to its canonical file.';
+}
+
+/**
+ * Runs inside the publication transaction after the source row is share-locked
+ * (authorizeStoredRequest), so a concurrent claim either committed before this
+ * read or waits for the publication to finish.
+ */
+export async function assertUnboundPublication(tx: SqlEngine, row: Pick<WriteRequest, 'authority' | 'source_id' | 'operation'>, sourcePath: string | null | undefined): Promise<void> {
+  // A page or memory write admitted database-only to an unbound connector source (connector_database)
+  // must not publish around canonical files once the source has an owner. Connector intents
+  // (submit_job) carry their own sync-authority check.
+  if (row.authority.databaseOnlyReason === 'connector_database' && row.operation !== 'submit_job') {
+    const bound = await tx.executeRaw('SELECT 1 FROM persistence_source_bindings WHERE source_id=$1 LIMIT 1', [row.source_id]);
+    if (bound.length) throw new OperationError('owner_unavailable', CONNECTOR_BOUND_MESSAGE, CONNECTOR_BOUND_HINT);
+    return;
+  }
+  if (row.authority.databaseOnlyReason !== 'unbound_source') return;
+  const bound = await tx.executeRaw('SELECT 1 FROM persistence_source_bindings WHERE source_id=$1 LIMIT 1', [row.source_id]);
+  if (!bound.length && !sourcePath) return;
+  const error = new OperationError('owner_unavailable', UNBOUND_PUBLICATION_MESSAGE, unboundPublicationHint(row.source_id), UNBOUND_SOURCE_DOCS);
+  error.detail = 'unbound_source';
+  throw error;
+}
+
+/**
+ * The publication's database-only stamp of the page it wrote: `unbound_source`
+ * for a write admitted that way, and `detached` (forgetting the recorded file)
+ * for a `restore_page` with `detach` (#6609, `detached-pages.ts`).
+ */
+export async function classifyUnboundPage(tx: SqlEngine, row: Pick<WriteRequest, 'authority' | 'source_id' | 'slug' | 'operation' | 'intent'>): Promise<void> {
+  await detachRestoredPage(tx, row);
+  if (row.authority.databaseOnlyReason !== 'unbound_source') return;
+  await tx.executeRaw("UPDATE pages SET database_only_reason='unbound_source' WHERE source_id=$1 AND slug=$2 AND database_only_reason IS NULL",
+    [row.source_id, row.slug]);
+}
+
+export async function isUnboundSourcePage(engine: SqlEngine, sourceId: string, slug: string): Promise<boolean> {
+  const [row] = await engine.executeRaw<{ database_only_reason: string | null }>(
+    'SELECT database_only_reason FROM pages WHERE source_id=$1 AND slug=$2', [sourceId, slug]);
+  return row?.database_only_reason === 'unbound_source';
+}
+
+export function unboundWriteWarning(operation: string, sourceId: string, admittedUnbound: boolean): string {
+  return `${operation} wrote only to the database for source '${sourceId}': ` + (admittedUnbound
+    ? `the source has no canonical owner and ${UNBOUND_WRITE_KEY}=database_only, so no markdown file was created. `
+    : 'this page was written while the source had no canonical owner. ')
+    + 'The page stays database-only and is not materialized into a canonical file after binding.';
+}

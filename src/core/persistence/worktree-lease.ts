@@ -1,0 +1,227 @@
+/**
+ * #5984 lanes: one process's shared hold on a worktree's native lock.
+ *
+ * The native lock (`native-lock.ts`) is exclusive per open handle, so two
+ * group publications of one worktree in the same process cannot both hold
+ * it. Parallel sync lanes share one native lock through a counted lease:
+ * the first lane takes the lock, later lanes join, and the last one to
+ * leave releases it. Cross-process exclusion is unchanged.
+ *
+ * Every other worktree writer (file publications, effects, recovery,
+ * refresh, transfer) keeps taking the lock exclusively through
+ * `acquireWorktree`. When such a writer finds a live lease in this process,
+ * it marks the lease draining and wounded: no lane joins it any more, lanes
+ * waiting to commit roll back and release their claims, and the native lock
+ * is released as soon as the running lanes finish, so the exclusive writer
+ * gets it on its next attempt. A lease also drains (without wounding) after
+ * `LEASE_TURN_MS` of continuous holding: lanes already claimed still join it,
+ * but no new lane is claimed until it ends, so writers in other processes,
+ * which cannot mark it, still get a turn.
+ *
+ * GBRA-133: across processes, every take of the native lock is a poll, so a
+ * process that releases the lock and takes it again at once (a sync drain's
+ * publications, one lane lease ending and the next starting) wins every race
+ * against an effect worker that tries between claims, and a catch-up of Git
+ * effects never runs. A background writer that waits therefore leaves a marker
+ * beside the lock (`<lock>.waiters/<pid>`, refreshed while it waits). Once the
+ * oldest live marker of another process has waited `FOREIGN_WAIT_GRACE_MS`,
+ * this process's lanes drain and its no-wait takes report busy, until that
+ * writer took its turn and removed its marker.
+ */
+import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { NativeLockHandle } from './native-lock.ts';
+
+/** A lease stops admitting lanes after this long, so other processes get the native lock between turns. */
+export const LEASE_TURN_MS = 30_000;
+
+interface Lease { lock: NativeLockHandle; holders: number; since: number; draining: boolean; wounded: boolean; ended: Promise<void>; end: () => void }
+const leases = new Map<string, Lease>();
+/** A native lock acquisition in flight per path: lanes arriving meanwhile wait for it and join the lease it creates. */
+const opening = new Map<string, Promise<unknown>>();
+
+/**
+ * Background writers (effects) that found a live lease: since when each waits. They never wound the lanes; the
+ * lease drains once one has waited `DEFER_WAIT_MS`, and no new lease starts until the writer took the lock (or
+ * `DEFER_HOLD_MS` passed without it retrying).
+ */
+const deferred = new Map<string, number>();
+/** How long a background writer waits for running lanes before the lease drains for it. */
+export const DEFER_WAIT_MS = 10_000;
+const DEFER_HOLD_MS = 5_000;
+
+/** How long another process's background writer waits before this process's lanes and no-wait takes yield to it. */
+export const FOREIGN_WAIT_GRACE_MS = 1_000;
+/** A marker its writer stopped refreshing this long ago is ignored (the writer gave up, or holds the lock now). */
+const WAITER_STALE_MS = 5_000;
+/** One directory read per worktree at most this often. */
+const WAITER_PROBE_MS = 100;
+
+/** This process's waiting background writers: since when each worktree's waits, as its marker says. */
+const ownWaits = new Map<string, number>();
+const written = new Map<string, number>();
+const probes = new Map<string, { at: number; ahead: boolean }>();
+const waiterDir = (path: string) => `${path}.waiters`;
+
+/** Records (or refreshes) that a background writer of this process waits for `path`'s lock; keeps its first `since`. */
+export function noteWaiting(path: string): void {
+  const now = Date.now(), since = ownWaits.get(path) ?? now;
+  ownWaits.set(path, since);
+  if (now - (written.get(path) ?? 0) < WAITER_STALE_MS / 5) return;
+  written.set(path, now);
+  try {
+    const dir = waiterDir(path), file = join(dir, String(process.pid));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(`${file}.tmp`, JSON.stringify({ since, at: Date.now() }));
+    renameSync(`${file}.tmp`, file);
+  } catch { /* the marker only lends priority; without it the writer competes as before */ }
+}
+
+/** The background writer of this process got its turn (or stopped waiting): other processes no longer yield to it. */
+export function clearWaiting(path: string): void {
+  written.delete(path);
+  if (!ownWaits.delete(path)) return;
+  try { unlinkSync(join(waiterDir(path), String(process.pid))); } catch { /* already gone */ }
+}
+
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
+/**
+ * Whether a background writer of another process waits for `path` ahead of this process: its live, fresh marker is the
+ * oldest, it has waited `FOREIGN_WAIT_GRACE_MS`, and this process waits for less long (an older own wait goes first).
+ */
+export function foreignWaiterAhead(path: string): boolean {
+  const now = Date.now(), probed = probes.get(path);
+  if (probed && now - probed.at < WAITER_PROBE_MS) return probed.ahead;
+  let oldest: { since: number; pid: number } | null = null;
+  let names: string[] = [];
+  try { names = readdirSync(waiterDir(path)); } catch { /* no waiter ever wrote here */ }
+  for (const name of names) {
+    const pid = Number(name);
+    if (!/^\d+$/.test(name) || pid === process.pid) continue;
+    let marker: { since?: unknown; at?: unknown };
+    try { marker = JSON.parse(readFileSync(join(waiterDir(path), name), 'utf8')); } catch { continue; }
+    if (typeof marker.since !== 'number' || typeof marker.at !== 'number' || now - marker.at > WAITER_STALE_MS) continue;
+    if (!pidAlive(pid)) { try { unlinkSync(join(waiterDir(path), name)); } catch { /* raced */ } continue; }
+    if (!oldest || marker.since < oldest.since || marker.since === oldest.since && pid < oldest.pid) oldest = { since: marker.since, pid };
+  }
+  const own = ownWaits.get(path);
+  const ahead = !!oldest && now - oldest.since >= FOREIGN_WAIT_GRACE_MS
+    && (own === undefined || oldest.since < own || oldest.since === own && oldest.pid < process.pid);
+  probes.set(path, { at: now, ahead });
+  return ahead;
+}
+
+/** Whether lanes of this worktree should stop: an exclusive writer waits, or the lease used up its turn. */
+export function leaseDraining(path: string): boolean {
+  const lease = leases.get(path);
+  if (foreignWaiterAhead(path)) {
+    if (lease) lease.draining = true;
+    return true;
+  }
+  const waiting = deferred.get(path);
+  if (!lease) {
+    if (waiting === undefined) return false;
+    if (Date.now() - waiting < DEFER_WAIT_MS + DEFER_HOLD_MS) return true;
+    deferred.delete(path);
+    return false;
+  }
+  if (!lease.draining && (Date.now() - lease.since >= LEASE_TURN_MS || waiting !== undefined && Date.now() - waiting >= DEFER_WAIT_MS)) lease.draining = true;
+  return lease.draining;
+}
+
+/**
+ * #5984: a background writer's try-acquire (no wait, no yield) on a worktree whose lanes hold this process's
+ * lease. Records that it waits and reports busy, without wounding the lanes; true when there is no lease.
+ */
+export function deferToLease(path: string): boolean {
+  if (!leases.has(path)) return true;
+  if (!deferred.has(path)) deferred.set(path, Date.now());
+  return false;
+}
+/** An exclusive writer took the native lock: a deferred writer no longer holds back new lanes. */
+export function exclusiveAcquired(path: string): void { deferred.delete(path); }
+
+/** Whether an exclusive writer in this process waits for the lease: lanes still waiting to commit roll back. */
+export function leaseWounded(path: string): boolean {
+  return leases.get(path)?.wounded === true;
+}
+
+/**
+ * Joins this process's lease on `path`, or takes the native lock through
+ * `acquire` when there is none. Lanes never race each other for the native
+ * lock: one lane acquires it while the others wait and join, and a lease whose
+ * last holder is still releasing the lock stays registered until the lock is
+ * free. Null when the lock is busy elsewhere or an exclusive writer waits for
+ * the lease; the caller releases its claim and retries later.
+ */
+export async function acquireShared(path: string, acquire: () => Promise<NativeLockHandle | null>): Promise<NativeLockHandle | null> {
+  const live = leases.get(path);
+  if (live) {
+    // A used-up turn only stops new lane claims (sync-lanes.ts laneRoots); a wounded lease also refuses joins.
+    if (live.wounded) return null;
+    if (live.holders === 0) { await live.ended; return acquireShared(path, acquire); }
+    if (live.lock.released) return null;
+    live.holders++;
+    return share(path, live);
+  }
+  const pending = opening.get(path);
+  if (pending) { await pending; return acquireShared(path, acquire); }
+  if (foreignWaiterAhead(path)) return null;
+  const attempt = acquire();
+  opening.set(path, attempt.catch(() => null));
+  let lock: NativeLockHandle | null;
+  try { lock = await attempt; } finally { opening.delete(path); }
+  if (!lock) return null;
+  let end!: () => void;
+  const ended = new Promise<void>(resolve => { end = resolve; });
+  const lease: Lease = { lock, holders: 1, since: Date.now(), draining: false, wounded: false, ended, end };
+  leases.set(path, lease);
+  return share(path, lease);
+}
+
+/**
+ * #5984 Phase 4.5: a foreground page write joins this process's live lane lease and publishes beside the lane
+ * groups (they are database-only, so its file is the only one written under the lease). Null without a live,
+ * unwounded lease; the caller then takes the lock exclusively.
+ */
+export function joinLease(path: string): NativeLockHandle | null {
+  const live = leases.get(path);
+  if (!live || live.wounded || live.holders === 0 || live.lock.released) return null;
+  live.holders++;
+  return share(path, live);
+}
+
+function share(path: string, lease: Lease): NativeLockHandle {
+  let released = false;
+  return {
+    get released() { return released || lease.lock.released; },
+    async release() {
+      if (released) return;
+      released = true;
+      if (--lease.holders > 0) return;
+      try { await lease.lock.release(); } finally { if (leases.get(path) === lease) leases.delete(path); lease.end(); }
+    },
+  };
+}
+
+/**
+ * Called by an exclusive writer before it takes the native lock. Without a
+ * lease in this process it returns at once. With one, it marks the lease
+ * draining and waits up to `waitMs` for the lanes to finish; false means the
+ * lease is still held and the writer should treat the worktree as busy.
+ */
+export async function yieldLease(path: string, waitMs: number, signal?: AbortSignal): Promise<boolean> {
+  const lease = leases.get(path);
+  if (!lease) return true;
+  lease.draining = true;
+  lease.wounded = true;
+  if (waitMs <= 0) return false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), waitMs); });
+  const aborted = new Promise<false>(resolve => signal?.addEventListener('abort', () => resolve(false), { once: true }));
+  try { return await Promise.race([lease.ended.then(() => true as const), timeout, aborted]); }
+  finally { clearTimeout(timer); }
+}

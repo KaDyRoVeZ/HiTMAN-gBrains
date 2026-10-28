@@ -1,0 +1,224 @@
+/**
+ * Typed retry-eligible-error predicates (v0.30.1, finding C4).
+ *
+ * Three v0.30.1 sites need to decide whether to retry on a given error:
+ *   - db.ts:connectWithRetry (existing — auth, conn-refused, ECONNRESET)
+ *   - migrate.ts retry wrapper (statement_timeout 57014 + conn-reset)
+ *   - backfill-base.ts adaptive retry (statement_timeout 57014 + conn drop)
+ *
+ * Before this module these predicates lived inline at each site and drifted
+ * over time. One source of truth here; new call sites import the typed
+ * helper instead of pattern-matching the same regexes again.
+ *
+ * TWO-AXIS DESIGN NOTE (do not "fix" one side to match the other):
+ * this module answers "should I retry?" — and deliberately treats
+ * `password authentication failed` as RETRYABLE (auth race during DNS
+ * failover). The REASON classifier (`src/core/pg-access-classify.ts`)
+ * answers "what went wrong and what fixes it?" — and reports the same
+ * error as `auth_failed` with `transient: false` (a persistently wrong
+ * password is not transient). Both are correct on their own axis.
+ * This module's only exports consumed there are the predicates plus the
+ * `getCode`/`getMessage` shape helpers; no new patterns land here.
+ */
+
+const CONN_PATTERNS = [
+  /password authentication failed/i,
+  /connection refused/i,
+  /the database system is starting up/i,
+  /Connection terminated unexpectedly/i,
+  /ECONNRESET/i,
+  /connection.*closed/i,
+  /server closed the connection/i,
+  /could not connect to server/i,
+  // v0.41.2.1: gbrain's own GBrainError thrown by getConnection() when
+  // the singleton pool was nulled (engine.disconnect mid-cycle, or
+  // postgres.js's auto-recovery between queries). Matches the literal
+  // message shape from PR #1416's reported batch-loss incident.
+  /No database connection/i,
+  // v0.42.5.0 (issue #1678): postgres.js throws errors carrying
+  // `code: 'CONNECTION_ENDED'` (a LIBRARY code, not an 08xxx SQLSTATE) when a
+  // transaction-mode pooler reaps an idle socket between queries. Without an
+  // explicit match it was only accidentally caught by /connection.*closed/i.
+  // Match the message form too for wrappers that fold the code into the text.
+  /CONNECTION_ENDED/i,
+  // v0.42.x (#1794): Supavisor transaction-pooler session exhaustion. When all
+  // upstream connections are checked out the pooler rejects new sessions
+  // ("MaxClientsInSessionMode" / EMAXCONNSESSION) and Postgres raises SQLSTATE
+  // 53300 (too_many_connections). Both are transient under load — without a
+  // retry, the checkpoint write (and every other pool-contending write) is
+  // dropped during the exact spike #1794's resumable sync must survive.
+  /EMAXCONNSESSION/i,
+  // #6340: the socket errnos postgres.js surfaces as "write <ERRNO> host:port" when a
+  // session-mode pooler drops the connection mid-statement (ECONNABORTED was the one
+  // that ended four managed catch-up runs in one afternoon). Same class as ECONNRESET.
+  /ECONNABORTED/i,
+  /ETIMEDOUT/i,
+  /EPIPE/i,
+  /too many clients already/i,
+  /max.*clients?.*in session mode/i,
+  /remaining connection slots are reserved/i,
+];
+
+interface PgError {
+  code?: string;
+  message?: string;
+  cause?: unknown;
+  // v0.41.2.1: gbrain's GBrainError uses `problem` (typed) + `detail` so
+  // callers can switch on the engine-state class without string matching.
+  problem?: string;
+}
+
+export function getCode(err: unknown): string | undefined {
+  if (err && typeof err === 'object') {
+    const code = (err as PgError).code;
+    if (typeof code === 'string') return code;
+  }
+  return undefined;
+}
+
+/** Socket errnos and postgres.js library codes that mean an open connection went away: decided by the code, never the message. */
+const CONNECTION_CODES: ReadonlySet<string> = new Set(['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE', 'CONNECTION_CLOSED', 'CONNECTION_ENDED', 'CONNECTION_DESTROYED']);
+
+/** True for a socket errno or a postgres.js connection code. */
+export function isConnectionCode(code: string | undefined): boolean {
+  return code !== undefined && CONNECTION_CODES.has(code);
+}
+
+/**
+ * GBRA-133 S-70: does this message name a path? Connection text is only read from a message that names none, so an
+ * unexpected error quoting a file such as `notes/connection closed.md` is never taken for a dropped connection.
+ * URLs (a connection string, an endpoint) are not paths.
+ */
+export function quotesPath(message: string): boolean {
+  return /[\\/]/.test(message.replace(/[a-z][a-z0-9+.-]*:\/\/\S*/gi, ''));
+}
+
+export function getMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === 'object') {
+    const msg = (err as PgError).message;
+    if (typeof msg === 'string') return msg;
+  }
+  return String(err ?? '');
+}
+
+/**
+ * SQLSTATE 57014: query_canceled / statement_timeout.
+ * Postgres signals this when a statement exceeds `statement_timeout`.
+ */
+export function isStatementTimeoutError(err: unknown): boolean {
+  if (getCode(err) === '57014') return true;
+  const msg = getMessage(err);
+  return /statement_timeout|canceling statement due to statement timeout/i.test(msg);
+}
+
+/**
+ * SQLSTATE 55P03: lock_not_available.
+ * Postgres signals this when `lock_timeout` or `NOWAIT` would block.
+ */
+export function isLockTimeoutError(err: unknown): boolean {
+  if (getCode(err) === '55P03') return true;
+  const msg = getMessage(err);
+  return /lock_not_available|could not obtain lock/i.test(msg);
+}
+
+/**
+ * Connection-level errors that are typically transient: TCP resets,
+ * pooler restarts, server-starting-up, auth race during DNS failover.
+ * Distinguish from statement_timeout / lock_timeout via the dedicated
+ * predicates above.
+ */
+export function isRetryableConnError(err: unknown): boolean {
+  // Statement / lock timeouts are NOT connection errors. Callers that
+  // want to retry on those use isStatementTimeoutError / isLockTimeoutError
+  // explicitly so they can apply different backoff (e.g. backfill halves
+  // batch size on stmt timeout but reconnects on conn drop).
+  if (isStatementTimeoutError(err) || isLockTimeoutError(err)) return false;
+  const code = getCode(err);
+  // Postgres connection-level codes:
+  //   08000 connection_exception
+  //   08003 connection_does_not_exist
+  //   08006 connection_failure
+  //   08001 sqlclient_unable_to_establish_sqlconnection
+  //   08004 sqlserver_rejected_establishment_of_sqlconnection
+  if (code && /^08/.test(code)) return true;
+  // v0.42.5.0 (issue #1678): postgres.js's library-level connection-ended
+  // code. Not an 08xxx SQLSTATE, so the /^08/ test above misses it.
+  if (code === 'CONNECTION_ENDED') return true;
+  // issue #1720: postgres.js also throws code 'CONNECTION_CLOSED' when the
+  // pooler closes the socket mid-query ("write CONNECTION_CLOSED host:port").
+  // The message form is already caught by /connection.*closed/i below; match
+  // the code too for wrappers that rethrow with the code but a new message.
+  if (code === 'CONNECTION_CLOSED') return true;
+  if (isConnectionCode(code)) return true;
+  // v0.42.x (#1794): SQLSTATE 53300 too_many_connections — pool/pooler
+  // exhaustion. Starts with 53 not 08, so the /^08/ test above misses it.
+  // Transient: the spike clears as in-flight queries release connections.
+  if (code === '53300') return true;
+  // v0.41.2.1: typed-shape match for gbrain's own GBrainError
+  // (problem === 'No database connection'). Avoids brittle string match
+  // when the error wrapper is gbrain-internal.
+  if (
+    err && typeof err === 'object' &&
+    (err as PgError).problem === 'No database connection'
+  ) {
+    return true;
+  }
+  const msg = getMessage(err);
+  return !quotesPath(msg) && CONN_PATTERNS.some(p => p.test(msg));
+}
+
+/**
+ * #6355: did the database session go away under a statement that was already sent? Narrower than
+ * `isRetryableConnError` (no auth or startup races): the connection-class SQLSTATEs, postgres.js's own
+ * connection codes, the server's admin/crash shutdown codes (`pg_terminate_backend`, a failover) and the
+ * socket errnos. Such an error says nothing about whether the statement's transaction committed, so a
+ * caller that sent a write must re-read its retained request id instead of inferring rollback.
+ */
+export function isConnectionLoss(err: unknown): boolean {
+  const code = getCode(err);
+  if (code && (/^08/.test(code) || isConnectionCode(code) || ['57P01', '57P02', '57P03'].includes(code))) return true;
+  const msg = getMessage(err);
+  return !quotesPath(msg) && /\b(ECONNRESET|ECONNABORTED|ETIMEDOUT|EPIPE)\b|Connection terminated unexpectedly|server closed the connection|connection.*closed|terminating connection due to administrator command/i.test(msg);
+}
+
+/**
+ * issue #1685 (CODEX #8): is this error specifically a POOLER REAP — postgres.js's
+ * library-level `CONNECTION_ENDED` code (the transaction-mode pooler dropping an
+ * idle socket between ticks)? Narrower than `isRetryableConnError`, which also
+ * matches 08xxx SQLSTATEs, network blips, and auth races. Used by
+ * `PostgresEngine.reconnect()` to label the pool-recovery audit honestly so a
+ * generic reconnect isn't mis-recorded as a reap.
+ */
+export function isConnectionEndedError(err: unknown): boolean {
+  const code = getCode(err);
+  if (code === 'CONNECTION_ENDED') return true;
+  const msg = getMessage(err);
+  return /CONNECTION_ENDED/i.test(msg);
+}
+
+/**
+ * Did postgres.js abandon a connection handshake because its own
+ * `connect_timeout` timer fired? It reports that as code `CONNECT_TIMEOUT`
+ * with the message "write CONNECT_TIMEOUT <host>:<port>" (the host and port
+ * read "undefined:undefined" once the socket has been upgraded to TLS).
+ *
+ * Kept OUT of `isRetryableConnError` on purpose: on a process's first connect
+ * a handshake timeout usually means the host does not route, which
+ * pg-access-classify reports as `network_unreachable`, and retrying cannot
+ * fix that. A caller that has already reached the same URL in this process
+ * opts in through connectWithRetry's `retryConnectTimeout`.
+ */
+export function isConnectTimeoutError(err: unknown): boolean {
+  if (getCode(err) === 'CONNECT_TIMEOUT') return true;
+  return /\bCONNECT_TIMEOUT\b/.test(getMessage(err));
+}
+
+/**
+ * Convenience: is this error retryable for ANY reason (connection drop OR
+ * statement timeout)? Backfill uses this — callers that need finer-grained
+ * dispatch (different backoff per kind) call the dedicated predicates.
+ */
+export function isRetryableError(err: unknown): boolean {
+  return isRetryableConnError(err) || isStatementTimeoutError(err);
+}

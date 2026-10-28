@@ -1,0 +1,228 @@
+/**
+ * Shared fixture + normalizer for the W0 `gbrain doctor --json` goldens
+ * (test/doctor-json-golden.test.ts on PGLite, test/e2e/doctor-json-golden.test.ts
+ * on Postgres).
+ *
+ * Hermetic child: a fresh temp home (HOME = GBRAIN_HOME), cwd outside the
+ * repo (so working-tree state such as eval_drift never leaks in), audit and
+ * sync-failure ledgers under the home, a two-line fixture skills dir passed
+ * with `--skills-dir`, PATH reduced to a private bun symlink plus /usr/bin:/bin
+ * (a globally linked `gbrain` would otherwise make npm_squat fire), every provider key removed, startup hooks skipped, and
+ * `fetch` refused by test/helpers/no-network-preload.ts (attempted URLs are
+ * returned so the test can assert none happened).
+ *
+ * Normalizer `doctor-json-v1`: ordered checks (name, status, message,
+ * details, issues) plus the report envelope, with volatile tokens replaced:
+ * temp home / repo / os tmpdir paths, UUIDs, ISO timestamps, the running
+ * package and Bun versions, the machine hostname, and `*_ms` / elapsed / pid-style
+ * detail keys, and the latest schema migration number in the `schema_version`
+ * message (`<latest>`, so a migration renumber does not churn the goldens;
+ * `expectSchemaLatestMatchesRegistry` keeps the hidden number honest). Check order is emitted order (deterministic; no Map/Set
+ * iteration is re-sorted). stderr lines are kept (normalized) because the
+ * early-stop paths announce themselves there.
+ */
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
+import { defineNormalizer, mapStrings, scrubKeys, scrubPaths, scrubTimestamps } from './golden.ts';
+import { PROVIDER_ENV_KEYS } from './provider-env.ts';
+import { MIGRATIONS } from '../../src/core/schema-migrations/registry.generated.ts';
+import { SEGMENTED_WRITER_FLOOR } from '../../src/core/page-body/writer-floor.ts';
+import { MINIMUM_BUN_VERSION } from '../../src/core/runtime-version.ts';
+
+const REPO_ROOT = join(import.meta.dir, '..', '..');
+const CLI = join(REPO_ROOT, 'src', 'cli.ts');
+const PRELOAD = join(import.meta.dir, 'no-network-preload.ts');
+const CLOCK_PRELOAD = join(import.meta.dir, 'fixed-clock-preload.ts');
+const PACKAGE_VERSION = (JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8')) as { version: string }).version;
+const REGISTRY_LATEST = Math.max(...MIGRATIONS.map((m) => m.version));
+const SCHEMA_LATEST = /\b(Version |latest: |latest is |latest known version \()(\d+)\b/g;
+
+export interface DoctorHome {
+  home: string;
+  work: string;
+  skillsDir: string;
+  netLog: string;
+  /** Milliseconds every CLI process of this home adds to the real clock (fixed-clock-preload.ts); unset runs on the real clock. */
+  clockOffsetMs?: number;
+  cleanup: () => void;
+}
+
+/** `opts.clock`: an ISO instant; the home's CLI processes share one clock that reads it now and moves forward from it. */
+export function makeDoctorHome(prefix: string, opts: { clock?: string } = {}): DoctorHome {
+  const home = mkdtempSync(join(tmpdir(), `gbrain-${prefix}-`));
+  const work = join(home, 'work');
+  const skillsDir = join(home, 'skills');
+  mkdirSync(work, { recursive: true });
+  mkdirSync(join(home, 'bin'), { recursive: true });
+  symlinkSync(process.execPath, join(home, 'bin', 'bun'));
+  mkdirSync(join(skillsDir, 'alpha-example'), { recursive: true });
+  writeFileSync(
+    join(skillsDir, 'alpha-example', 'SKILL.md'),
+    '---\nname: alpha-example\ntriggers:\n  - "alpha example trigger"\n---\n# alpha-example\n\nA fixture skill.\n',
+  );
+  writeFileSync(join(skillsDir, 'manifest.json'), JSON.stringify({ skills: [{ name: 'alpha-example', path: 'alpha-example/SKILL.md' }] }));
+  writeFileSync(
+    join(skillsDir, 'RESOLVER.md'),
+    '# RESOLVER\n\n## Brain operations\n| Trigger | Skill |\n|---------|-------|\n| "alpha example trigger" | `skills/alpha-example/SKILL.md` |\n',
+  );
+  return {
+    home,
+    work,
+    skillsDir,
+    netLog: join(home, 'net.log'),
+    ...(opts.clock ? { clockOffsetMs: Date.parse(opts.clock) - Date.now() } : {}),
+    cleanup: () => rmSync(home, { recursive: true, force: true }),
+  };
+}
+
+export interface GbrainRun {
+  args: string[];
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  /** Parsed stdout when it is one JSON document, else null. */
+  json: unknown;
+  /** Replacement roots for the normalizer. */
+  roots: Record<string, string>;
+}
+
+/** Spawn `bun src/cli.ts <args>` in the hermetic doctor env. */
+/**
+ * eval_drift diffs this checkout against HEAD with a 5 s limit. A freshly copied checkout (a CI VM) has a racy
+ * index, so the first diff can run out of time and report "could not probe" while the next one answers; refresh
+ * the index once before the first capture so every capture sees the same settled tree.
+ */
+let indexSettled = false;
+function settleRepoIndex(): void {
+  if (indexSettled) return;
+  indexSettled = true;
+  Bun.spawnSync(['git', 'update-index', '-q', '--refresh'], { cwd: REPO_ROOT, stdout: 'ignore', stderr: 'ignore' });
+}
+
+export async function runGbrain(h: DoctorHome, args: string[], env: Record<string, string | undefined> = {}, timeoutMs = 120_000): Promise<GbrainRun> {
+  const childEnv: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) childEnv[k] = v;
+  for (const k of PROVIDER_ENV_KEYS) delete childEnv[k];
+  for (const k of ['DATABASE_URL', 'GBRAIN_DATABASE_URL', 'GBRAIN_REMOTE_CLIENT_SECRET', 'GBRAIN_PGLITE_SNAPSHOT', 'GBRAIN_SKILLS_DIR', 'OPENCLAW_WORKSPACE']) delete childEnv[k];
+  // harness_wiring reads agent markers and harness config homes: keep the golden independent of the host's harness.
+  for (const k of ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CODEX_SANDBOX', 'CODEX_CI', 'CODEX_HOME', 'OPENCODE', 'OPENCODE_PID', 'XDG_CONFIG_HOME']) delete childEnv[k];
+  Object.assign(childEnv, {
+    HOME: h.home,
+    GBRAIN_HOME: h.home,
+    GBRAIN_AUDIT_DIR: join(h.home, 'audit'),
+    GBRAIN_SYNC_FAILURES_DIR: join(h.home, 'sync-failures'),
+    GBRAIN_SKIP_STARTUP_HOOKS: '1',
+    GBRAIN_TEST_NET_LOG: h.netLog,
+    NO_COLOR: '1',
+    PATH: [join(h.home, 'bin'), '/usr/bin', '/bin'].join(delimiter),
+  });
+  delete childEnv.GBRAIN_TEST_CLOCK_OFFSET_MS;
+  if (h.clockOffsetMs !== undefined) childEnv.GBRAIN_TEST_CLOCK_OFFSET_MS = String(h.clockOffsetMs);
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) delete childEnv[k];
+    else childEnv[k] = v;
+  }
+  settleRepoIndex();
+  const proc = Bun.spawn([process.execPath, '--no-env-file', '--preload', PRELOAD, '--preload', CLOCK_PRELOAD, CLI, ...args], {
+    cwd: h.work,
+    env: childEnv,
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const killer = setTimeout(() => proc.kill(9), timeoutMs);
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    let json: unknown = null;
+    try {
+      json = JSON.parse(stdout);
+    } catch {
+      json = null;
+    }
+    return { args, exitCode: exitCode ?? -1, stdout, stderr, json, roots: { '<home>': h.home, '<repo>': REPO_ROOT } };
+  } finally {
+    clearTimeout(killer);
+  }
+}
+
+export function networkAttempts(h: DoctorHome): string[] {
+  return existsSync(h.netLog) ? readFileSync(h.netLog, 'utf-8').split('\n').filter(Boolean) : [];
+}
+
+/** Rewrite the fresh config.json (the only way `gbrain init` leaves it) with `patch`. */
+export function patchConfig(h: DoctorHome, patch: (cfg: Record<string, unknown>) => void): void {
+  const file = join(h.home, '.gbrain', 'config.json');
+  const cfg = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+  patch(cfg);
+  writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n');
+}
+
+const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+const VOLATILE_KEYS = /(^|_)(ms|pid|elapsed|duration|uptime)$|_ms$|^elapsed|^table_bytes$|^oldest_age_seconds$/i;
+
+export function normalizeDoctorText(text: string, roots: Record<string, string>, extra: Array<[RegExp | string, string]> = []): string {
+  if (Bun.semver.order(Bun.version, MINIMUM_BUN_VERSION) < 0) {
+    throw new Error([
+      `FAIL: the doctor goldens are recorded on Bun ${MINIMUM_BUN_VERSION} or newer, and this run is Bun ${Bun.version}.`,
+      `Why:  below ${MINIMUM_BUN_VERSION} (the supported floor) the bun_runtime row fails, which changes the row, the score and the top issues.`,
+      'Fix:  bun upgrade, then rerun this test (CI and the Ubicloud gate pin the build runtime).',
+    ].join('\n'));
+  }
+  let out = scrubPaths(text, roots);
+  for (const [pattern, label] of extra) out = typeof pattern === 'string' ? out.split(pattern).join(label) : out.replace(pattern, label);
+  out = scrubTimestamps(out).replace(UUID, '<uuid>');
+  out = out.replace(/\(most recent caller: at [^()]*\([^()]*\)\)/g, '(most recent caller: <frame>)');
+  out = out.split(PACKAGE_VERSION).join('<version>');
+  out = out.replace(SCHEMA_LATEST, (match, prefix: string, n: string) => (Number(n) === REGISTRY_LATEST ? `${prefix}<latest>` : match));
+  out = out.split(`Bun ${Bun.version}`).join('Bun <bun-version>');
+  const host = hostname();
+  if (host) out = out.split(host).join('<hostname>');
+  return out;
+}
+
+/**
+ * Golden guard for the `<latest>` placeholder: the raw (un-normalized) doctor
+ * report must name the migration registry maximum as both the brain's schema
+ * version and the latest version, so normalizing it away hides nothing.
+ */
+export function expectSchemaLatestMatchesRegistry(run: GbrainRun): void {
+  const checks = (run.json as { checks?: Array<{ name: string; message: string }> } | null)?.checks ?? [];
+  const message = checks.find((c) => c.name === 'schema_version')?.message ?? '<no schema_version check>';
+  const expected = `Version ${REGISTRY_LATEST} (latest: ${REGISTRY_LATEST})`;
+  if (message !== expected) {
+    throw new Error([
+      `FAIL: doctor schema_version says "${message}", expected "${expected}" (migration registry maximum ${REGISTRY_LATEST}).`,
+      'Why:  the doctor goldens replace the latest migration number with <latest>; this guard keeps the doctor\'s reported',
+      '      latest version equal to src/core/schema-migrations/registry.generated.ts, so the placeholder cannot hide a stale schema.',
+      'Fix:  bun run build:schema-migrations (stale registry), then rerun this test; a fresh brain must migrate to the registry maximum.',
+      'See:  docs/TESTING.md#refactor-wave-1-goldens',
+    ].join('\n'));
+  }
+}
+
+/** `doctor-json-v1` with optional extra literal/regex replacements (e.g. a Postgres URL). */
+/**
+ * The segmented writer floor equals VERSION in the release that stamps it, so the
+ * version scrub would turn it into `<version>` there and back into a literal one
+ * release later; a stable label keeps the doctor goldens independent of VERSION.
+ */
+function maskWriterFloor(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(maskWriterFloor);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) =>
+    [k, k === 'floor' && v === SEGMENTED_WRITER_FLOOR ? '<segmented-writer-floor>' : maskWriterFloor(v)]));
+}
+
+export function doctorJsonNormalizer(extra: Array<[RegExp | string, string]> = [], name = 'doctor-json-v1') {
+  return defineNormalizer<GbrainRun>(name, (run) => {
+    const fn = (s: string) => normalizeDoctorText(s, run.roots, extra);
+    return {
+      args: run.args.map(fn),
+      exit_code: run.exitCode,
+      report: run.json === null ? null : mapStrings(maskWriterFloor(scrubKeys(run.json, VOLATILE_KEYS)), fn),
+      stdout: run.json === null ? fn(run.stdout).split('\n').filter(Boolean) : '<json>',
+      stderr: fn(run.stderr).split('\n').filter(Boolean),
+    };
+  });
+}

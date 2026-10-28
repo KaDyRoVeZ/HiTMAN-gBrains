@@ -1,0 +1,218 @@
+/**
+ * v0.35.4 (R1 + R8 — D-CDX-4 + D-CDX-7) — IRON-RULE: the contradiction
+ * probe NEVER writes `valid_until` on the facts table.
+ *
+ * The temporal trajectory wave (v0.35.4) gives `consolidate` the
+ * authority to write `valid_until` on chronologically-superseded facts.
+ * That authority is exclusive: the contradiction probe surfaces
+ * `temporal_supersession` verdicts via paste-ready commands, but it
+ * must NEVER auto-mutate. This preserves the
+ * `src/core/eval-contradictions/auto-supersession.ts:4` invariant.
+ *
+ * Two layered guards:
+ *   R1 — grep guard over the entire `src/core/eval-contradictions/`
+ *        subtree and the `src/commands/eval-suspected-contradictions*.ts`
+ *        files: no code path may UPDATE facts.valid_until.
+ *   R8 — broader guard over all of `src/`: only reviewed writers may
+ *        change valid_until. Any new
+ *        write site fails this guard; the human adding it must explicitly
+ *        amend the allow-list AND document the deliberate design change.
+ */
+
+import { test, expect, describe } from 'bun:test';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+
+// Allow-listed files that legitimately write `valid_until`. Adding a new
+// file here means you've thought carefully about the
+// auto-supersession.ts:4 invariant and decided the new write site
+// preserves it.
+//
+//   - consolidate.ts (v0.35.4 — chronological writeback)
+//   - facts/forget.ts (v0.32.2 — user-initiated `gbrain forget`; user is
+//     the supersession authority, not the probe)
+//   - facts/withdrawal.ts — durable user-initiated forget closes every
+//     matching active claim in the same source and visibility lane. It
+//     records the user's withdrawal before filesystem work; this is an
+//     explicit retraction, never a contradiction-probe inference.
+//   - facts/withdrawal-schema.ts — its insert/update trigger reapplies an
+//     already-recorded user withdrawal when derived facts are rebuilt; it
+//     cannot invent a withdrawal or infer one from a contradiction.
+//   - facts/insert-guard-schema.ts — the statement-level form of that same
+//     insert trigger (#7105): it clamps valid_until only on rows the current
+//     INSERT wrote that match an already-recorded fact_withdrawals row, the
+//     same rule; it never reads contradiction findings.
+//   - persistence/canonical-projections.ts — restores explicit valid_until
+//     from the accepted canonical Markdown fence, including version reverts,
+//     in the guarded page publication transaction. This copies user-authored
+//     state; it never applies contradiction-probe inference.
+//   - cycle/extract-facts.ts — the unmanaged fence reconcile updates a
+//     matched row in place with the fence's explicit valid_until cell (the
+//     same user-authored copy canonical-projections.ts makes); it never
+//     applies contradiction-probe inference.
+//   - postgres-engine.ts + pglite-engine.ts (v0.42.56.0, #2390 — Life
+//     Chronicle ontology: `mergeOntologyFact` forward-supersession closes
+//     the prior OPEN row's valid_until when a NEW value arrives for the
+//     same (entity, dimension). Engine-layer, caller-requested, scoped to
+//     `dimension IS NOT NULL` ontology rows only — plain facts untouched,
+//     and the contradiction probe still never mutates, so the
+//     auto-supersession.ts:4 invariant is preserved. Deliberate design
+//     change per the #2390 eng review (G1: ontology extends facts).
+//   - facts/proposal-supersede.ts (System One S9) — applies or undoes a
+//     contradiction PROPOSAL only when the user runs `gbrain decide proposals
+//     accept|undo <id>` (local CLI); the sweep and the inline fact write path
+//     never call it, so a probe still never mutates (auto-supersession.ts:4).
+//   - persistence/loop-fact-retirement.ts (#5869) — retires a commitment fact
+//     only when its loop is closed through `loops_close` or `gbrain repair
+//     loop-facts` (expired_at + valid_until with the struck fence row); the
+//     contradiction sweep and probes never call it.
+//   - repair/consolidate-ties.ts (#6023) — `gbrain repair consolidate-ties`
+//     reopens (valid_until back to NULL) only the preview-approved facts the
+//     pre-#6023 consolidate writeback closed at their own instant; local CLI,
+//     explicit-only, and the contradiction probe never calls it.
+//   - generations/adapters/fact-rows.ts (GBRA-161 PR 2) — `restoreFactRow`
+//     writes back a fact's recorded before-state (valid_until included) only in
+//     a preview-approved `gbrain repair generations --mode restore` of a
+//     consolidation chain or a fence generation; local CLI, and the
+//     contradiction probe never calls it.
+const VALID_UNTIL_WRITE_ALLOWLIST: ReadonlySet<string> = new Set([
+  'src/core/cycle/extract-facts.ts',
+  'src/core/cycle/phases/consolidate.ts',
+  'src/core/engine-sql/facts.ts', // #7214: insertFact's supersede closes the retired interval at the replacement's valid_from
+  'src/core/facts/forget.ts',
+  'src/core/facts/insert-guard-schema.ts',
+  'src/core/facts/proposal-supersede.ts',
+  'src/core/facts/withdrawal.ts',
+  'src/core/facts/withdrawal-schema.ts',
+  'src/core/generations/adapters/fact-rows.ts',
+  'src/core/persistence/canonical-projections.ts',
+  'src/core/persistence/facts-prepare.ts', // #7214: a published supersession closes the retired interval (supersededValidUntil)
+  'src/core/persistence/loop-fact-retirement.ts',
+  'src/core/persistence/memory-prepare.ts', // #7214: remember (replaces or cosine) closes the retired interval (supersededValidUntil)
+  'src/core/persistence/prepared-maintenance.ts',
+  'src/core/postgres-engine.ts',
+  'src/core/pglite-engine.ts',
+  'src/core/repair/consolidate-ties.ts',
+]);
+
+function walkTs(dir: string, acc: string[] = []): string[] {
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name);
+    const st = statSync(full);
+    if (st.isDirectory()) {
+      // Skip generated / vendored / test directories.
+      if (name === 'node_modules' || name === '.git' || name === 'dist') continue;
+      walkTs(full, acc);
+    } else if (name.endsWith('.ts') && !name.endsWith('.test.ts')) {
+      acc.push(full);
+    }
+  }
+  return acc;
+}
+
+/**
+ * Detect lines that look like they are UPDATEing facts.valid_until.
+ * Permissive on SQL formatting (the same UPDATE can be split across lines,
+ * use template strings, or use parameterized SQL via postgres.js's
+ * tagged-template syntax). We look for the pair of substrings near
+ * each other in the same file: `UPDATE facts` and `valid_until`.
+ *
+ * Tolerated: a reference to `valid_until` in a SELECT projection list
+ * (which is fine — reading the column is not writing it) is filtered out
+ * by also requiring a write verb (SET) nearby OR an INSERT INTO facts
+ * with valid_until in the column list (INSERT path is OK from
+ * src/core/postgres-engine.ts + src/core/pglite-engine.ts because those
+ * are the engine layer, intentionally writing on caller request via
+ * insertFact/insertFacts; the issue is whether the contradiction probe
+ * path triggers those writes).
+ */
+function findValidUntilWrites(source: string): string[] {
+  // Quick-fail: no mention of valid_until at all.
+  if (!source.includes('valid_until')) return [];
+  const lines = source.split('\n');
+  const hits: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/\bNEW\.valid_until\s*:=/i.test(line)) hits.push(`${i + 1}: ${line.trim()}`);
+    // Detect actual SQL writes. The narrow pattern `UPDATE facts SET ...
+    // valid_until` is unambiguous — UPDATE is a SQL verb, not text
+    // anyone writes in a description string. Tolerates same-line and
+    // multi-line UPDATEs (look at the next 4 lines after `UPDATE facts`
+    // for `valid_until`).
+    if (/\bUPDATE\s+facts\b/i.test(line)) {
+      const window = lines.slice(i, i + 5).join('\n');
+      if (/\bSET\b[\s\S]*\bvalid_until\b/i.test(window)) {
+        hits.push(`${i + 1}: ${line.trim()}`);
+      }
+    }
+  }
+  return hits;
+}
+
+describe('R1 — contradiction probe never writes valid_until', () => {
+  test('no file under src/core/eval-contradictions/ writes facts.valid_until', () => {
+    const dir = 'src/core/eval-contradictions';
+    const files = walkTs(dir);
+    expect(files.length).toBeGreaterThan(0);
+    for (const f of files) {
+      const src = readFileSync(f, 'utf-8');
+      const hits = findValidUntilWrites(src);
+      expect(hits, `${f} contains valid_until write: ${hits.join(' | ')}`).toEqual([]);
+    }
+  });
+
+  test('no src/commands/eval-suspected-contradictions* file writes facts.valid_until', () => {
+    const dir = 'src/commands';
+    const files = readdirSync(dir)
+      .filter(n => n.startsWith('eval-suspected-contradictions') && n.endsWith('.ts'))
+      .map(n => join(dir, n));
+    expect(files.length).toBeGreaterThanOrEqual(1);
+    for (const f of files) {
+      const src = readFileSync(f, 'utf-8');
+      const hits = findValidUntilWrites(src);
+      expect(hits, `${f} contains valid_until write: ${hits.join(' | ')}`).toEqual([]);
+    }
+  });
+});
+
+describe('R8 — only reviewed temporal and user-retraction writers may write valid_until', () => {
+  test('every src/ TypeScript file that writes valid_until is on the allow-list', () => {
+    const files = walkTs('src');
+    const offenders: Array<{ file: string; hits: string[] }> = [];
+
+    for (const f of files) {
+      // Normalize path separator for cross-platform matching of the
+      // allow-list keys.
+      const relForCheck = f.replace(/\\/g, '/');
+      if (VALID_UNTIL_WRITE_ALLOWLIST.has(relForCheck)) continue;
+
+      // Engine implementation files (postgres-engine.ts, pglite-engine.ts)
+      // legitimately write valid_until inside insertFact/insertFacts —
+      // those are caller-driven INSERTs. Pattern is `INSERT INTO facts (
+      // ... valid_until ...) VALUES`. Detect and exempt that pattern.
+      // The R8 guard is about UPDATE; INSERT carrying valid_until as a
+      // column value is not the failure mode auto-supersession.ts:4 cares
+      // about.
+      const src = readFileSync(f, 'utf-8');
+      const hits = findValidUntilWrites(src);
+      if (hits.length > 0) offenders.push({ file: relForCheck, hits });
+    }
+
+    expect(
+      offenders,
+      `Unexpected valid_until UPDATE sites:\n` +
+      offenders.map(o => `  ${o.file}:\n    ${o.hits.join('\n    ')}`).join('\n') +
+      `\n\nIf you added a deliberate write, append the path to ` +
+      `VALID_UNTIL_WRITE_ALLOWLIST in this test AND review the ` +
+      `\`auto-supersession.ts:4\` invariant first.`,
+    ).toEqual([]);
+  });
+
+  test('VALID_UNTIL_WRITE_ALLOWLIST is non-empty (consolidate is on it)', () => {
+    // Self-check: if the test file ever ships with an empty allow-list,
+    // the R8 guard collapses to "no code writes valid_until anywhere" and
+    // becomes a tautology. Keep the consolidate phase on the list as the
+    // explicit positive control.
+    expect(VALID_UNTIL_WRITE_ALLOWLIST.has('src/core/cycle/phases/consolidate.ts')).toBe(true);
+  });
+});

@@ -1,0 +1,395 @@
+/**
+ * E2E: `gbrain bootstrap harness` lifecycle against a REAL `serve --http` on
+ * a hermetic PGLite brain (#4043).
+ *
+ * The real seams the unit suite injects away: an actual /health probe, the
+ * actual StreamableHTTP + bearer smoke (probeBrainIdentity), the PGLite
+ * single-writer reality (mint refused under a live serve → the --token lane
+ * is the documented escape), and the dispatcher path (runBootstrap →
+ * home-lock → apply/status/remove) with real receipt/install-log files.
+ *
+ * The claude CLI is a recording fake (runBootstrap's runner seam); the codex
+ * lane writes the real managed TOML block into a temp CODEX_HOME; HOME is
+ * remapped so user-scope writes land in the sandbox.
+ *
+ * Serial: env remapping (HOME / CODEX_HOME / GBRAIN_HOME) + a spawned serve.
+ *
+ * Lane: serial. Run: `bash scripts/run-serial-tests.sh test/bootstrap-harness-lifecycle.serial.test.ts`. Moved from test/e2e/
+ * by the 2026-09 lane-move pilot (PGLite-only, no DATABASE_URL); see
+ * docs/test-audit/2026-09-29/implementation/lane-pilot.md.
+ */
+
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { spawn, execFileSync, type ChildProcess } from 'child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
+import { runBootstrap } from '../src/commands/bootstrap.ts';
+import type { ExecRunner } from '../src/core/bootstrap/repo.ts';
+import { readHarnessReceiptState, writeHarnessReceipt } from '../src/core/bootstrap/format.ts';
+import { CODEX_TOML_BLOCK_BEGIN } from '../src/core/bootstrap/host-specs.ts';
+import { withEnv } from './helpers/with-env.ts';
+
+const PORT = 19741; // unique to this suite (19735 = connect-bearer, 19131 = oauth)
+const BASE = `http://127.0.0.1:${PORT}`;
+
+describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
+  let parent: string; // GBRAIN_HOME parent for the brain
+  let sandboxHome: string; // HOME for user-scope writes
+  let codexHome: string;
+  let stubBin: string; // sandbox bin dir carrying a no-op `claude` (#4325)
+  let server: ChildProcess | null = null;
+  let token = '';
+  let serverReady = false;
+
+  const userSettings = () => join(sandboxHome, '.claude', 'settings.json');
+  const codexConfig = () => join(codexHome, 'config.toml');
+  const claudeRegistrations = new Map<string, { url: string; token: string }>();
+
+  function makeClaudeRunner(): { runner: ExecRunner; calls: string[][] } {
+    const calls: string[][] = [];
+    const runner: ExecRunner = async (argv: string[]) => {
+      calls.push(argv);
+      if (argv[0] === 'claude' && argv[2] === 'get') {
+        const registration = claudeRegistrations.get(argv[3]);
+        return registration
+          ? { code: 0, stdout: `Scope: User\nType: http\nURL: ${registration.url}\nAuthorization: Bearer ${registration.token}`, stderr: '' }
+          : { code: 1, stdout: '', stderr: 'No MCP server found' };
+      }
+      if (argv[0] === 'claude' && argv[2] === 'add') {
+        const url = argv.find(value => /^https?:\/\//.test(value));
+        const header = argv.find(value => value.startsWith('Authorization: Bearer '));
+        if (!url || !header) throw new Error('Incomplete fixture registration');
+        claudeRegistrations.set(argv[3], { url, token: header.slice('Authorization: Bearer '.length) });
+      }
+      if (argv[0] === 'claude' && argv[2] === 'remove') claudeRegistrations.delete(argv[3]);
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    return { runner, calls };
+  }
+
+  // Harness detection MUST be pinned, not inherited from the host. The
+  // production default is Bun.which(), which reads the real password-database
+  // HOME and ignores this test's remapped HOME/PATH — so without this seam the
+  // suite silently asserts different things depending on which agent CLIs the
+  // machine happens to have installed. Concretely: `claude` is on a developer
+  // laptop's PATH but absent on a GitHub runner, so the claude lane never ran
+  // in CI, no `claude mcp add` was exec'd, and no user-scope settings file was
+  // written — failing at lines 175 and 220 every night since 2026-08-17 while
+  // passing locally. Both harnesses are declared present here because that is
+  // the scenario these assertions describe.
+  const HARNESS_DETECT = {
+    claude: () => true,
+    codex: () => true,
+    opencode: () => false,
+  } as const;
+
+  async function capture<T>(fn: () => Promise<T>): Promise<{ result: T; out: string; err: string }> {
+    const origLog = console.log;
+    const origErr = console.error;
+    let out = '';
+    let err = '';
+    console.log = (...a: unknown[]) => { out += a.map(String).join(' ') + '\n'; };
+    console.error = (...a: unknown[]) => { err += a.map(String).join(' ') + '\n'; };
+    try {
+      return { result: await fn(), out, err };
+    } finally {
+      console.log = origLog;
+      console.error = origErr;
+    }
+  }
+
+  // CLAUDE_CONFIG_DIR is the load-bearing override: Bun's homedir() ignores a
+  // remapped HOME (it reads the password database), so HOME alone does NOT
+  // sandbox user-scope writes — that leak is exactly why claudeUserSettingsPath
+  // honors CLAUDE_CONFIG_DIR/HOME explicitly now.
+  const envFor = () => ({
+    GBRAIN_HOME: parent,
+    HOME: sandboxHome,
+    CLAUDE_CONFIG_DIR: join(sandboxHome, '.claude'),
+    CODEX_HOME: codexHome,
+    // #4325: detectClaude() probes PATH via Bun.which('claude'); CI runners
+    // don't ship the claude CLI, so the claude lane silently un-wires and the
+    // apply test's `claude add` assertions fail. Prepend a sandbox bin dir
+    // carrying an executable no-op `claude` stub — the recording runner seam
+    // intercepts every real exec, so the stub only ever satisfies detection.
+    PATH: `${stubBin}:${process.env.PATH ?? ''}`,
+    // With an ambient DATABASE_URL, the IN-PROCESS runBootstrap calls
+    // (unlike the spawned children scrubbed in beforeAll) would otherwise
+    // resolve it via loadConfig's env>file precedence and mint tokens
+    // against Postgres while the live serve is PGLite-backed — turning the
+    // expected refusal into an invalid_token rollback. withEnv treats
+    // undefined as delete-with-restore.
+    DATABASE_URL: undefined,
+    GBRAIN_DATABASE_URL: undefined,
+  });
+
+  // #6661: started once in beforeAll and again by the pre-mint sequence test (which stops it first).
+  async function startServe(env: Record<string, string | undefined>): Promise<void> {
+    serverReady = false;
+    server = spawn('bun', [
+      'run', 'src/cli.ts', 'serve', '--http',
+      '--bind', '127.0.0.1', '--port', String(PORT),
+      '--public-url', BASE,
+    ], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let serr = '';
+    server.stderr?.on('data', (d: Buffer) => { serr += d.toString(); });
+    for (let i = 0; i < 60; i++) {
+      try {
+        const res = await fetch(`${BASE}/health`);
+        if (res.ok) { serverReady = true; break; }
+      } catch { /* not up yet */ }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    if (!serverReady) throw new Error(`serve --http did not become ready:\n${serr}`);
+  }
+
+  async function stopServe(): Promise<void> {
+    const proc = server;
+    server = null;
+    serverReady = false;
+    if (!proc || proc.exitCode !== null) return;
+    const exited = new Promise<void>((r) => proc.once('exit', () => r()));
+    proc.kill('SIGTERM');
+    await exited;
+  }
+
+  beforeAll(async () => {
+    parent = mkdtempSync(join(tmpdir(), 'gb-harness-e2e-'));
+    sandboxHome = mkdtempSync(join(tmpdir(), 'gb-harness-home-'));
+    codexHome = mkdtempSync(join(tmpdir(), 'gb-harness-codex-'));
+    // codex "installed" for detection purposes: the config file exists.
+    writeFileSync(codexConfig(), '# preexisting codex config\nmodel = "o5"\n');
+    // #4325: claude "installed" for detection purposes — executable no-op
+    // stub on a sandbox PATH entry (see envFor). Never actually executed.
+    stubBin = mkdtempSync(join(tmpdir(), 'gb-harness-bin-'));
+    writeFileSync(join(stubBin, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+
+    const env: Record<string, string | undefined> = { ...process.env, GBRAIN_HOME: parent };
+    delete env.DATABASE_URL;
+    delete env.GBRAIN_DATABASE_URL;
+
+    execFileSync('bun', ['run', 'src/cli.ts', 'init', '--pglite', '--no-embedding', '--non-interactive'], {
+      cwd: process.cwd(), env, stdio: 'ignore',
+    });
+    // Pre-mint the scoped token BEFORE serve starts — PGLite is single-writer,
+    // which is exactly the documented reason the --token lane exists.
+    const authOut = execFileSync(
+      'bun',
+      ['run', 'src/cli.ts', 'auth', 'create', 'bootstrap-harness', '--scopes', 'read,write'],
+      { cwd: process.cwd(), env, encoding: 'utf8' },
+    );
+    token = (authOut.match(/gbrain_[a-f0-9]{64}/) ?? [''])[0];
+    if (!token) throw new Error(`auth create did not yield a token:\n${authOut}`);
+    expect(authOut).toContain('scopes=["read","write"]');
+
+    await startServe(env);
+  }, 90_000);
+
+  afterAll(() => {
+    if (server) { try { server.kill('SIGTERM'); } catch { /* best-effort */ } }
+    for (const d of [parent, sandboxHome, codexHome, stubBin]) {
+      try { rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  });
+
+  test('mint under the live PGLite serve refuses with the two escape hatches', async () => {
+    expect(serverReady).toBe(true);
+    const { runner } = makeClaudeRunner();
+    const { result, err } = await withEnv(envFor(), () =>
+      capture(() =>
+        runBootstrap(['harness', '--yes', '--port', String(PORT), '--harness', 'codex'], { runner, harnessDetect: HARNESS_DETECT }),
+      ),
+    );
+    expect(result).toBe(1);
+    expect(err).toMatch(/pre-mint|--token/);
+    expect(err).toMatch(/stop the serve/);
+  }, 60_000);
+
+  // #6661 (D25): the refusal's printed sequence, run for real: stop the serve, pre-mint with the harness grant, restart.
+  test('the refusal\'s stop/mint/rescope/start sequence yields a token with the harness grant', async () => {
+    expect(serverReady).toBe(true);
+    const { runner } = makeClaudeRunner();
+    const { result, err } = await withEnv(envFor(), () =>
+      capture(() => runBootstrap(['harness', '--yes', '--port', String(PORT), '--harness', 'codex', '--token-name', 'harness-e2e'], { runner, harnessDetect: HARNESS_DETECT })),
+    );
+    expect(result).toBe(1);
+    const steps = [...err.matchAll(/^\s+\d\. (.*)$/gm)].map((m) => m[1]!);
+    expect(steps).toHaveLength(5);
+    expect(steps[0]).toMatch(/stop the serve/);
+    expect(steps[1]).toBe('gbrain auth create harness-e2e --scopes read,write,skills_member_self');
+    expect(steps[2]).toMatch(/^gbrain auth rescope --token harness-e2e --operations \S*join_brain\S*$/);
+    expect(steps[3]).toMatch(/gbrain serve --http/);
+    expect(steps[4]).toMatch(/--token/);
+
+    const env: Record<string, string | undefined> = { ...process.env, GBRAIN_HOME: parent };
+    delete env.DATABASE_URL;
+    delete env.GBRAIN_DATABASE_URL;
+    const gbrain = (argv: string[]) => execFileSync('bun', ['run', 'src/cli.ts', ...argv], { cwd: process.cwd(), env, encoding: 'utf8' });
+    await stopServe();
+    const created = gbrain(steps[1]!.split(' ').slice(1));
+    const premint = (created.match(/gbrain_[a-f0-9]{64}/) ?? [''])[0];
+    expect(premint).not.toBe('');
+    gbrain(steps[2]!.split(' ').slice(1));
+    const grants = gbrain(['auth', 'rescope', '--token', 'harness-e2e']);
+    const stored = (grants.match(/^\s+Operations: (.*)$/m) ?? ['', ''])[1]!.split(', ');
+    expect(stored).toEqual(steps[2]!.split(' ')[6]!.split(','));
+    await startServe(env);
+    const joinBrain = async (bearer: string) => (await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: `Bearer ${bearer}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'join_brain', arguments: {} } }),
+    })).text();
+    // The printed grant reaches join_brain (refused only for its missing argument); the bare read,write pre-mint the
+    // old refusal suggested is refused for scope, which is what the reporter hit.
+    const viaPremint = await joinBrain(premint);
+    expect(viaPremint).toContain('Missing required parameter: adapter');
+    expect(viaPremint).not.toContain('insufficient_scope');
+    expect(await joinBrain(token)).toContain('insufficient_scope');
+  }, 120_000);
+
+  test('apply with --token: real health + real bearer smoke; both harnesses wired; receipt + install log', async () => {
+    expect(serverReady).toBe(true);
+    const { runner, calls } = makeClaudeRunner();
+    const { result, out } = await withEnv(envFor(), () =>
+      capture(() =>
+        runBootstrap(
+          [
+            'harness', '--yes',
+            '--port', String(PORT),
+            '--token', token,
+            '--gbrain-bin', '/opt/fake/gbrain',
+          ],
+          { runner, harnessDetect: HARNESS_DETECT },
+        ),
+      ),
+    );
+    expect(result).toBe(0);
+    // real smoke against the live serve — identity round-tripped over bearer
+    expect(out).toMatch(/smoke test:/);
+    expect(out).toMatch(/"engine":"pglite"/); // C2: tool results are compact JSON
+    // the sandbox held: nothing touched the operator's real user scope
+    expect(out).not.toContain(`${process.env.HOME}/.claude/settings.json`);
+
+    // claude lane: exec'd through the runner with user scope + our token
+    const add = calls.find((c) => c[0] === 'claude' && c[2] === 'add');
+    expect(add).toBeDefined();
+    expect(add!.join(' ')).toContain('--scope user');
+    expect(add!.join(' ')).toContain(`Bearer ${token}`);
+
+    // user-scope sandbox writes
+    const settings = JSON.parse(readFileSync(userSettings(), 'utf8')) as Record<string, unknown>;
+    expect((settings.permissions as { allow: string[] }).allow).toContain('mcp__gbrain');
+    expect(Object.keys(settings.hooks as object).length).toBe(5);
+
+    // codex lane: managed block with the inline http_headers credential
+    // (#4574 — never bearer_token); preexisting content intact
+    const toml = readFileSync(codexConfig(), 'utf8');
+    expect(toml).toContain('# preexisting codex config');
+    expect(toml).toContain(CODEX_TOML_BLOCK_BEGIN);
+    expect(toml).toContain(`http_headers = { Authorization = "Bearer ${token}" }`);
+    expect(toml).not.toContain('bearer_token');
+
+    // receipt: all confirmed; supplied token → minted:false
+    const home = join(parent, '.gbrain');
+    const state = readHarnessReceiptState(home);
+    expect(state.state).toBe('ok');
+    const receipt = (state as { receipt: { targets: Array<{ state: string }>; token: { minted: boolean } } }).receipt;
+    expect(receipt.targets.every((t) => t.state === 'confirmed')).toBe(true);
+    expect(receipt.token.minted).toBe(false);
+
+    // install log carries the harness phase
+    const log = readFileSync(join(home, 'bootstrap', 'install.jsonl'), 'utf8');
+    expect(log).toMatch(/"phase":"harness".*"outcome":"ok"/);
+  }, 60_000);
+
+  test('--status: live probes, token recovered from the codex block, exit 0', async () => {
+    const { runner } = makeClaudeRunner();
+    const all = await withEnv(envFor(), () => capture(() => runBootstrap(['harness', '--status', '--json'], { runner, harnessDetect: HARNESS_DETECT })));
+    expect(all.result).toBe(0);
+    expect(JSON.parse(all.out).harness_tokens).toEqual([{ host: 'claude-code', verified: true }, { host: 'codex', verified: true }]);
+    const home = join(parent, '.gbrain');
+    const state = readHarnessReceiptState(home);
+    expect(state.state).toBe('ok');
+    if (state.state !== 'ok') throw new Error('expected the installed receipt');
+    writeHarnessReceipt(home, { ...state.receipt, targets: state.receipt.targets.filter(target => target.host === 'codex'),
+      harness_tokens: { codex: state.receipt.harness_tokens!.codex } });
+    try {
+    const { result, out } = await withEnv(envFor(), () =>
+      capture(() => runBootstrap(['harness', '--status'], { runner, harnessDetect: HARNESS_DETECT })),
+    );
+    expect(result).toBe(0);
+    expect(out).toMatch(/serve: OK/);
+    expect(out).toMatch(/token: OK .*codex config block/);
+    } finally { writeHarnessReceipt(home, state.receipt); }
+  }, 60_000);
+
+  test('--remove: host wiring cleared, codex config byte-identical to pre-apply, receipt consumed', async () => {
+    const { runner } = makeClaudeRunner();
+    const { result } = await withEnv(envFor(), () =>
+      capture(() => runBootstrap(['harness', '--remove', '--yes'], { runner, harnessDetect: HARNESS_DETECT })),
+    );
+    expect(result).toBe(0);
+    expect(readFileSync(codexConfig(), 'utf8')).toBe('# preexisting codex config\nmodel = "o5"\n');
+    const settings = JSON.parse(readFileSync(userSettings(), 'utf8')) as Record<string, unknown>;
+    expect(settings.permissions).toBeUndefined();
+    expect(settings.hooks).toBeUndefined();
+    expect(readHarnessReceiptState(join(parent, '.gbrain'))).toEqual({ state: 'absent' });
+  }, 60_000);
+
+  test('scoped token is honored end-to-end: an admin-scope op is refused over MCP', async () => {
+    // The minted token carries scopes {read,write}; get_stats is an
+    // admin-scope MCP op — the per-op hasScope gate must refuse it while
+    // read/write ops keep working (proven by the smoke above).
+    const res = await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'get_stats', arguments: {} },
+      }),
+    });
+    const text = await res.text();
+    expect(text).toMatch(/insufficient_scope|requires .*admin|not permitted|scope/i);
+  }, 30_000);
+
+  // #6661 option B, run for real: with the serve stopped a --token run wires and ends pending_verify (exit 13);
+  // --status stays partial until the fix's re-run, which runs while the live serve holds the PGLite brain.
+  test('--token with the serve stopped ends pending_verify; the printed re-run completes it under the live serve', async () => {
+    const env: Record<string, string | undefined> = { ...process.env, GBRAIN_HOME: parent };
+    delete env.DATABASE_URL;
+    delete env.GBRAIN_DATABASE_URL;
+    await stopServe();
+    const { runner } = makeClaudeRunner();
+    const run = (argv: string[]) => withEnv(envFor(), () => capture(() => runBootstrap(argv, { runner, harnessDetect: HARNESS_DETECT })));
+    const pending = await run(['harness', '--yes', '--port', String(PORT), '--harness', 'codex', '--skills', 'memory-only', '--token', token, '--json']);
+    expect(pending.result).toBe(13);
+    const doc = JSON.parse(pending.out) as { status: string; fix: { argv: string[] } };
+    expect(doc.status).toBe('pending_verify');
+    expect(pending.out).not.toContain(token);
+    expect(readFileSync(codexConfig(), 'utf8')).toContain(`http_headers = { Authorization = "Bearer ${token}" }`);
+    expect((await run(['harness', '--status', '--json'])).result).toBe(1);
+
+    await startServe(env);
+    const partial = await run(['harness', '--status', '--json']);
+    expect(partial.result).toBe(1);
+    expect(JSON.parse(partial.out)).toMatchObject({ status: 'partial', serve_ok: true, engine: 'pglite' });
+
+    const completed = await run(doc.fix.argv.slice(2).map(a => (a === '<TOKEN>' ? token : a)));
+    expect(completed.result).toBe(0);
+    // The re-run could not open the brain (the live serve holds it) and verified over HTTP instead.
+    expect(completed.err).toMatch(/could not verify --source 'default' against the brain/);
+    expect(completed.out).toMatch(/smoke test:/);
+    const done = await run(['harness', '--status', '--json']);
+    expect(done.result).toBe(0);
+    expect(JSON.parse(done.out).verify_pending).toBeUndefined();
+    expect((await run(['harness', '--remove', '--yes'])).result).toBe(0);
+  }, 120_000);
+});

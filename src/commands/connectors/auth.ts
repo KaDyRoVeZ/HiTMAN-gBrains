@@ -1,0 +1,257 @@
+/**
+ * commands/connectors/auth.ts — store + verify a provider session credential.
+ *
+ * Cookie paste-in is the primary lane. `--cookie -` reads the raw Cookie header
+ * from stdin so the secret never lands in argv/`ps`. `--try-oauth` (chatgpt)
+ * attempts the best-effort OAuth PKCE loopback first, then probes and falls back
+ * to cookie guidance. Every path ends with a probe + a one-line verdict; nothing
+ * is saved on a failed probe unless `--force`. A ChatGPT cookie first mints a
+ * token through the same client; a failed mint is the verdict and no probe
+ * follows it (#7515).
+ */
+
+import type { BrainEngine } from '../../core/engine.ts';
+import { setCliExitVerdict } from '../../core/cli-force-exit.ts';
+import { shellQuote } from '../../core/agent-output.ts';
+import { agentBlock } from '../../core/agent-markers.ts';
+import { isInteractive } from '../../core/interaction.ts';
+import { readStdinPayload } from '../../core/stdin-read.ts';
+import { ConnectorClient, probeFailure } from '../../core/connectors/client.ts';
+import { deleteCredential, saveCredential } from '../../core/connectors/credentials.ts';
+import { getConnectorProvider, isConnectorProviderName } from '../../core/connectors/registry.ts';
+import type { ChatHistoryProvider, ConnectorCredential, ProbeResult } from '../../core/connectors/types.ts';
+
+interface AuthFlags {
+  cookie?: string;
+  token?: string;
+  tryOauth: boolean;
+  noBrowser: boolean;
+  force: boolean;
+}
+
+function parseFlags(args: string[]): { provider: string; flags: AuthFlags } {
+  const flags: AuthFlags = { tryOauth: false, noBrowser: false, force: false };
+  let provider = '';
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--cookie') flags.cookie = args[++i];
+    else if (a === '--token') flags.token = args[++i];
+    else if (a === '--try-oauth') flags.tryOauth = true;
+    else if (a === '--no-browser') flags.noBrowser = true;
+    else if (a === '--force') flags.force = true;
+    else if (!a.startsWith('-')) provider = a;
+  }
+  return { provider, flags };
+}
+
+/** A person pasting a cookie at the terminal gets 5 minutes for the first byte. */
+const PASTE_WAIT_MS = 300_000;
+
+/** Bounded credential read (C5): an open-but-silent stdin times out with a message instead of hanging. */
+async function readStdin(firstByteMs?: number): Promise<string | null> {
+  const read = await readStdinPayload("printf '%s' \"$COOKIE\" | gbrain connectors auth <provider> --cookie -",
+    firstByteMs !== undefined ? { firstByteMs } : {});
+  if (read.ok) return read.text.trim();
+  console.error(read.message);
+  return null;
+}
+
+/**
+ * The headless lane (C7, mirrors Google connect): the `[AGENT]` block with
+ * the provider's cookie checklist fenced as `[SHOW USER]`, and the command
+ * that takes the cookie on stdin once the user has it. The cookie is a
+ * credential: the user copies it; the agent never guesses or reuses one.
+ */
+export function headlessCredentialBlock(provider: string, prov: Pick<ChatHistoryProvider, 'sessionInstructions'>): string {
+  const argv = ['gbrain', 'connectors', 'auth', provider, '--cookie', '-'];
+  return agentBlock({
+    ask: `Ask the user to copy their ${provider} session cookie from a logged-in browser (steps below), then pass it on stdin.`,
+    why: `Syncing ${provider} history needs the user's own browser session; there is no headless sign-in, and only the user can copy it.`,
+    risk: `The cookie grants access to the user's ${provider} account; gbrain stores it only on this machine (0600) and sends it only to ${provider}.`,
+    consent: 'credentials',
+    actor: 'user',
+    next: 'tell_user_to_run',
+    if_yes: `printf '%s' "<cookie>" | ${shellQuote(argv)}`,
+    if_no: 'Nothing was saved. The official export works without a cookie: gbrain transcripts ingest <export-file>.',
+    verify: `gbrain connectors status ${provider}`,
+  }, { showUser: prov.sessionInstructions() });
+}
+
+function makeProbeClient(provider: ChatHistoryProvider, cred: ConnectorCredential): ConnectorClient {
+  return new ConnectorClient({
+    baseUrl: provider.baseUrl,
+    headers: () => provider.authHeaders(cred),
+    refresh: provider.refreshAccessToken ? (client) => provider.refreshAccessToken!(cred, client) : undefined,
+  });
+}
+
+/** chatgpt: mint an accessToken from the cookie up front, so the first sync doesn't start with a 401→refresh round-trip. */
+async function mintToken(provider: ChatHistoryProvider, cred: ConnectorCredential, client: ConnectorClient): Promise<ProbeResult> {
+  if (!cred.cookie || !provider.refreshAccessToken) return { ok: true };
+  try {
+    if (await provider.refreshAccessToken(cred, client)) return { ok: true };
+    return { ok: false, kind: 'unauthorized', detail: 'the session endpoint returned no access token' };
+  } catch (e) {
+    return probeFailure(e);
+  }
+}
+
+async function probeAndReport(provider: ChatHistoryProvider, cred: ConnectorCredential): Promise<boolean> {
+  const client = makeProbeClient(provider, cred);
+  const minted = await mintToken(provider, cred, client);
+  const r = minted.ok ? await provider.probe(client) : minted;
+  if (r.ok) {
+    console.log(`✓ ${provider.name}: credential verified — conversation history is reachable.`);
+    return true;
+  }
+  if (r.kind === 'forbidden_fingerprint') {
+    console.error(
+      `✗ ${provider.name}: blocked by a bot/Cloudflare challenge (${r.detail}).\n` +
+        '  Server-side fetch may be blocked from this machine. Use the official export instead:\n' +
+        '  ' + provider.sessionInstructions().split('\n').slice(-2).join(' '),
+    );
+  } else if (r.kind === 'unauthorized') {
+    console.error(`✗ ${provider.name}: credential rejected (${r.detail}). Re-copy a fresh cookie.`);
+  } else {
+    console.error(`✗ ${provider.name}: probe failed (${r.kind}: ${r.detail}).`);
+  }
+  return false;
+}
+
+function printFirstRun(provider: string): void {
+  console.log(
+    [
+      '',
+      'Next steps:',
+      `  gbrain connectors sync ${provider} --dry-run     # preview how many conversations`,
+      `  gbrain connectors sync ${provider} --limit 5      # import a small sample first`,
+      `  gbrain conversation-parser scan conversations/${provider === 'chatgpt' ? 'chatgpt' : 'claude'}/<slug>  # validate one page`,
+      `  gbrain connectors sync ${provider} --full         # import everything`,
+      '',
+      `To keep it synced automatically (opt-in; polls your account on a schedule):`,
+      `  gbrain config set connectors.${provider}.auto_sync true`,
+      `  gbrain autopilot --install`,
+    ].join('\n'),
+  );
+}
+
+export async function runConnectorAuth(_engine: BrainEngine, args: string[]): Promise<void> {
+  const { provider, flags } = parseFlags(args);
+  if (!isConnectorProviderName(provider)) {
+    console.error(`Usage: gbrain connectors auth <chatgpt|claude> [--cookie -|--token V] [--try-oauth] [--force]`);
+    setCliExitVerdict(1);
+    return;
+  }
+  const prov = getConnectorProvider(provider)!;
+
+  const interactive = isInteractive();
+  // --try-oauth (chatgpt only, best-effort/forward-compat). The loopback flow
+  // needs a person at a browser on this machine and blocks up to 10 minutes
+  // waiting for the redirect, so a headless run never starts it (C7): it
+  // hands the agent the cookie lane instead.
+  if (flags.tryOauth && prov.oauth && !interactive) {
+    console.error('OAuth sign-in needs a person at a browser on this machine (it waits for a local redirect), so it was not started.');
+  } else if (flags.tryOauth && prov.oauth) {
+    const ok = await tryOauth(prov, flags);
+    if (ok) {
+      printFirstRun(provider);
+      return;
+    }
+    console.error('OAuth did not yield conversation-history access — falling back to the cookie lane.');
+  } else if (flags.tryOauth && !prov.oauth) {
+    console.error(`${provider} has no OAuth lane; use the cookie lane.`);
+  }
+
+  // Cookie / token lane (primary).
+  let cookie = flags.cookie;
+  let token = flags.token;
+  if (cookie === '-') {
+    const read = await readStdin();
+    if (read === null) { setCliExitVerdict(1); return; }
+    cookie = read;
+  }
+  if (!cookie && !token && !interactive) {
+    // Headless (an agent or a pipeline): there is no one to paste a cookie.
+    // Only the user can copy it from their browser, so relay the checklist
+    // and stop; nothing was saved.
+    process.stdout.write(headlessCredentialBlock(provider, prov));
+    setCliExitVerdict(1);
+    return;
+  }
+  if (!cookie && !token) {
+    console.error(prov.sessionInstructions());
+    console.error('\nPaste the credential now (Cookie header, or `token:<accessToken>`), then Ctrl-D:');
+    const pasted = await readStdin(PASTE_WAIT_MS);
+    if (pasted === null) { setCliExitVerdict(1); return; }
+    if (pasted.startsWith('token:')) token = pasted.slice('token:'.length).trim();
+    else cookie = pasted;
+  }
+  if (!cookie && !token) {
+    console.error('No credential provided.');
+    setCliExitVerdict(1);
+    return;
+  }
+
+  const cred: ConnectorCredential = {
+    provider,
+    strategy: 'browser-session',
+    cookie: cookie || undefined,
+    accessToken: token || undefined,
+    savedAt: new Date().toISOString(),
+  };
+  const ok = await probeAndReport(prov, cred);
+  if (!ok && !flags.force) {
+    console.error('Credential NOT saved (probe failed). Re-run with --force to save anyway.');
+    setCliExitVerdict(1);
+    return;
+  }
+  saveCredential(cred);
+  console.log(`Saved ${provider} credential to ~/.gbrain/connectors/${provider}.json (0600).`);
+  printFirstRun(provider);
+}
+
+async function tryOauth(prov: ChatHistoryProvider, flags: AuthFlags): Promise<boolean> {
+  const { buildAuthorizeUrl, exchangeCode, generatePkcePair, generateState, runLoopbackFlow } = await import(
+    '../../core/connectors/oauth-pkce.ts'
+  );
+  const cfg = prov.oauth!;
+  const { verifier, challenge } = generatePkcePair();
+  const state = generateState();
+  const authorizeUrl = buildAuthorizeUrl(cfg, challenge, state);
+  try {
+    const { code } = await runLoopbackFlow(cfg, authorizeUrl, state, {
+      openBrowser: !flags.noBrowser,
+      log: (m) => console.error(m),
+    });
+    const tokens = await exchangeCode(cfg, code, verifier);
+    const cred: ConnectorCredential = {
+      provider: prov.name,
+      strategy: 'oauth-pkce',
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      expiresAt: tokens.expiresAt,
+      savedAt: new Date().toISOString(),
+    };
+    const ok = await probeAndReport(prov, cred);
+    if (ok) {
+      saveCredential(cred);
+      console.log(`Saved ${prov.name} OAuth credential (0600).`);
+      return true;
+    }
+    return false;
+  } catch (e) {
+    console.error(`OAuth flow failed: ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
+}
+
+export async function runConnectorLogout(args: string[]): Promise<void> {
+  const provider = args.find((a) => !a.startsWith('-')) ?? '';
+  if (!isConnectorProviderName(provider)) {
+    console.error('Usage: gbrain connectors logout <chatgpt|claude>');
+    setCliExitVerdict(1);
+    return;
+  }
+  const removed = deleteCredential(provider);
+  console.log(removed ? `Removed ${provider} credential.` : `No ${provider} credential to remove.`);
+}

@@ -1,0 +1,120 @@
+import type { Recipe } from '../types.ts';
+
+/**
+ * DeepSeek's thinking mode (default on `deepseek-flash`, `deepseek-v4-flash` and `deepseek-v4-pro`;
+ * formerly the `deepseek-reasoner` model, retired 2026-07-24) returns its
+ * answer in a separate `reasoning_content` field and leaves `content`
+ * empty/whitespace when the whole response was reasoning. The AI SDK's openai-compatible adapter reads only `content`, so
+ * the model appears to answer with nothing. This transport shim promotes
+ * `reasoning_content` into `content` when `content` is empty, before the
+ * adapter parses the body. Fail-open: any error returns the original response.
+ * Non-streaming JSON chat completions only.
+ *
+ * @internal exported for tests.
+ */
+// Cast through `unknown` because TS's `typeof fetch` includes a `preconnect`
+// member the arrow function does not implement (matches azure-openai.ts).
+export const deepseekReasoningContentCompatFetch = (async (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response> => {
+  const res = await fetch(input as any, init as any);
+  try {
+    if (!res.ok) return res;
+    const ctype = res.headers.get('content-type') ?? '';
+    if (!ctype.includes('application/json')) return res;
+    const json = await res.clone().json();
+    const choices = Array.isArray(json?.choices) ? json.choices : [];
+    let modified = false;
+    for (const choice of choices) {
+      const msg = choice?.message;
+      if (!msg) continue;
+      // A tool-call turn legitimately carries content:null — the answer is the
+      // tool call, not text. NEVER promote reasoning_content there: DeepSeek's
+      // chain-of-thought must not be fed back to the model (it would be
+      // persisted as assistant text and replayed every subsequent turn,
+      // contaminating context and inflating tokens). Only promote on a terminal
+      // text turn whose content is empty.
+      const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+      const content = msg.content;
+      const reasoning = msg.reasoning_content;
+      const contentEmpty = content == null || (typeof content === 'string' && content.trim() === '');
+      if (!hasToolCalls && contentEmpty && typeof reasoning === 'string' && reasoning.trim() !== '') {
+        msg.content = reasoning;
+        modified = true;
+      }
+    }
+    if (!modified) return res;
+    // Rebuild with a fresh header set: the body length changed, so the
+    // upstream content-length / content-encoding would now be wrong.
+    const headers = new Headers(res.headers);
+    headers.delete('content-length');
+    headers.delete('content-encoding');
+    return new Response(JSON.stringify(json), {
+      status: res.status,
+      statusText: res.statusText,
+      headers,
+    });
+  } catch {
+    return res;
+  }
+}) as unknown as typeof fetch;
+
+/**
+ * DeepSeek exposes an OpenAI-compatible /v1/chat/completions endpoint.
+ * Useful as the second hop in a refusal-fallback chain and for cheap-
+ * research delegation.
+ * Pricing: https://api-docs.deepseek.com/quick_start/pricing
+ */
+export const deepseek: Recipe = {
+  id: 'deepseek',
+  name: 'DeepSeek',
+  tier: 'openai-compat',
+  implementation: 'openai-compatible',
+  base_url_default: 'https://api.deepseek.com/v1',
+  auth_env: {
+    required: ['DEEPSEEK_API_KEY'],
+    setup_url: 'https://platform.deepseek.com/api_keys',
+  },
+  touchpoints: {
+    // Query expansion reuses the same OpenAI-compatible chat endpoint (the
+    // gateway's expansion path is a plain languageModel call). Without this
+    // declaration an explicit `expansion_model: deepseek:...` silently
+    // yields no expansion (#1135).
+    // `deepseek-chat` / `deepseek-reasoner` were retired by DeepSeek on
+    // 2026-07-24 (#1255). Do not re-add the old names — the API 404s them.
+    // `deepseek-flash` (DeepSeek-V4.1-Flash) is the current name; the legacy
+    // `deepseek-v4-flash` is still accepted and served by the same model.
+    // openai-compat tier means user-configured legacy names still pass
+    // validation locally; the provider rejects them at call time.
+    // Rates are DeepSeek's PEAK cache-miss rates (an upper bound; off-peak
+    // bills half), matching model-pricing.ts.
+    expansion: {
+      models: ['deepseek-flash', 'deepseek-v4-flash'],
+      cost_per_1m_tokens_usd: 0.30,
+      price_last_verified: '2026-10-05',
+    },
+    chat: {
+      models: ['deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-pro'],
+      supports_tools: true,
+      supports_subagent_loop: true,
+      // DeepSeek's context caching is on by default for every account — the
+      // API reports prompt_cache_hit_tokens / prompt_cache_miss_tokens and
+      // there is no client opt-in to make. Declaring false contradicted this
+      // touchpoint's own cost_per_1m_input_usd, annotated as the *cache-miss*
+      // baseline — i.e. it already assumes a cache exists — and produced advice
+      // telling operators to move to a more expensive provider "for lower cost".
+      supports_prompt_cache: true,
+      // Thinking mode is DEFAULT ON for every listed model (see module docstring):
+      // reasoning bills as output and counts against max_tokens, so callers
+      // that size output caps must grant reasoning headroom (gbrain#4172).
+      thinking_by_default: true,
+      max_context_tokens: 1_000_000,
+      cost_per_1m_input_usd: 0.30, // deepseek-flash peak cache-miss baseline
+      cost_per_1m_output_usd: 1.20,
+      price_last_verified: '2026-10-05',
+    },
+  },
+  setup_hint: 'Get an API key at https://platform.deepseek.com/api_keys, then `export DEEPSEEK_API_KEY=...`',
+  compat: { fetch: deepseekReasoningContentCompatFetch },
+};

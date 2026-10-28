@@ -1,0 +1,391 @@
+/**
+ * Structural assertions for fix-wave fixes whose behavior is best verified
+ * at source-shape level rather than via a runtime harness:
+ *
+ *  - #1125 query drain cache writes — assert cli.ts awaits the drain after
+ *    the query op completes.
+ *  - #1090 admin embed — assert the two-tier resolution (cwd path + embedded
+ *    manifest fallback) is in serve-http.ts and consumes ADMIN_ASSETS.
+ *  - #1077 admin register-client PKCE — assert the admin endpoint honors
+ *    grantTypes / redirectUris / tokenEndpointAuthMethod from the body.
+ *  - #1100 PGLite phaseASchema — assert the v0.11.0 orchestrator routes
+ *    in-process when the engine is pglite (not via execSync subprocess).
+ *  - #1124 query no-expand — assert the parseOpArgs negation logic exists.
+ *
+ * Source-grep regression tests are the right tool when the rule is "this
+ * specific line shape must stay present"; a behavioral test would either
+ * duplicate what an E2E covers or require heavy mocking that hides the
+ * regression behind a test seam.
+ */
+import { describe, test, expect } from 'bun:test';
+import { readFileSync } from 'fs';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
+
+describe('v0.42.20.0 — search-cache drained via the background-work registry', () => {
+  // Supersedes the v0.36.1.x #1125 query-only drain: search-cache now registers
+  // a registry drainer (drained for BOTH search and query, bounded), and cli.ts
+  // drains the whole registry rather than calling awaitPendingSearchCacheWrites
+  // directly for the 'query' op only.
+  test('hybrid.ts registers a bounded search-cache drainer', () => {
+    const src = surfaceFileSource('hybrid', 'src/core/search/hybrid.ts');
+    expect(src).toMatch(/export async function awaitPendingSearchCacheWrites/);
+    expect(src).toMatch(/pendingCacheWrites\.add\(promise\)/);
+    expect(src).toMatch(/trackCacheWrite\(/);
+    // Now bounded (was an unbounded Promise.allSettled) + registered.
+    expect(src).toMatch(/registerBackgroundWorkDrainer\(\{[\s\S]*?name:\s*'search-cache'/);
+    expect(src).toMatch(/Promise\.race/);
+  });
+});
+
+describe('v0.36.1.x #1090 — admin embed two-tier resolution', () => {
+  test('serve-http.ts uses ADMIN_ASSETS manifest when admin/dist is not next to cwd', () => {
+    const src = surfaceSource('serve-http');
+    expect(src).toMatch(/import\(['"]\.\.\/admin-embedded/);
+    expect(src).toMatch(/ADMIN_ASSETS/);
+    expect(src).toMatch(/ADMIN_INDEX_HTML/);
+    // Two-tier: dev path (cwd-relative admin/dist) AND embedded manifest fallback
+    expect(src).toMatch(/useDevPath/);
+  });
+
+  test('src/admin-embedded.ts is auto-generated with file: imports', () => {
+    const src = readFileSync('src/admin-embedded.ts', 'utf8');
+    expect(src).toMatch(/AUTO-GENERATED/);
+    expect(src).toMatch(/with \{ type: 'file' \}/);
+    expect(src).toMatch(/export const ADMIN_ASSETS/);
+    expect(src).toMatch(/export const ADMIN_INDEX_HTML/);
+  });
+
+  test('build script + CI guard exist', () => {
+    const buildSrc = readFileSync('scripts/build-admin-embedded.ts', 'utf8');
+    expect(buildSrc).toMatch(/walk\(DIST/);
+    expect(buildSrc).toMatch(/with \{ type: 'file' \}/);
+    const guard = readFileSync('scripts/check-admin-embedded.sh', 'utf8');
+    expect(guard).toMatch(/git diff --exit-code -- src\/admin-embedded\.ts/);
+  });
+});
+
+describe('v0.36.1.x #1077 — admin register-client supports PKCE public clients', () => {
+  test('admin endpoint reads grantTypes / redirectUris / tokenEndpointAuthMethod from request body', () => {
+    const src = readFileSync('src/commands/serve-http-registration.ts', 'utf8');
+    // The destructure must surface name / tokenTtl / grantTypes /
+    // redirectUris / tokenEndpointAuthMethod from req.body. v0.39.3.0
+    // WARN-9 (PR #1308) moved `scopes` to a separate read line that
+    // accepts BOTH `scopes` (admin SPA) AND `scope` (OAuth wire singular)
+    // via `?? `, so this regex no longer requires `scopes` in the inline
+    // destructure — it's separately covered by the scope-source check
+    // below.
+    expect(src).toMatch(/const\s+\{\s*name,\s*(?:[^}]*?,\s*)?tokenTtl,\s*grantTypes,\s*redirectUris,\s*tokenEndpointAuthMethod\s*\}\s*=\s*req\.body/);
+    // v0.39.3.0 WARN-9: the route must still read a `scope`/`scopes` field
+    // (under either name) from req.body. Pin the fallback pattern so the
+    // PKCE-fix regression contract stays load-bearing.
+    expect(src).toMatch(/req\.body[^;]*scopes\s*\?\?\s*[^;]*scope\b/);
+    // v0.41.3 (T4 atomicity fix, codex F4): admin endpoint now validates
+    // tokenEndpointAuthMethod via the shared validator and passes it to
+    // registerClientManual as a positional arg. Pre-v0.41.3 the route did
+    // INSERT (confidential) → UPDATE (NULL out secret_hash) for the 'none'
+    // case, which left a confidential row stranded if the UPDATE failed.
+    // Atomic now: one INSERT writes the correct shape; no post-insert
+    // UPDATE block (the regex deliberately asserts the post-insert UPDATE
+    // is GONE).
+    expect(src).toMatch(/validateTokenEndpointAuthMethod\(tokenEndpointAuthMethod\)/);
+    // cathedral-6: the route now composes registerScopedClient (the same core
+    // the CLI uses) instead of open-coding registerClientManual + a raw TTL
+    // UPDATE. The atomicity contract is unchanged — the validated method is
+    // threaded through the parsed args into registerClientManual's single
+    // INSERT inside the core; the no-post-insert-UPDATE guard below still
+    // pins the F4 regression. The call now runs on the tx-scoped sql handle
+    // (dup-check + INSERT are one transaction under the shared name lock).
+    expect(src).toMatch(/registerScopedClient\(txSql,\s*name,\s*\{[\s\S]*?tokenEndpointAuthMethod:\s*validatedAuthMethod[\s\S]*?\}/);
+    // cathedral-6: the dup-check + INSERT run in ONE engine.transaction under
+    // the SAME name-scoped advisory lock the CLI lane takes — two concurrent
+    // same-name requests can no longer both pass the autocommit pre-check.
+    expect(src).toMatch(/pg_advisory_xact_lock\(hashtext\(\$1\)::bigint\)`,\s*\[registerClientNameLockKey\(name\)\]/);
+    // cathedral-6 (C1): tokenTtl validates BEFORE the tx (integer within the
+    // shared bounds → structured 400, never an in-tx integer-cast 500).
+    expect(src).toMatch(/invalid_token_ttl/);
+    expect(src).toMatch(/Number\.isInteger\(v\) \|\| v < TOKEN_TTL_MIN_SECONDS \|\| v > TOKEN_TTL_MAX_SECONDS/);
+    // Regression guard: post-insert UPDATE flipping client_secret_hash to
+    // NULL based on a runtime check is exactly the non-atomic pattern T4
+    // killed. Re-introducing it brings back codex F4.
+    expect(src).not.toMatch(/UPDATE oauth_clients SET client_secret_hash = NULL, token_endpoint_auth_method = 'none'/);
+  });
+});
+
+describe('v0.41.37.0 #1605 — v0.11.0 phaseASchema routes in-process for ALL engines', () => {
+  test('phaseASchema calls runMigrateOnlyCore (in-process) + is awaited', () => {
+    // Supersedes #1100's PGLite-only in-process branch. v0.41.37.0 #1605 routes
+    // EVERY engine through runMigrateOnlyCore (no execSync subprocess at all),
+    // which is strictly stronger: PGLite still never subprocesses, AND the
+    // Windows+Postgres getaddrinfo-ENOTFOUND spawn bug is closed too.
+    // The eng.initSchema() call moved into src/commands/migrations/in-process.ts.
+    const src = readFileSync('src/commands/migrations/v0_11_0.ts', 'utf8');
+    expect(src).toContain('runMigrateOnlyCore()');
+    expect(src).not.toContain("execSync('gbrain init --migrate-only'");
+    expect(src).toMatch(/await\s+phaseASchema/);
+  });
+
+  test('apply-migrations skips pre-flight schema-version probe on PGLite', () => {
+    const src = readFileSync('src/commands/apply-migrations.ts', 'utf8');
+    expect(src).toMatch(/skipPreflight\s*=\s*cfg\.engine\s*===\s*'pglite'/);
+  });
+});
+
+describe('v0.42.20.0 — background-work registry drains every sink before disconnect', () => {
+  // Supersedes the v0.41.8.0 #1247/#1269/#1290 per-call last-retrieved drain:
+  // last-retrieved is one of four registry sinks. #2084 moved the registry
+  // drain out of cli.ts's inline finallys into finishCliTeardown
+  // (cli-force-exit.ts), which every cli.ts teardown site routes through —
+  // the drain-before-disconnect invariant is pinned there (and behaviorally
+  // by test/cli-finish-teardown.test.ts).
+  test('cli-force-exit.ts imports + drains the registry inside finishCliTeardown', () => {
+    const src = readFileSync('src/core/cli-force-exit.ts', 'utf8');
+    expect(src).toMatch(/import\s+\{\s*drainAllBackgroundWorkForCliExit[\s\S]*?\}\s*from\s+['"]\.\/background-work\.ts['"]/);
+    expect(src).toMatch(/export async function finishCliTeardown/);
+  });
+
+  test('last-retrieved.ts still exports the bounded drain + registers a drainer', () => {
+    const src = readFileSync('src/core/last-retrieved.ts', 'utf8');
+    expect(src).toMatch(/export async function awaitPendingLastRetrievedWrites/);
+    expect(src).toMatch(/pendingLastRetrievedWrites\s*=\s*new\s+Set/);
+    expect(src).toMatch(/Promise\.race/);
+    expect(src).toMatch(/registerBackgroundWorkDrainer\(\{[\s\S]*?name:\s*'last-retrieved'/);
+  });
+
+  test('all four sinks register a drainer', () => {
+    expect(readFileSync('src/core/facts/queue.ts', 'utf8'))
+      .toMatch(/registerBackgroundWorkDrainer\(\{[\s\S]*?name:\s*'facts'[\s\S]*?abort:/);
+    expect(surfaceSource('hybrid'))
+      .toMatch(/name:\s*'search-cache'/);
+    expect(readFileSync('src/core/last-retrieved.ts', 'utf8'))
+      .toMatch(/name:\s*'last-retrieved'/);
+    expect(readFileSync('src/core/eval-capture.ts', 'utf8'))
+      .toMatch(/name:\s*'eval-capture'/);
+  });
+
+  test('finishCliTeardown positioning: registry drain appears BEFORE engine disconnect', () => {
+    // #2084: the invariant moved from cli.ts's inline finallys into the shared
+    // helper. The drain must run against a live engine (facts abort-path
+    // logIngest, #1762) before disconnect tears the pools down.
+    const src = readFileSync('src/core/cli-force-exit.ts', 'utf8');
+    const drainCallRe = /await\s+drain\s*\(\s*\{\s*timeoutMs:\s*drainTimeoutMs\s*\}\s*\)/;
+    const disconnectCallRe = /await\s+opts\.engine\.disconnect\s*\(/;
+    expect(src).toMatch(drainCallRe);
+    expect(src).toMatch(disconnectCallRe);
+    const drainIdx = src.indexOf(src.match(drainCallRe)![0]);
+    const disconnectIdx = src.indexOf(src.match(disconnectCallRe)![0]);
+    expect(drainIdx).toBeLessThan(disconnectIdx);
+  });
+
+  test('background-work.ts: Map registry, ordered drain, awaited abort, test seam', () => {
+    const src = readFileSync('src/core/background-work.ts', 'utf8');
+    expect(src).toMatch(/new\s+Map<string,\s*BackgroundWorkDrainer>/);
+    expect(src).toMatch(/sort\(\s*\(a,\s*b\)\s*=>\s*a\.order\s*-\s*b\.order/);
+    // #4143 widened the abort gate: still awaited, but only on the CLI-exit
+    // path (allowAbort) — the disconnect drain must never fire a permanent
+    // process-level abort from a long-lived process.
+    expect(src).toMatch(/if\s*\(unfinished\s*>\s*0\s*&&\s*d\.abort\s*&&\s*opts\.allowAbort\)\s*\{[\s\S]*?await\s+d\.abort\(\)/);
+    expect(src).toMatch(/export async function drainBackgroundWorkBeforeDisconnect/);
+    expect(src).toMatch(/export function __registerDrainerForTest/);
+  });
+
+  test('#4136 scan surfaces unrecognized_headings on both output paths', () => {
+    // The CLI test harness is deliberately engine-less, so pin the scan
+    // command's field passthrough at source level: JSON payload + the human
+    // caveat line must both carry the folded-heading diagnostic.
+    const src = readFileSync('src/commands/conversation-parser.ts', 'utf8');
+    expect(src).toContain('unrecognized_headings: result.unrecognized_headings'); // JSON payload
+    expect(src).toContain('unrecognized_headings: [${result.unrecognized_headings.join'); // human line
+    expect(src).toContain('speaker attribution may be wrong (#4136)');
+  });
+
+  test('#4143 engine parity: BOTH engines call the disconnect drain', () => {
+    // The postgres lane has no cheap behavioral harness (DATABASE_URL-gated),
+    // so pin the call sites structurally: a refactor that drops either
+    // engine's drain call silently reopens the in-flight-statement deadlock.
+    const pglite = surfaceFileSource('pglite-engine', 'src/core/pglite-engine.ts');
+    const postgres = surfaceSource('postgres-engine');
+    expect(pglite).toMatch(/await drainBackgroundWorkBeforeDisconnect\(\)/);
+    expect(postgres).toMatch(/await drainBackgroundWorkBeforeDisconnect\(\)/);
+    // PGLite ordering is load-bearing: drain AFTER the early-null (never
+    // before — that reopens the #1337 mid-close race), BEFORE close().
+    const nullIdx = pglite.indexOf('this._db = null;');
+    const drainIdx = pglite.indexOf('await drainBackgroundWorkBeforeDisconnect()');
+    expect(nullIdx).toBeGreaterThan(-1);
+    expect(drainIdx).toBeGreaterThan(nullIdx);
+  });
+
+  test('#4284 caller timeout retains ownership while the actual close drains under its watchdog', () => {
+    const pglite = surfaceFileSource('pglite-engine', 'src/core/pglite-engine.ts');
+    const closeStart = pglite.indexOf('private async _closeInternal(');
+    const armIdx = pglite.indexOf("label: 'pglite-disconnect-watchdog'", closeStart);
+    const stopIdx = pglite.indexOf('for (const stop of this._beforeDisconnect) await stop()', closeStart);
+    const drainIdx = pglite.indexOf('await drainBackgroundWorkBeforeDisconnect()', closeStart);
+    const closeIdx = pglite.indexOf('await db.close()', closeStart);
+    const releaseIdx = pglite.indexOf('await releaseLock(lock)', closeStart);
+    const disposeIdx = pglite.indexOf('watchdog?.dispose()', closeStart);
+    expect(armIdx).toBeGreaterThan(closeStart);
+    expect(stopIdx).toBeGreaterThan(armIdx);
+    expect(drainIdx).toBeGreaterThan(stopIdx);
+    expect(closeIdx).toBeGreaterThan(drainIdx);
+    expect(releaseIdx).toBeGreaterThan(closeIdx);
+    expect(disposeIdx).toBeGreaterThan(releaseIdx);
+    const timeoutStart = pglite.indexOf('const call = (async () =>');
+    const deadline = pglite.slice(timeoutStart, closeStart);
+    expect(deadline).toContain('Promise.race([work');
+    expect(deadline).toContain('reject(error)');
+    expect(deadline).not.toContain('releaseLock');
+    expect(deadline).not.toContain('.unref');
+  });
+  test('cli-force-exit.ts daemon guard excludes "serve"', () => {
+    const src = readFileSync('src/core/cli-force-exit.ts', 'utf8');
+    expect(src).toMatch(/export function shouldForceExitAfterMain/);
+    expect(src).toMatch(/DAEMON_COMMANDS[\s\S]*serve/);
+  });
+});
+
+describe('#2084 — cli.ts owns process-exit teardown via finishCliTeardown', () => {
+  test('no bare awaited engine disconnects remain in cli.ts', () => {
+    // The awaited forms are the call-site contract (comments never use the
+    // awaited literal, so this is comment-proof — eng-review D13.2). A bare
+    // disconnect skips the bounded drain + computed-deadline backstop and
+    // reopens the lingering-socket hang class.
+    const src = surfaceSource('cli');
+    expect(src).not.toContain('await engine.disconnect()');
+    expect(src).not.toContain('await eng.disconnect()');
+  });
+
+  test('the pre-handler hard-deadline timer is gone (handler time is not teardown budget)', () => {
+    // Pre-#2084 the op-dispatch timer armed BEFORE the op handler, so any op
+    // slower than 10s was force-killed mid-run with exit 0 and truncated
+    // output. The deadline now arms inside finishCliTeardown, at teardown
+    // start only.
+    const src = surfaceSource('cli');
+    expect(src).not.toContain('DISCONNECT_HARD_DEADLINE_MS');
+  });
+
+  test('all nine swept sites route through finishCliTeardown; one exit seam', () => {
+    const src = surfaceSource('cli');
+    const calls = src.match(/await finishCliTeardown\(/g) ?? [];
+    expect(calls.length).toBeGreaterThanOrEqual(9);
+    // The single process-exit seam: flushThenExit in the import.meta.main
+    // block, fed by currentExitCode().
+    expect(src).toMatch(/import\.meta\.main/);
+    expect(src).toMatch(/flushThenExit\(currentExitCode\(\)\)/);
+  });
+
+  test('pglite-engine contains the Emscripten process.exitCode hijack', () => {
+    // PGLite's WASM runtime writes its own status into process.exitCode (99
+    // alive / exit status on close) and ignores `undefined` assignment. The
+    // create call runs inside preservingProcessExitCode to keep the global
+    // tidy; close is deliberately unwrapped (see below) — the CLI's verdict
+    // is immune either way via the owned channel.
+    const src = surfaceSource('pglite-engine');
+    expect(src).toMatch(/preservingProcessExitCode\(\(\)\s*=>\s*\n?\s*PGlite\.create/);
+    // close stays UNWRAPPED by design: its status write is baseline behavior
+    // test runners depend on; the CLI's verdict is immune because it lives in
+    // the gbrain-owned channel, never read back from process.exitCode.
+    const helper = readFileSync('src/core/cli-force-exit.ts', 'utf8');
+    expect(helper).toMatch(/let cliVerdict: number \| null = null/);
+    expect(helper).toMatch(/return cliVerdict \?\? 0/);
+    // The op-dispatch catch must set the verdict through the owned channel.
+    const cli = surfaceSource('cli');
+    expect(cli).toMatch(/setCliExitVerdict\(1\);/);
+  });
+});
+
+describe('v0.41.8.0 #1340 — PGLite WASM init classifier', () => {
+  test('pglite-engine.ts connect catch block routes through the classifier', () => {
+    const src = surfaceSource('pglite-engine');
+    expect(src).toMatch(/classifyPgliteInitError\(original\)/);
+    // WAL-repair wave: the call gained platform + repair-context args, so pin
+    // only the (verdict, original, …) prefix — the routing seam, not the arity.
+    expect(src).toMatch(/buildPgliteInitErrorMessage\(verdict, original/);
+  });
+});
+
+describe('WAL-repair wave structural pins (#223/#2575)', () => {
+  test('connect() catch wires the WAL auto-repair seam', () => {
+    const src = surfaceSource('pglite-engine');
+    expect(src).toMatch(/attemptWalRepairAndRetry\(/);
+  });
+
+  test('the repair-retry lambda stays inside the #2084 exitCode guard', () => {
+    // The retry re-runs PGlite.create; unguarded, Emscripten would hijack
+    // process.exitCode on the retry path exactly as it did on the first
+    // attempt (the #2084 class). Pin the wrap at the seam call-site.
+    const src = surfaceFileSource('pglite-engine', 'src/core/pglite-engine.ts');
+    expect(src).toMatch(/attemptWalRepairAndRetry\([\s\S]{0,300}preservingProcessExitCode/);
+  });
+
+  test('no bare PGlite.create outside the wrapped engine sites', () => {
+    // The repair/resetwal modules take the retry as a callback — if either
+    // grew its own PGlite.create call it would bypass BOTH the exitCode
+    // guard and the single-writer lock.
+    const repair = readFileSync('src/core/pglite-repair.ts', 'utf8');
+    const resetwal = readFileSync('src/core/pglite-resetwal.ts', 'utf8');
+    expect(repair).not.toMatch(/PGlite\.create/);
+    expect(resetwal).not.toMatch(/PGlite\.create/);
+  });
+
+  test('pglite-resetwal.ts carries the upstream attribution', () => {
+    // The reset-WAL sequence mirrors upstream electric-sql/pglite PR #994;
+    // the pointer is the audit trail for future divergence.
+    const resetwal = readFileSync('src/core/pglite-resetwal.ts', 'utf8');
+    expect(resetwal).toContain('electric-sql/pglite/pull/994');
+  });
+});
+
+describe('v0.42.43.0 #2095 — volunteer-events sink + cycle purge wiring (structural pins)', () => {
+  test('volunteer-events registers a background-work drainer (order 4)', () => {
+    // Deleting this registration would silently drop volunteer events on
+    // every CLI exit with no behavioral test failing — same pin class as the
+    // other four sinks above.
+    const src = readFileSync('src/core/context/volunteer-events.ts', 'utf8');
+    expect(src).toMatch(/registerBackgroundWorkDrainer\(\{[\s\S]*?name:\s*'volunteer-events'/);
+    expect(src).toMatch(/order:\s*4/);
+  });
+
+  test("the dream cycle's purge phase invokes purgeStaleVolunteerEvents and reports the count", () => {
+    const src = readFileSync('src/core/cycle.ts', 'utf8');
+    expect(src).toMatch(/purgeStaleVolunteerEvents\(engine\)/);
+    expect(src).toMatch(/purged_volunteer_events_count/);
+  });
+});
+
+describe('five-issue fix wave — integrity progress is (source_id, slug)-keyed', () => {
+  // integrity.ts's resume progress used to be keyed by slug alone, so a resume
+  // SKIPPED same-slug pages in every other source (the scan iterates
+  // (slug, source_id) pairs from listAllPageRefs). Behavioral coverage would
+  // need live resolvers; the keying shape is what must not regress.
+  test('integrity.ts keys seen/progress by progressKey(source_id, slug) and persists source_id', () => {
+    const src = readFileSync('src/commands/integrity.ts', 'utf8');
+    expect(src).toMatch(/function progressKey\(/);
+    expect(src).toMatch(/seen\.has\(progressKey\(source_id, slug\)\)/);
+    expect(src).toMatch(/seen\.add\(progressKey\(entry\.source_id, entry\.slug\)\)/);
+    // Every appendProgress site persists the source_id.
+    const appends = src.match(/appendProgress\(\{[^}]*\}\)/g) ?? [];
+    expect(appends.length).toBeGreaterThan(0);
+    for (const call of appends) {
+      expect(call).toContain('source_id');
+    }
+    // One writer PER SOURCE (a single default-scoped writer was the bug).
+    expect(src).toMatch(/new BrainWriter\(engine, \{ strictMode: 'off', sourceId \}\)/);
+  });
+});
+
+describe('#2955 — sync multi-source repoPath routes through msysToNativePath', () => {
+  // sources.local_path can be msys-shaped (`/c/Users/x`, recorded by a Git
+  // Bash `sources add` on Windows) and join-resolves to a phantom
+  // C:\c\Users\x. The pure helper is unit-tested in path-confine.test.ts
+  // (identity off win32, so a POSIX behavioral test can't observe the site);
+  // this pins that BOTH multi-source repoPath sites — the parallel --all
+  // closure and syncOneSource — heal the value before it becomes a repoPath.
+  test('both `repoPath: src.local_path` sites in sync.ts wrap with msysToNativePath', () => {
+    const src = surfaceSource('sync');
+    expect(src).toMatch(/from '\.\.\/core\/path-confine\.ts'/);
+    const healed = src.match(/repoPath:\s*msysToNativePath\(src\.local_path!\)/g) ?? [];
+    expect(healed.length).toBe(2);
+    // No remaining raw multi-source assignment.
+    expect(src).not.toMatch(/repoPath:\s*src\.local_path!/);
+  });
+});

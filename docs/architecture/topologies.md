@@ -1,0 +1,988 @@
+# GBrain Deployment Topologies
+
+GBrain supports three deployment shapes. They compose: a single user can mix
+all three on the same machine without conflict, because every shape resolves
+to "which `~/.gbrain/config.json` is active right now?" and `GBRAIN_HOME`
+controls that selection.
+
+This page covers the three topologies, when each fits, and concrete setup
+recipes. Pair this doc with `docs/architecture/brains-and-sources.md` (which
+covers the in-brain organization axes) — that doc is about WHICH database;
+this doc is about WHERE that database lives.
+
+## Quick decision tree
+
+```
+   "I'm setting up gbrain..."
+        │
+        ▼
+  Just for me, on one machine? ─── yes ───▶ Topology 1 (single brain)
+        │
+        no
+        │
+        ▼
+  Will a remote machine host the brain
+  while my agent runs locally? ──── yes ───▶ Topology 2 (cross-machine thin client)
+        │
+        no
+        │
+        ▼
+  Multiple Conductor worktrees that
+  shouldn't share a code index? ─── yes ───▶ Topology 3 (split-engine)
+```
+
+Topologies 2 and 3 stack: a thin-client install can also host per-worktree
+code engines, and a per-worktree code engine can also point its artifact
+brain at a remote server.
+
+## Topology 1 — Single brain (the default)
+
+```
+  ┌────────────────┐
+  │   one machine  │
+  │  ┌──────────┐  │
+  │  │  gbrain  │──┼──→  ~/.gbrain/  →  PGLite  or  Supabase
+  │  │   CLI    │  │
+  │  └──────────┘  │
+  └────────────────┘
+```
+
+What you get: one local DB (PGLite for small brains, Supabase for ~1000+
+files). All commands work directly against it. `gbrain serve` exposes it
+to a single agent over MCP.
+
+When it fits: solo use, single machine, one agent, no Conductor parallelism.
+This is the default; `gbrain init` (no flags) gives you this.
+
+Setup:
+
+```
+gbrain init           # interactive — defaults to PGLite
+gbrain init --pglite  # explicit local
+gbrain init --supabase  # remote Supabase (recommended for 1000+ files)
+```
+
+Nothing else here is special. The other two topologies are variations on
+"who owns the DB" and "how does the agent talk to it."
+
+## Topology 2 — Cross-machine thin client
+
+```
+  ┌────────────┐                    ┌──────────────────┐
+  │ neuromancer│                    │    brain-host    │
+  │ ┌────────┐ │ HTTP MCP / OAuth   │  ┌────────────┐  │
+  │ │ Hermes │─┼───────────────────→│  │   gbrain   │──┼──→ Supabase
+  │ │ agent  │ │                    │  │ serve --http│  │
+  │ └────────┘ │                    │  └────────────┘  │
+  │            │                    │   (with autopilot)│
+  │  no local  │                    │                  │
+  │  gbrain DB │                    │                  │
+  └────────────┘                    └──────────────────┘
+```
+
+What you get: the agent on one machine ("neuromancer") consumes a brain
+hosted on another machine ("brain-host") over HTTP MCP with OAuth. The
+agent's machine has NO local engine. All queries, searches, embeddings,
+and indexing happen on the host.
+
+When it fits:
+
+- Heavy brain (Supabase + autopilot) lives on a beefy machine; agents
+  elsewhere just consume it.
+- You want one source of truth across many machines.
+- Spinning up a parallel local install would create source-ID contention or
+  duplicate work.
+
+The thin client's `~/.gbrain/config.json` carries a `remote_mcp` field
+instead of a local DB connection:
+
+```jsonc
+{
+  "engine": "postgres",  // ignored — never used
+  "remote_mcp": {
+    "issuer_url": "https://brain-host.local:3001",
+    "mcp_url":    "https://brain-host.local:3001/mcp",
+    "oauth_client_id": "neuromancer-...",
+    "oauth_client_secret": "..."  // or set GBRAIN_REMOTE_CLIENT_SECRET
+  }
+}
+```
+
+The CLI dispatch guard refuses every DB-bound command (`sync`, `embed`,
+`extract`, `migrate`, `serve`, `enrich`, `jobs`, `sources`, `pages`,
+`files`, `eval`, and the rest of the local-only surface — the full hint
+table is `THIN_CLIENT_REFUSE_HINTS` in `src/cli.ts`) on a thin-client
+install with a clear error pointing at the remote host. `gbrain doctor`
+runs a dedicated thin-client check set (OAuth discovery, token round-trip,
+MCP smoke). See [`thin-client.md`](./thin-client.md) for the routing seam.
+
+### Setup
+
+**Step 1 — On the host (brain-host):**
+
+```bash
+gbrain init --supabase                         # or --pglite, doesn't matter
+gbrain serve --http --port 3001 --bind 0.0.0.0 # bind explicitly for remote access
+                                                # (default bind is 127.0.0.1)
+gbrain auth register-client neuromancer \
+  --grant-types client_credentials \
+  --scopes read,write,admin                    # admin needed for remote doctor
+
+# source-scoped client (write to one source, federate reads across
+# multiple sources). Omit both flags for an unscoped super-client.
+gbrain auth register-client neuromancer-dept \
+  --grant-types client_credentials \
+  --scopes read,write \
+  --source dept-x \
+  --federated-read dept-x,shared,parent-canon
+```
+
+The `register-client` command prints a `client_id` and `client_secret`.
+Note both. **Scope must include `admin`** for `run_doctor` (used by
+`gbrain remote doctor`) and generic background jobs. `submit_job` accepts
+only `sync`, `import`, `lint`, and `lint-fix` with the authenticated source's
+registered root, so the host refuses the `autopilot-cycle` job that
+`gbrain remote ping` submits; run maintenance on the brain host. See the
+[authorization upgrade guide](../guides/authorization-upgrade.md#generic-remote-background-jobs).
+
+**Step 2 — On the thin client (neuromancer):**
+
+```bash
+gbrain init --mcp-only \
+  --issuer-url https://brain-host.local:3001 \
+  --mcp-url https://brain-host.local:3001/mcp \
+  --oauth-client-id <id> \
+  --oauth-client-secret <secret>
+```
+
+Pre-flight smoke runs three probes (OAuth discovery, token round-trip,
+MCP initialize). If any fails, init exits with an actionable error. On
+success, `~/.gbrain/config.json` gets `remote_mcp` set and NO local DB
+is created.
+
+**Step 3 — Configure your agent's MCP client.**
+
+For Claude Desktop / Hermes / openclaw, add a single MCP server entry
+pointing at the host's `mcp_url` with the bearer token from `register-client`.
+Example for Claude Desktop's `~/.config/claude/claude_desktop_config.json`:
+
+```jsonc
+{
+  "mcpServers": {
+    "gbrain": {
+      "type": "url",
+      "url": "https://brain-host.local:3001/mcp",
+      "headers": { "Authorization": "Bearer <client_secret>" }
+    }
+  }
+}
+```
+
+**Step 4 — Verify.**
+
+```bash
+gbrain doctor             # runs thin-client checks (no local DB needed)
+gbrain remote doctor      # asks the host to run its own doctor (Tier B)
+```
+
+`gbrain sync` and friends will refuse with a clear thin-client error
+naming the `mcp_url`. That's the correct behavior — those commands need
+a local engine that doesn't exist here.
+
+### Re-run guard
+
+Running `gbrain init` (no flags) on a machine that already has thin-client
+config set refuses without `--force`. This catches the scripted-setup-loop
+friction where an orchestrator keeps trying to create a local DB. Use
+`gbrain init --mcp-only --force` to refresh thin-client config.
+
+### Storing the OAuth secret
+
+Three storage paths in priority order:
+
+1. **`GBRAIN_REMOTE_CLIENT_SECRET` env var** (preferred for headless agents).
+   When set, overrides whatever's in the config file. The init flow doesn't
+   persist a config-file copy when the env var was the source.
+2. **`~/.gbrain/config.json` with 0600 perms** (default for interactive
+   setup; mirrors how Supabase keys are stored today).
+3. macOS Keychain integration is not supported (roadmap item).
+
+The access token the thin client mints is cached in
+`~/.gbrain/remote-tokens/` (one 0600 file per client, bearer and expiry only,
+no secret) and reused by every `gbrain` command until 30 seconds before it expires, so a
+per-prompt hook mints about one token per token lifetime instead of one per
+command. Changing the client id or secret starts a fresh token; deleting the
+directory is always safe. Processes that start together with no cached token
+each mint one. The host still checks each request against the client's
+current grant, so narrowing or revoking the client takes effect on the cached
+token at once.
+
+## Topology 3 — Split-engine, per-worktree code + remote artifacts
+
+```
+  ┌──────────────────────────────────────────────────────┐
+  │                  one machine                         │
+  │                                                      │
+  │  ┌─ worktree A ──────────────┐                       │
+  │  │  GBRAIN_HOME=A/.conductor │                       │
+  │  │  gbrain serve --port 3001 │── PGLite (code A)     │
+  │  └───────────────────────────┘                       │
+  │                                                      │
+  │  ┌─ worktree B ──────────────┐                       │
+  │  │  GBRAIN_HOME=B/.conductor │                       │
+  │  │  gbrain serve --port 3002 │── PGLite (code B)     │
+  │  └───────────────────────────┘                       │
+  │                                                      │
+  │  ┌─ default ~/.gbrain ───────┐    HTTP MCP / OAuth   │
+  │  │  gbrain serve --port 3000 │──────────────────────→ remote artifacts
+  │  └───────────────────────────┘                        (Supabase / brain-host)
+  │                                                      │
+  │  Agent's MCP config (Hermes / Claude Desktop):       │
+  │    mcp__gbrain_code__*       → http://localhost:3001 │
+  │    mcp__gbrain_artifacts__*  → http://brain-host/mcp │
+  └──────────────────────────────────────────────────────┘
+```
+
+What you get: each Conductor worktree has its own per-worktree code index
+(local PGLite, disposable when the worktree dies). Artifacts (plans,
+learnings, transcripts) still live in a shared brain that all worktrees
+can see and write to.
+
+When it fits:
+
+- Multiple Conductor worktrees on one machine, all touching the same code
+  repo.
+- You don't want each worktree's code-import to clobber the others'
+  `last_commit`, source IDs, or symbol tables.
+- You DO want artifacts (plans, learnings, retros, transcripts) to be
+  visible across worktrees.
+
+### How it works
+
+`GBRAIN_HOME` selects which `~/.gbrain` directory is active. Set per worktree:
+
+```bash
+export GBRAIN_HOME=/path/to/worktree-A/.conductor/gbrain
+gbrain init --pglite
+gbrain serve --http --port 3001
+```
+
+Each worktree's `gbrain serve` instance binds its own port and indexes its
+own DB. Multiple `gbrain serve` processes coexist fine — they're separate
+OS processes with separate config and separate connection pools.
+
+The artifact brain runs as a separate `gbrain serve` instance with the
+default `~/.gbrain` (no GBRAIN_HOME override) — or remote, in which case
+it's a Topology 2 setup.
+
+The agent's MCP client config lists multiple servers, each with a unique
+alias. Tool names are namespaced as `mcp__<alias>__<tool>`, so the agent
+calls `mcp__gbrain_code__search` for code lookups and `mcp__gbrain_artifacts__search`
+for artifact lookups.
+
+### Recommended embedding model
+
+Per-worktree code brains index source files only — no meeting notes,
+no people pages, no transcripts. Configure each code brain to use
+Voyage's code-tuned model at init time so the config can't be lost to a
+later `init` overwrite:
+
+```bash
+export GBRAIN_HOME=/path/to/worktree-A/.conductor/gbrain
+gbrain init --pglite \
+  --embedding-model voyage:voyage-code-3 \
+  --embedding-dimensions 1024
+```
+
+`voyage-code-3` is Voyage's code-specialized embedding model with
+head-to-head numbers above their general flagships on code retrieval
+([voyageai.com/blog](https://voyageai.com/blog)). For already-initialized
+brains, switch with the one-command wipe-and-reinit (preserves every
+other config field):
+
+```bash
+gbrain reinit-pglite --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
+gbrain reindex-code --yes
+```
+
+(`gbrain config set embedding_model` is refused because the schema column
+has to resize alongside the config.)
+
+`gbrain reindex-code` prints a recommendation when the configured
+embedding model isn't code-tuned. Suppress with
+`GBRAIN_NO_CODE_MODEL_NUDGE=1` if you've intentionally chosen another
+provider (single-vendor procurement, compliance, no Voyage key).
+
+### CRITICAL: alias-level routing is manual
+
+Topology 3 has no smart per-tool routing inside gbrain. The agent picks
+which brain to query when it picks the alias. **A wrong alias writes (or
+queries) the wrong brain silently.** This is intentional (explicit beats
+magic) but real:
+
+- If the agent calls `mcp__gbrain_artifacts__put_page` with code-shaped
+  content, that page lands in the artifact brain forever.
+- If the agent calls `mcp__gbrain_code__search` for a question that
+  actually wants artifact context, the search comes back empty.
+
+Mitigations:
+
+- Name aliases clearly. `gbrain_code` vs `gbrain_artifacts` is unambiguous;
+  `gbrain` vs `gbrain_local` is not.
+- Document in your agent's system prompt or rules which alias goes where.
+  Be explicit about "code questions → `gbrain_code`; everything else →
+  `gbrain_artifacts`."
+- Pair Topology 3 with `gstack`'s per-worktree wiring (which sets the
+  alias names + agent rules consistently across worktrees).
+
+### Setup (manual; gstack automates this side)
+
+The gbrain side requires zero new code — `GBRAIN_HOME` and `--port` already
+exist. Setup looks like:
+
+```bash
+# Start the artifact brain (default ~/.gbrain) on port 3000
+gbrain serve --http --port 3000 &
+
+# Start a per-worktree code brain on port 3001
+export GBRAIN_HOME=/path/to/worktree-A/.conductor/gbrain
+gbrain init --pglite
+gbrain serve --http --port 3001 &
+unset GBRAIN_HOME
+```
+
+Then configure the agent's MCP config with two entries (different aliases,
+different ports). For Claude Desktop:
+
+```jsonc
+{
+  "mcpServers": {
+    "gbrain_artifacts": {
+      "type": "url",
+      "url": "http://localhost:3000/mcp",
+      "headers": { "Authorization": "Bearer <token-A>" }
+    },
+    "gbrain_code": {
+      "type": "url",
+      "url": "http://localhost:3001/mcp",
+      "headers": { "Authorization": "Bearer <token-B>" }
+    }
+  }
+}
+```
+
+The gstack-side wiring (per-worktree home setup, port allocation, automatic
+MCP config generation, gitignore for the per-worktree DB) is in the gstack
+repo's setup-gbrain skill — it composes these primitives, gbrain doesn't
+have to know about Conductor.
+
+## Combining topologies
+
+The three shapes compose. A single machine can run:
+
+- A thin-client default config pointing at a remote artifact brain
+  (Topology 2).
+- Plus per-worktree code brains under their own `GBRAIN_HOME` (Topology 3).
+- Each worktree's `gbrain serve` instance is local; the agent's MCP config
+  lists them alongside the remote artifact brain.
+
+`GBRAIN_HOME` controls which config file is active for any one CLI
+invocation. `gbrain serve --port` controls which port a server listens on.
+The agent's MCP client picks the alias and thus the destination per tool
+call. There's no global gbrain orchestrator that knows about all of them
+simultaneously — that's by design.
+
+## Writer administration is not routine repair
+
+An `owner_unavailable` write error means that the selected source cannot currently
+publish through its designated owner. It is not permission to claim a checkout,
+activate managed persistence, or transfer ownership. Start with read-only inspection
+on the selected brain host:
+
+```bash
+gbrain sources writer status --brain host --json
+```
+
+Keep the brain and source selection explicit. Inspect the existing owners, source
+bindings, epochs, enabled state and outstanding recovery before asking the operator
+what should change. `doctor`, `doctor --fix`, startup checks, scheduled maintenance
+and retries must leave these identities and epochs alone. Never remove ownership
+markers, recreate identities, or edit database rows to bypass a refusal.
+
+`writer_status.onboarding` reports each source's binding, legacy-lock state and
+the next deliberate step. A configured but unbound Postgres source refuses writes;
+claiming it alone does not restore legacy sync. Claim the intended canonical path,
+inspect a **fresh** status and fingerprint, then activate only after quiescing
+older writers. Neither repair nor startup auto-claims or activates sources.
+
+### Deliberate topology changes
+
+Only the trusted local CLI administration lane can perform these operations.
+Ordinary remote tokens and stdio agent credentials cannot administer ownership,
+even when they supply the flags below. Local shell access is already trusted:
+these flags record deliberate, state-bound intent, not proof that a human is
+typing. A TTY or a generic `--yes` is neither required nor sufficient.
+
+For a planned change, the operator must review `status` and retain its `admin_state`
+fingerprint. Each non-dry-run action requires both an exact `--admin-intent` and
+`--expected-state` containing that reviewed fingerprint:
+
+| Action | Required intent |
+|---|---|
+| `claim` | `writer_claim` |
+| `activate` | `writer_activate` |
+| `transfer prepare` | `writer_transfer_prepare` |
+| `transfer accept` | `writer_transfer_accept` |
+| `transfer cancel` | `writer_transfer_cancel` |
+
+For example, after reviewing the target host and canonical directory:
+
+```bash
+gbrain sources writer claim default --brain host --path /absolute/canonical/source --dry-run --json
+gbrain sources writer claim default --brain host --path /absolute/canonical/source \
+  --admin-intent writer_claim --expected-state <reviewed-admin-state> --json
+```
+
+Inspect status again after each change. The fingerprint covers the brain identity,
+managed mode, source incarnations and paths, owner identities and epochs, worktree
+membership and transfer manifests. It excludes heartbeats and ordinary queue
+traffic. A changed fingerprint refuses with `writer_admin_state_changed`, including
+a change racing the final transaction. Re-inspect and re-review; do not blindly
+substitute the new value and retry. Dry runs do not grant permission to apply.
+
+Activation additionally requires every older writer and maintenance process on
+every host to be upgraded and stopped, filesystem sources to have their intended
+owners, and outstanding locks and recovery to be resolved. On a brain whose
+`sync.write_through` is `false` (a database-only brain), a rooted source with no
+owner needs none: `writer status` already reports it `database_only`, and
+activation lists it under `database_only_sources` and goes ahead (#6449). Page
+writes to it publish to the database only (`write_through.skipped:
+disabled_by_config`), `gbrain sync` on it refuses `owner_unavailable` naming the
+claim, and turning `sync.write_through` back on does not claim it, not even on
+PGLite (activation records the listed source ids as a JSON array in the config
+key `persistence.database_only_sources`, deactivation clears it, and
+`gbrain config unset persistence.database_only_sources` is the escape hatch if a
+listing outlives its brain state; it is not a setting to edit by hand): the next write
+refuses with `detail: unbound_source` and the `writer claim` to run (preview
+with `--dry-run`), or stays database-only under
+`persistence.unbound_write=database_only`. With `sync.write_through` on, the
+same source refuses activation with `writer_registration_required`, and the
+suggestion names that claim and the database-only alternative. Preview
+activation with `--confirm-quiesced --dry-run`, then, only when approved:
+
+```bash
+gbrain sources writer activate --brain host --confirm-quiesced \
+  --admin-intent writer_activate --expected-state <reviewed-admin-state> --json
+```
+
+`--confirm-quiesced` remains an attestation about all hosts, not a way to bypass the
+intent and state checks. Explicit noninteractive provisioning uses the same
+procedure and preconditions. A transfer still requires the prepared epoch and an
+exact successor manifest; stale heartbeats never authorize takeover.
+
+<a id="transfer-cancel"></a>**Ending a transfer nobody accepts.** `transfer prepare` drains the
+worktree and records `prepared_at` with the manifest; until the successor accepts, maintenance,
+fence repair, managed repair roots and lifecycle changes refuse `owner_unavailable` /
+`transfer_in_progress` (`wait`, then `ask_user` once the drain is 30 minutes old). On the owner
+host, `gbrain sources writer transfer cancel <source> --expected-epoch <n> --admin-intent
+writer_transfer_cancel --expected-state <admin_state>` (preview with `--dry-run`) takes the
+coordination lock, requires the worktree draining at that epoch under this owner, sets it back to
+`active` and clears the prepared manifest; the epoch is kept, so an accept bound to it refuses
+`writer_transfer_conflict`, and the owner may prepare again. Nothing cancels a transfer on its own.
+
+**Content receipts follow the root.** An accept and a `sources set-path` rebind the shared-skills
+content receipt of every moved gbrain-owned content source (nested sources by relative path) in
+their own transaction and report them as `content_receipts`; a receipt an older release left
+behind is rebound by `gbrain repair content-receipt-root` ([repair guide](../guides/repair.md#content-receipt-root)).
+
+<a id="transfer-manifest-scope"></a>**What the manifest covers.** In a Git checkout, the transfer, `sources
+set-path` (rebind), clone and reclone manifest covers the files Git tracks
+(`git ls-files --cached`), hashed from their bytes in the working tree; a
+tracked file missing on disk counts as deleted (#6099). Files Git ignores (such
+as `.env.local` or `node_modules`) are never opened, hashed or stored, and never
+need copying: a clean `git clone` of the same commit verifies. Untracked files
+that Git does not ignore are not covered; `transfer prepare` reports how many as
+`untracked_files` with a warning to commit or ignore them. Git runs with the
+checkout's own hooks, fsmonitor and submodule recursion disabled. Symlinks and
+submodules refuse with `writer_manifest_unsafe`. A directory that is not the top
+of its own Git work tree keeps the exact-copy manifest over every file. A
+mismatch names the first differing paths for a local rebind (tracked paths only
+in a Git checkout). A transfer an older release prepared covers every file,
+ignored ones included; if the successor is a Git checkout and does not match,
+accept refuses `writer_manifest_rescope_required`: prepare the transfer again
+on the owner host instead of copying ignored files. Upgrading removes the
+per-file path and hash maps releases before v0.60.69 stored with prepared
+transfers and clone recovery records (migration v218); only digests and counts
+remain.
+
+Live, young or foreign legacy locks block activation regardless of expiry. For
+exact dead same-host holders only, preview with
+`--cleanup-dead-local-locks --dry-run` and explicitly opt in on the reviewed
+activation; preview never deletes locks. Do not use TTL alone as liveness proof.
+
+For same-owner physical-root drift, `transfer prepare --self-transfer` records
+the exact before-state and intended repair in a durable manifest; inspect a
+fresh status and use `transfer accept --self-transfer` with the new reviewed
+state and exact manifest. Both phases still require their corresponding
+`writer_transfer_prepare` or `writer_transfer_accept` intent and expected state.
+This is not an automatic takeover or a way to rewrite the original reservation
+owner. Wrong identity, changed tokens, malformed physical records or uncertain
+liveness refuse. The native lock derives from the database binding.
+
+```bash
+gbrain sources writer transfer prepare default --brain host --self-transfer \
+  --admin-intent writer_transfer_prepare --expected-state <reviewed-admin-state> --dry-run --json
+# After separate approval, rerun prepare without --dry-run; then inspect fresh status.
+gbrain sources writer transfer accept default --brain host --self-transfer \
+  --path /absolute/canonical/source --expected-epoch <prepared-epoch> \
+  --manifest <prepared-sha256> --admin-intent writer_transfer_accept \
+  --expected-state <fresh-reviewed-admin-state> --dry-run --json
+# After separate approval, rerun accept without --dry-run.
+```
+
+<a id="recreated-root"></a>**Recreated or moved canonical root (#5914).** A
+directory deleted and recreated at its recorded path (a restore from backup, a
+container rebuilt without its volume, a Migration Assistant copy) keeps its
+path but not its inode and birth time, so every verb refused
+`recovery_required`, self-transfer included. Two deliberate exits exist, and
+neither relaxes anything else:
+
+- *Same path, new directory:* add `--confirm-relocated-root` to both
+  self-transfer phases. It waives only the inode and birth-time comparison, and
+  only when the token, brain id, worktree id, root and coordination path of the
+  stamp and the **outside-root reservation** all agree; a copied in-root stamp
+  without the reservation beside the root is never authority. Prepare records
+  `relocated: true` on the durable manifest, accept must repeat the flag (in
+  either direction it refuses `writer_transfer_conflict`), and the reservation
+  is rewritten through a compare-and-swap: a reservation someone else changed
+  between prepare and accept refuses with detail `stale_record`, so prepare
+  again from a fresh status. The flag without `--self-transfer` is a usage
+  error.
+- *Recorded path now a symlink to the moved checkout:* run
+  `gbrain sources set-path <source> <recorded-or-real-path>` on the owner host.
+  When the recorded path resolves to the target and the reservation under the
+  recorded name and the stamp inside the real directory agree on token, brain
+  id and worktree id, the worktree keeps its id: `local_path` and the host
+  binding move to the real directory, the reservation is written under the new
+  `sha256(root)` name, the old one is removed and the stamp names the new root.
+  A token or worktree mismatch keeps the refusal and moves nothing.
+
+`gbrain sources writer deactivate --dry-run` lists a `physical_root` blocker
+exactly when its real run would refuse: the managed run takes the strict
+worktree lock, so a recreated root blocks it until one of the exits above ran;
+the classic (pre-activation) release publishes nothing and needs only the
+native lock plus a reservation naming the worktree whose stamp carries the same
+token, so a recreated root does not block it but a token mismatch does.
+
+For containers, persist the canonical source root, its sibling-reservation
+parent, persistence home and stable lock/coordination directory together across
+recreation. Storage preflight reports each location and can identify Linux
+overlay/tmpfs backing, but a mount shown as present is **not** attested durable.
+When `GBRAIN_HOME` lies inside the checkout, the lock directory is not the persistence
+home (see [where the coordination lock lives](#coordination-lock)): set
+`GBRAIN_COORDINATION_HOME` to a mounted directory outside the checkout so the lock
+survives recreation, because the default `~/.gbrain/persistence` usually sits on the
+container's ephemeral filesystem.
+
+<a id="coordination-lock"></a>**Where the coordination lock lives.** Every
+canonical checkout has one native lock file that all of its writers share, and
+it never lives inside the checkout it protects (a copied checkout must not copy
+its lock). Claim, reservation, reclone and transfer choose it with one rule;
+the first match wins:
+
+1. `reservation`: the path the outside-root reservation
+   (`.gbrain-owner-<sha256(root)>.json` beside the root) already records. A
+   recorded path always wins over the environment, so two processes with
+   different settings still lock the same file.
+2. `binding`: on a transfer, the accepting host binding's recorded path, when it
+   is absolute, canonical and outside the successor checkout.
+3. `persistence_home`: `<persistence home>/locks/<worktree id>.lock`
+   (`$GBRAIN_HOME/.gbrain/persistence`, else `~/.gbrain/persistence`) when that
+   is outside the checkout. This is every ordinary layout.
+4. `coordination_home` / `home_default`: when the persistence home is inside the
+   checkout (`GBRAIN_HOME` is the checkout or lies inside it),
+   `$GBRAIN_COORDINATION_HOME/locks/<namespace>/<worktree id>.lock`, or the same
+   under `~/.gbrain/persistence` when the variable is unset. The namespace is a
+   hash of the canonical checkout path and the host id, so one shared fallback
+   directory can serve several checkouts and hosts.
+5. A result still inside the checkout (for example `GBRAIN_COORDINATION_HOME`
+   pointing into it through a symlink) refuses with `storage_error` before
+   anything is written.
+
+`GBRAIN_COORDINATION_HOME` must be an absolute path without `..` segments and is
+read only when rule 4 applies. It comes from the process environment only: a
+`.env` file in the working directory cannot set it (it is on the cwd `.env`
+quarantine list). `gbrain sources writer status --json` prints
+`onboarding.sources[].coordination_lock` with the resolved `path` and the `rule`
+that chose it; an unclaimed checkout without a reservation reports the
+`directory` a claim would use, and an unreadable setting reports `error`.
+
+<a id="coordination-home-ignored"></a>Because a recorded path wins, changing
+`GBRAIN_COORDINATION_HOME` after a checkout's reservation was written moves
+nothing: every process keeps locking the recorded file. When the variable applies
+to a checkout (rule 4) and names another directory than the recorded lock's,
+`writer status --json` adds `coordination_lock.coordination_home_ignored`
+(`configured_directory`, `recorded_path`, `move_step`) and doctor's
+`coordination_lock_location` warns with the same move step: make the recorded
+lock's directory survive container recreation (mount it), and unset the variable
+for that checkout's processes if it was meant to move the lock. No gbrain command
+relocates a recorded lock yet; never edit or delete the reservation to force one.
+
+A reservation written before this rule existed, for a checkout that contains
+`GBRAIN_HOME`, records its lock inside the checkout, so every claim refused with
+"The stable coordination lock must live outside the canonical checkout". Status
+marks it `old_path_wedge: true`. Upgrade, then run the claim again on the host
+that reserved it: the claim rewrites only the reservation's lock path (same
+token, brain, host and worktree), under a guard file beside the reservation. A
+reservation that names another brain or host, or a worktree the database
+already records, is left unchanged and keeps the refusal; that case needs
+verified writer recovery. Never delete the reservation to get past it.
+
+### Claim and activate runbook
+
+Activation is reversible through the [deactivate runbook](#deactivate-runbook)
+below, but treat deactivation as a planned mode conversion, not an undo. Take a
+database backup first: for Postgres, `pg_dump` the brain database; for PGLite,
+stop every gbrain process and copy the database directory.
+
+Quiesce every writer on every host that uses this database before activating:
+
+1. Stop `gbrain serve` (stdio and HTTP) on each host.
+2. Pause autopilot on each host with `gbrain autopilot pause --reason "writer activation"`
+   and confirm with `gbrain autopilot status`. The pause survives
+   `gbrain upgrade` and `gbrain autopilot --install`; `gbrain autopilot resume`
+   clears it afterwards.
+3. Stop `gbrain jobs work` workers and supervisors that are not autopilot's.
+4. Disable cron entries, Git hooks and harness hooks that run `gbrain sync`,
+   `embed`, `extract`, `dream` or `import`.
+5. Upgrade every remaining host to the gbrain version you activate with (v0.60.11.0
+   or newer), even ones you only read from.
+
+Then run the sequence, re-reading status between every step, because
+`admin_state` rotates after every change and a stale value refuses with
+`writer_admin_state_changed`:
+
+```bash
+gbrain sources writer status --brain host --json          # note admin_state
+gbrain sources writer claim default --brain host --path /absolute/canonical/source \
+  --admin-intent writer_claim --expected-state <admin_state> --json
+gbrain sources writer status --brain host --json          # fresh admin_state
+gbrain sources writer activate --brain host --confirm-quiesced --dry-run --json
+gbrain sources writer activate --brain host --confirm-quiesced \
+  --admin-intent writer_activate --expected-state <fresh admin_state> --json
+```
+
+After activation, managed sync requires `--no-pull` (new upstream commits come in
+through `gbrain sources refresh <source>`, the drained worktree-wide fast-forward,
+which runs inside a resident PGLite owner such as `gbrain serve` when one holds the brain;
+see [worktree refresh refusals](../guides/write-refusals.md#worktree-refresh-refusals)) and refuses `--skip-failed` and
+`--include-gitignored`; after fixing a failed item run
+the plain `gbrain sync --no-pull` with the same source and options (`--retry-failed` is a deprecated alias of it on a managed brain). Resume
+autopilot with `gbrain autopilot resume` and re-enable the hooks you stopped.
+
+When activation refuses with `writer_not_quiesced` because of queued work, the
+refusal names the blocking effect (effect id, kind, source, page and request id)
+and the command that inspects it, `gbrain sources writer status <source> --json`.
+A committed write whose embedding effect is stuck queued or failed is reported by
+`gbrain doctor` as `stale_embedding_effects` and settled by
+`gbrain repair embedding-effects --source <source>` (preview, then `--apply`).
+
+<a id="deactivate-runbook"></a>
+### Deactivate runbook
+
+`gbrain sources writer deactivate` converts the whole brain back to classic
+mode: classic writers, `gbrain sync` and older binaries then write as they did
+before managed mode. It is a planned mode conversion, not a proven rollback of
+everything that happened while managed. It keeps canonical files and database
+pages, retires every worktree (their rows stay so write receipts remain valid),
+removes source and host bindings, and records a committed `writer_deactivate`
+receipt. Shared-skill settings stay recorded but have no effect while the brain
+is classic. Reactivation is the normal claim and activate runbook above.
+
+**Say to your agent:** *"Switch this brain back to classic mode, but show me the
+dry run first."*
+
+<a id="pre-activation-claims"></a>**A source claimed before activation.** Claiming a source fences classic
+`gbrain sync` of it even while managed persistence was never activated, so sync
+refuses `writer_coordinator_required` (#6122). On such a brain, the dry run
+reports the claims as `pre_activation_claims` (with `source_bindings` counting
+them) and, when nothing blocks, an `apply_command`; running it releases every
+claim: the claimed worktrees are retired, source and host bindings are removed
+and a committed `writer_deactivate` receipt (`outcome.pre_activation: true`) is
+recorded. The brain stays classic and its mode epoch does not change; the next
+`gbrain sync` runs in classic mode, and the source can be claimed again later.
+The CLI writer registration that receipt needs is created if the brain has none
+yet, as activation would. The other choice is to finish the claim and activate
+runbook above.
+
+1. Quiesce every writer on every host, as for activation: stop `gbrain serve`,
+   pause autopilot with `gbrain autopilot pause --reason "writer deactivation"`,
+   and let queued writes finish.
+2. Back up: `pg_dump` the Postgres database, or stop gbrain and copy the PGLite
+   directory.
+3. Dry run: `gbrain sources writer deactivate --dry-run`. It lists each blocker
+   with its exit and what would change, and changes nothing. Blocker exits:
+   `gbrain cancel-write-request <request_id>` for a queued write,
+   `gbrain sync --source <id> --no-pull` for one that needs
+   recovery, waiting for the owner to drain a queued or running effect (a
+   links or facts-backstop effect that keeps failing settles after five
+   attempts; an embedding effect still queued after an hour is re-queued by
+   `gbrain repair embedding-effects --source <id>`), and
+   `gbrain sources writer unlock` for the writer admin lock. A terminally
+   failed effect does not block: the dry run lists it in `failed_effects` with
+   its code and the exit that retries it
+   (`gbrain sources writer retry-effects <source> --request-id <id> --dry-run`
+   for parked targets and failed Git, withdrawal, links and facts-backstop
+   effects, `gbrain repair embedding-effects --source <id>` for a failed
+   embedding effect, none for a zero-norm refusal or an effect whose source is
+   gone). Held Google or GitHub items do not block: deactivate
+   copies each source's managed holds into its classic state file
+   (`.google-source.json` or `.github-source.json`), so they stay held, retried
+   and reported in classic mode; the dry run lists them as `carried_holds`. Only
+   a source with no state directory, or with a classic state file that does not
+   parse, blocks; its exit is to move that file aside, or to resolve the holds
+   (`gbrain sources status <id>`, fix the cause, `gbrain sources retry-held <id>`,
+   `gbrain sync --source <id>`). A live connector or maintenance
+   lease means waiting for that run. A clean dry run prints `apply_command`,
+   the deactivate command bound to the state it reviewed.
+4. Deactivate: run the printed `apply_command`, or `gbrain sources writer status --json`
+   (note `admin_state`) and then
+   `gbrain sources writer deactivate --admin-intent writer_deactivate --expected-state <admin_state>`.
+   It takes no `<source>`: deactivation is brain-wide.
+5. Verify on every host: `gbrain sources writer status` reports `mode: classic`
+   and this host's `local_markers`: `cleared`, or `pending` with each path that
+   still needs attention. Binaries older than v0.60.20.0 honor local markers
+   without this cleanup, so run a v0.60.20.0 or newer command (for example
+   `gbrain sources writer status`) once on every other host before an older
+   binary writes there. That first command removes the markers and registry
+   records of the retired epoch; a marker from an unknown or newer epoch (for
+   example after restoring an older backup) is kept and reported.
+   On Postgres every filesystem source is now unbound: page writes refuse
+   `unbound_source`, and the write path is the file, a commit and
+   `gbrain sync` ([unbound sources](../guides/write-refusals.md#unbound-sources-on-postgres)).
+
+`min_writer_version` is not implemented: while the brain is managed, the database
+writer guard is the enforcement, and after deactivation that guard is inert.
+
+### Writer admin lock
+
+`gbrain sources writer lock` sets an opt-in, brain-level admin lock; while it
+is set, writer claim, activate, transfer prepare, accept and cancel refuse for
+every caller with `writer_admin_locked`, whose hint tells an agent to stop and
+ask the operator. Only these administrative changes are blocked: ordinary
+writes continue, including the automatic first-write claim on a PGLite brain.
+There is no `--force`; the escape hatch is the local unlock. Remote callers can
+neither lock nor unlock, and generic `gbrain config set`/`unset` (including
+`--pattern`) refuse the reserved key `persistence.writer_admin_lock`. Dry runs
+of the four operations refuse too. The lock guards against routine or accidental
+agent administration; it is not a security boundary against a caller with the
+same shell. Binaries older than v0.60.11.0 do not consult it.
+`gbrain sources writer status` shows `admin_lock` (whether it is set, when, and
+by which host) and the selected brain.
+
+To administer a locked brain, the operator runs, on the brain host:
+
+```bash
+gbrain sources writer unlock --brain host
+gbrain sources writer status default --brain host --json   # fresh admin_state
+# ... the reviewed claim, activate or transfer commands above ...
+gbrain sources writer lock --brain host
+```
+
+If administration fails midway, still run `gbrain sources writer lock` before
+investigating, so no agent can retry the change meanwhile. `lock` refuses with
+`writer_transfer_conflict` while a transfer is prepared but not accepted; accept
+it on the successor, or cancel it on the owner host with `gbrain sources writer
+transfer cancel <source> --expected-epoch <n>`, first. Shared-skill setup, which claims a checkout as
+administration rather than as an ordinary first write, is refused while locked.
+`lock` and `unlock` are idempotent and print the resulting state.
+
+### Git durability on a managed brain
+
+<a id="git-durability"></a>On a managed brain the persistence owner commits and
+pushes page writes through its Git effect; `gbrain sources push`, `sources
+harden` and `lint --fix` are not its Git writers and refuse with
+`writer_coordinator_required` naming this verb. Whether the owner commits is a
+recorded per-host-binding setting, `git_durability` (`on`, `off` or `unknown` in
+`writer status --json` and in `writer activate`'s listing):
+
+```bash
+gbrain sources writer status <source> --json                  # read git_durability and parked effects first
+gbrain sources writer git-durability <source> --enable --dry-run
+gbrain sources writer git-durability <source> --enable --admin-intent writer_git_durability --expected-state <admin_state>
+gbrain sources writer git-durability <source> --pat-file ~/.config/gbrain/pat --admin-intent writer_git_durability --expected-state <admin_state>
+gbrain sources writer git-durability <source> --disable --admin-intent writer_git_durability --expected-state <admin_state>
+```
+
+`--enable` runs a read-only `git push --dry-run` probe first (`git_branch_unborn`,
+`git_checkout_required` and `git_detached_head` refuse with the git step to take),
+records `enabled` on this host's binding and re-queues the Git effects completed
+`durability_not_enabled` while the setting was off, so the next worker pass commits
+and pushes them. `--pat-file` (a 0600 file; `pat_file_unreadable` otherwise) wires
+the repo-scoped push credential the same way `sources harden` does and retries this
+worktree's parked pushes. `--disable` records `disabled`; the effects complete
+`durability_not_enabled` and are re-queued by a later `--enable`. A binding with
+nothing recorded (`unknown`) keeps consulting the legacy post-commit hook, and a
+probe that cannot read the checkout fails the effect instead of skipping it. Only
+the host that owns the binding can change it (`writer_registration_required`
+elsewhere), and never during a pending recovery or transfer
+(`recovery_required`). The setting is not a backup: the owner still never pulls
+or rebases the checkout.
+
+<a id="files-that-are-not-pages"></a>**Files that are not pages.** The owner's
+Git effect commits only the page paths it wrote (`git commit --only`) and then
+pushes HEAD. Everything else in the checkout (`MEMORY.md`, daily notes,
+`AGENTS.md`, scripts) is the operator's: commit it with
+`gbrain git commit-push -m "<msg>" -- <paths>`, which commits only those paths
+under the checkout's commit lock (`committed_local`) and never fetches, pushes
+or moves the checkout. Those commits reach the remote on the owner's next
+push, because the owner pushes HEAD, or sooner with
+`gbrain git commit-push --push-only --keep-checkout` from the checkout; `gbrain sources push` refuses on a managed root and its secret scan
+does not run on a hand push. A hand push and the owner's push race only by
+ordinary Git semantics (both push the same HEAD; a push the remote rejects is
+retried by the owner and, after repeated failures, parked, which
+`writer status --json` shows). Never
+`git pull --rebase`, `git reset` or `git checkout` page paths in the checkout: <!-- gbrain-allow-shared-tree-git: names what never to run -->
+the owner never pulls, and moving files under it is what `source_changed`
+guards against; bring remote commits in with `gbrain sources refresh <source>`.
+The durability block `sources harden` writes into `AGENTS.md`/`RESOLVER.md`
+before activation says the opposite (run the push helper after every write,
+pull before writing), so `writer git-durability <source> --enable` and
+`--pat-file` rewrite that block in place to the managed variant (#5808); the
+preview reports it as `agents`, the rewrite touches nothing outside the
+markers, and the file is left for you to commit.
+
+### Supported managed work and explicit repair
+
+Once active, ordinary authorized local atom extraction, fact fences/backstop,
+synthesis, patterns and consolidation use journaled resident publication. Atom
+admission retains output for provider-free publication replay; a malformed
+extraction needs a separately approved retry identity. After inspecting the
+failed receipt, a trusted local operator can submit:
+
+```bash
+gbrain jobs submit extract-atoms-drain --params '{"sourceId":"default","retryRequestId":"<receipt-request-id>"}' --follow --max-attempts 1 --idempotency-key <unique-approval-key>
+```
+
+Replace the source and receipt with the inspected values and choose a unique
+approval key for that action. Inspect a submitted retry with `gbrain jobs get
+<job-id>` rather than resubmitting it. Completed submissions replay their result;
+a newly submitted job after failure is a new approval to attempt extraction.
+An approved malformed-output retry permits one new extraction attempt;
+publication retry reuses admitted output without another model call. Neither
+overrides source identity, changed content or grants. For a failed embedding
+effect, preview the exact original request first, then separately approve the
+same command without `--dry-run`:
+
+```bash
+gbrain sources writer retry-effects default --request-id <original-request-uuid> --dry-run --json
+```
+
+Only an unclaimed failed nonrecovering embedding effect is eligible. Current
+valid vectors reconcile without provider work; otherwise the additional
+allowance is one-shot and covers worker attempts, which may contain provider
+sub-batches. It remains bounded by selected-brain policy, original/current
+authority, source/page revision and effect CAS. This changes no canonical
+receipt, content or ownership. Healthy embedding work renews its token-guarded
+claim every ten seconds without holding a worktree lock or database transaction
+over provider work. Losing the claim cancels that invocation; the final
+installation still verifies its token. Caller cancellation, per-provider
+timeouts and budget admission remain effective without a whole-page deadline.
+
+The same command handles parked Git and withdrawal work. A target that fails five
+consecutive times is parked: its scan moves on, the effect never reports
+complete, and `gbrain doctor` (`parked_effects`) names the page with the exact
+command. Fix the cause, preview with `--dry-run`, then run it without
+`--dry-run` to authorize one more attempt per parked target. A target that fails
+again parks again; each invocation authorizes one attempt.
+
+Direct `--brain <mount>` retry uses only the selected database's validated active
+column and recorded model provenance for inspection and explicit queue approval.
+Unknown or inconsistent provenance refuses the action; the host brain's model
+and policy are never borrowed. The receipt identifies this as
+`approval: selected_database_provenance` and `execution: owner_file_and_database`.
+Queue approval is not permission to bypass the eventual owner's selected file
+configuration: both that configuration and the database `embedding_disabled`
+setting must permit each provider attempt and final installation. A disable in
+either effective policy stops further provider work. Existing valid vectors can
+still reconcile without a provider while embeddings are disabled.
+
+Fact NULL-vector backfill is a separate
+source-scoped preview/approved-cost operation in
+[embedding migrations](../embedding-migrations.md).
+
+Local enabled synthesis and patterns publish through the admitted page path;
+consolidation uses a single source-scoped take/fact transaction. A retired or
+resolved matching take is skipped, not silently reopened. Only world-visible
+facts backed by live non-private evidence are eligible for public consolidation;
+this is no guarantee that private facts will be consolidated. Remote maintenance
+authority is not added. Fence reconciliation (`dream --phase extract_facts`,
+including its expiry of deleted pages' facts), bulk `extract-conversation-facts`
+and `conversation_facts_backfill` run on managed brains: their database-only
+fact rows commit inside the coordinator's source capability under the page key,
+like derived links, without a persistence request per page. The phantom redirect
+publishes as two maintenance requests (`managed_maintenance_phantom_merge` on
+the canonical page, which moves the phantom's rows by id, then
+`managed_maintenance_phantom_delete` on the phantom). Direct fence writes,
+`loops_extract` commitments and other `writeSingleFact` callers publish through
+the `managed_facts_entity` intent. Each checks its local writer authority (and,
+for file publication, the canonical owner) before model calls. Receipt pages
+for these runs stay unmanaged-only. `unsupported_maintenance` in writer status
+and activation preview is empty, but that does not mean dream or job writers
+outside the lanes named above publish on a managed brain.
+
+Google and GitHub API sources route through managed connector checkpoints,
+not a Git cursor. A deliberately unbound API source uses reviewed
+`connector_database` DB-only authority; an existing bound source retains
+canonical file publication and physical-root fences. Activation/status expose
+that distinction, and neither mode invents a binding. Managed connector
+`--dry-run`, `--skip-failed`, and Git filtering/working-tree/code options refuse
+before credentials or network access rather than pretending to preview.
+After repairing a terminal connector storage failure, explicitly run
+`gbrain sync --source <connector-source-id> --retry-failed` with the same options.
+Ordinary replay does not reopen a failed receipt. Explicit retry authorizes a
+new, linked attempt after current and originally accepted grants, source,
+canonical owner and idle state are checked. The old receipt stays immutable,
+including after receipt compaction. A durable retry pointer is committed with
+the new admission; repeated or restarted calls reuse its pending attempt rather
+than granting another one. Retry does not reset the API bookmark or bypass
+canonical-file drift checks, and both connector cursors and retry pointers
+survive generic checkpoint TTL cleanup. A newly failed replacement requires
+another explicit retry after inspecting and repairing its cause; cancelled
+receipts are not retry-approved. No connector API data is fetched before the
+source/owner and active-work preflight, although deriving exact matching input
+can require a normal API fetch before retry approval.
+For PGLite, `dream` and `jobs --follow` need exclusive engine access:
+stop the resident owner and any supervisor using their normal shutdown path,
+wait for writes to drain, run the inline command, then restart the owner. The
+disk-brain CLI regression verifies refusal with a live owner, malformed-output
+recovery, idempotent replay and fresh readback after a clean restart. Do not
+disable persistence to bypass this, and do not confuse live fact-backfill IPC
+with live-owner dream delegation.
+
+## When NOT to use these topologies
+
+- **Don't use Topology 2 if your agent only ever runs on the same machine
+  as the brain.** A local `gbrain` install + `gbrain serve` (stdio) is
+  simpler and faster.
+- **Don't use Topology 3 if you only have one Conductor worktree at a
+  time.** Per-worktree engines exist to prevent contention; one-at-a-time
+  use has no contention.
+- **Don't use a `remote_mcp` thin client AND a local engine on the same
+  machine in the same `GBRAIN_HOME`.** The dispatch guard refuses DB-bound
+  commands when `remote_mcp` is set. If you genuinely want both modes on
+  one machine, use `GBRAIN_HOME` to separate them (one home for the thin
+  client, another for the local engine).
+
+## See also
+
+- `docs/guides/bootstrap.md` — `gbrain bootstrap`, the paved-road paste-in
+  install for Topology 1 with a desktop coding agent (interview, hooks,
+  MCP registration, verify).
+- `docs/architecture/brains-and-sources.md` — in-brain organization (brains
+  vs sources axes).
+- `docs/mcp/CLAUDE_DESKTOP.md` and siblings — per-client MCP setup.
+- `gbrain init --help` and `gbrain auth --help` for command-level details.
+- [`docs/tutorials/`](../tutorials/) — end-to-end walkthroughs that combine
+  these topologies into working setups (company brain, personal brain,
+  agent integration, etc.).

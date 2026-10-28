@@ -1,0 +1,1497 @@
+/**
+ * MinionSupervisor — Process manager for the Minion worker.
+ *
+ * Spawns `gbrain jobs work` as a child process and restarts it on crash
+ * with exponential backoff. Provides health monitoring, PID file locking
+ * (atomic via O_CREAT|O_EXCL), and graceful shutdown.
+ *
+ * ENGINE: Postgres only. PGLite uses an exclusive file lock that blocks
+ * any separate worker process, so `gbrain jobs supervisor` cannot work
+ * against a PGLite brain — `src/commands/jobs.ts` rejects that combination
+ * at the CLI layer. The health-check SQL below assumes Postgres schema.
+ *
+ * Usage:
+ *   gbrain jobs supervisor [--concurrency N] [--queue Q] [--pid-file PATH]
+ *                          [--max-crashes N] [--health-interval N]
+ *                          [--allow-shell-jobs] [--json]
+ *
+ * Design: the supervisor does NOT run the worker in-process. It spawns a
+ * separate child so a misbehaving handler can't take down the supervisor.
+ * Same isolation pattern as autopilot.ts but standalone and reusable.
+ *
+ * Exit codes (documented in CLI --help):
+ *   0 clean shutdown (SIGTERM/SIGINT received, worker drained)
+ *   1 max crashes exceeded (worker kept dying)
+ *   2 another supervisor holds the PID lock
+ *   3 PID file unwritable (permission / path error)
+ */
+
+import { detectTini } from './spawn-helpers.ts';
+import { OwnerProcessingState, type OwnerProcessingStatus } from './processing-state.ts';
+import { resolveDefaultMaxRssMb } from './rss-default.ts';
+import {
+  ChildWorkerSupervisor,
+  HARD_STOP_CRASH_MULTIPLIER,
+  type ChildSupervisorEvent,
+} from './child-worker-supervisor.ts';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeSync,
+} from 'fs';
+import { dirname, resolve } from 'path';
+import { hostname } from 'os';
+import type { BrainEngine } from '../engine.ts';
+import { tryAcquireDbLock, waitForDbLockTakeover, inspectLock, isLockHolderLive, type DbLockHandle } from '../db-lock.ts';
+import { currentBrainId, readWorkers, workerRegistryReadFailure } from './worker-registry.ts';
+import { autopilotOperatorPauseMarkerPath, autopilotPaused } from '../autopilot-paths.ts';
+import { gbrainPath } from '../config.ts';
+import { registerSignalOwner, triggerCleanupAndExit } from '../process-cleanup.ts';
+import { resolveEnvNumber } from '../env-number.ts';
+import { pidFileContents, processStartStamp } from './supervisor-pid.ts';
+
+export type SupervisorEvent =
+  | 'started'
+  | 'worker_spawned'
+  | 'worker_exited'
+  | 'worker_spawn_failed'
+  | 'backoff'
+  | 'health_warn'
+  | 'health_error'
+  | 'max_crashes_exceeded'
+  | 'shutting_down'
+  | 'stopped';
+
+export interface SupervisorEmission {
+  event: SupervisorEvent;
+  ts: string;
+  [key: string]: unknown;
+}
+
+export interface SupervisorOpts {
+  /** Worker concurrency (passed to child). Default: 2. */
+  concurrency: number;
+  /** Queue name (passed to child). Default: 'default'. */
+  queue: string;
+  /** PID file path. Default: `<gbrain home>/supervisor-<brain-id>.pid`, GBRAIN_HOME honoured (parent dir auto-created). */
+  pidFile: string;
+  /** Max consecutive crashes before giving up. Default: 10. */
+  maxCrashes: number;
+  /** Health check interval in ms. Default: 60000. */
+  healthInterval: number;
+  /** Path to the gbrain CLI executable (MUST be a compiled binary; .ts sources cannot be spawned). */
+  cliPath: string;
+  cliArgsPrefix?: string[];
+  /** Allow shell jobs on child worker. Default: false. When true, sets GBRAIN_ALLOW_SHELL_JOBS=1 on the
+   *  child env AND passes `--allow-shell-jobs` (buildWorkerArgs) so the worker's cwd-.env quarantine
+   *  cannot silently drop the opt-in. */
+  allowShellJobs: boolean;
+  /** JSON mode: emit JSONL events on stderr, reserve stdout for data payloads. Default: false. */
+  json: boolean;
+  /** RSS threshold (MB) passed to the spawned worker as `--max-rss N`.
+   *  When omitted, the constructor auto-sizes cgroup-aware via
+   *  resolveDefaultMaxRssMb() (issue #1678) instead of a flat default.
+   *  Set to 0 to spawn the worker without a watchdog. */
+  maxRssMb: number;
+  /** Niceness (issue #1815) the operator requested via `--nice` / `GBRAIN_NICE`,
+   *  or undefined to inherit. When set, the worker is spawned with `--nice N` so
+   *  it re-applies the value (the supervisor itself is reniced by the CLI layer,
+   *  before construction). The apply RESULT is computed in jobs.ts and passed in
+   *  here purely so the `started` audit event records what actually happened —
+   *  the supervisor does not call setPriority. */
+  nice_requested?: number;
+  /** Effective niceness of the supervisor process after its own renice attempt. */
+  nice_effective?: number;
+  /** issue #5: when 'process', the spawned worker runs each claimed job in a
+   *  SIGKILL-able child process (passed through as `--job-isolation process`).
+   *  Omitted/inline: today's shared-process execution. */
+  jobIsolation?: 'inline' | 'process';
+  /** Error string if the supervisor's own renice failed (e.g. EPERM). */
+  nice_error?: string;
+  /**
+   * issue #1801 — progress watchdog. When a child is alive but makes no forward
+   * progress on claimable work for this many minutes (waiting_claimable > 0 and
+   * active_healthy == 0 across `wedgeRestartChecks` consecutive health checks),
+   * the supervisor forcibly restarts it so the respawn rebuilds a fresh DB pool.
+   * Set to 0 to DISABLE the wedge watchdog. Default: 15.
+   */
+  wedgeRestartMinutes: number;
+  /** Consecutive wedged health checks required before a restart fires (hysteresis). Default: 3. */
+  wedgeRestartChecks: number;
+  /** Max wedge restarts inside `wedgeRestartLoopWindowMs` before the supervisor
+   *  stops restarting and emits `wedge_restart_loop` (alert-only — a dead-pool
+   *  wedge resolves in one restart; a loop means restart isn't the fix). Default: 3. */
+  wedgeRestartLoopBudget: number;
+  /** Sliding window for the wedge-restart loop breaker, ms. Default: 30 min. */
+  wedgeRestartLoopWindowMs: number;
+  /** After a (re)spawn, suppress wedge evaluation for this long so a fresh
+   *  worker gets a fair claim window before the wedge clock applies (the DB's
+   *  last_completed is still stale right after a restart). Default: 2× healthInterval. */
+  startupGraceMs: number;
+  /** Optional event sink (Lane C audit writer). Called for every lifecycle event. */
+  onEvent?: (event: SupervisorEmission) => void;
+  /**
+   * Test-only override: minimum backoff in ms between child respawns. Default: undefined
+   * (uses full `calculateBackoffMs()` curve). Tests pass `1` to make crash-loops finish
+   * in < 1s. Not exposed via CLI.
+   * @internal
+   */
+  _backoffFloorMs?: number;
+}
+
+export const DEFAULT_PID_FILE: string = (() => {
+  const envOverride = process.env.GBRAIN_SUPERVISOR_PID_FILE;
+  if (envOverride && envOverride.length > 0) return envOverride;
+  // #1849: key the default pidfile on the brain id so two DIFFERENT brains
+  // under one HOME don't share `supervisor.pid` and falsely block each other's
+  // pidfile guard. Derived from config (no DB connect), so it's safe to
+  // resolve at module load — `status`/`stop` need a cheap path before the
+  // engine connects. The queue-scoped DB lock (supervisorLockId) is the real
+  // singleton authority; this just removes the common-case footgun.
+  let brainId = 'default';
+  try { brainId = currentBrainId(); } catch { /* fallback 'default' */ }
+  return gbrainPath(`supervisor-${brainId}.pid`);
+})();
+
+const DEFAULTS: Omit<SupervisorOpts, 'cliPath'> = {
+  concurrency: 2,
+  queue: 'default',
+  pidFile: DEFAULT_PID_FILE,
+  maxCrashes: 10,
+  healthInterval: 60_000,
+  allowShellJobs: false,
+  json: false,
+  maxRssMb: 2048,
+  // issue #1801 progress-watchdog defaults. Conservative: a dead-pool wedge is
+  // caught faster by the worker's own DB probe (fix #2, ~3 min); this 15-min
+  // watchdog is the cause-agnostic backstop for non-DB wedges (stuck handler,
+  // deadlock) so it deliberately fires slower to avoid racing fix #2.
+  wedgeRestartMinutes: 15,
+  wedgeRestartChecks: 3,
+  wedgeRestartLoopBudget: 3,
+  wedgeRestartLoopWindowMs: 30 * 60_000,
+  startupGraceMs: 120_000, // overridden to 2× healthInterval in the constructor
+};
+
+/**
+ * Build the argv the supervisor uses to spawn `gbrain jobs work`. Extracted from
+ * runSuperviseLoop so it's unit-testable (issue #1815, Codex). Appends `--nice N`
+ * when the operator requested a niceness, alongside the existing concurrency /
+ * queue / max-rss flags. The spawned worker re-applies the niceness to itself;
+ * niceness also inherits to the worker's own children automatically.
+ */
+export function buildWorkerArgs(
+  opts: Pick<SupervisorOpts, 'concurrency' | 'queue' | 'maxRssMb' | 'nice_requested' | 'jobIsolation'> &
+    Partial<Pick<SupervisorOpts, 'allowShellJobs'>>,
+): string[] {
+  const args = [
+    'jobs', 'work',
+    '--concurrency', String(opts.concurrency),
+    '--queue', opts.queue,
+  ];
+  if (opts.maxRssMb > 0) {
+    args.push('--max-rss', String(opts.maxRssMb));
+  }
+  if (opts.nice_requested !== undefined) {
+    args.push('--nice', String(opts.nice_requested));
+  }
+  // Conditional push (issue #5): omitted for inline so existing deployments'
+  // argv is byte-identical (pinned by supervisor-build-worker-args.test.ts).
+  if (opts.jobIsolation === 'process') {
+    args.push('--job-isolation', 'process');
+  }
+  // Conditional push: the shell opt-in travels as a flag as well as env. The
+  // worker's startup cwd-.env quarantine (core/env-trust.ts) drops
+  // GBRAIN_ALLOW_SHELL_JOBS whenever a .env in the worker's cwd assigns it,
+  // so an env-only handoff could silently disable shell jobs; `jobs work`
+  // re-asserts the env from this flag after its preflight.
+  if (opts.allowShellJobs) {
+    args.push('--allow-shell-jobs');
+  }
+  return args;
+}
+
+/** Grace before SIGKILL when restarting a wedged child — reuses the 35s
+ *  shutdown() drain window (issue #1801, D3). */
+const WEDGE_RESTART_GRACE_MS = 35_000;
+/** #5062: shutdown drain window for the worker (its own 30s job drain + slack). */
+const WORKER_DRAIN_GRACE_MS = 35_000;
+/** #5062: how long to wait for the kernel to confirm a SIGKILLed worker. */
+const WORKER_KILL_CONFIRM_MS = 5_000;
+/** Shutdown reasons that come from an operator signal (always honored, even
+ *  when the owner is configuration-blocked). */
+const SIGNAL_REASONS: ReadonlySet<string> = new Set(['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGPIPE']);
+
+/**
+ * issue #1994: resolve the hard permanent-give-up ceiling. Default
+ * maxCrashes × HARD_STOP_CRASH_MULTIPLIER; operators override (or disable with
+ * 0 = never auto-stop) via GBRAIN_SUPERVISOR_HARD_STOP_CRASHES. A negative or
+ * non-integer override is ignored (falls back to the default).
+ */
+export function resolveHardStopMaxCrashes(maxCrashes: number): number {
+  const raw = process.env.GBRAIN_SUPERVISOR_HARD_STOP_CRASHES;
+  if (raw !== undefined && raw !== '') {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n >= 0) return n;
+  }
+  return maxCrashes * HARD_STOP_CRASH_MULTIPLIER;
+}
+
+/** Calculate backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s cap. */
+export function calculateBackoffMs(crashCount: number): number {
+  const base = Math.min(1000 * Math.pow(2, Math.max(crashCount, 0)), 60_000);
+  // Add 10% jitter
+  return base + Math.random() * base * 0.1;
+}
+
+/** Check if a PID is alive. */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * issue #1801 — queue + name-scoped wedge signals. Exported (with the SQL) so
+ * the FILTER semantics are testable against a real engine (PGLite) without
+ * spinning a supervisor process:
+ *   - `activeHealthy` counts only LIVE-lock active rows, so an expired-lock
+ *     active row (a worker that died mid-job) does NOT mask the wedge (Codex #6).
+ *   - `waitingClaimable` counts waiting OR due-delayed (delay_until <= now) rows
+ *     whose name the worker can claim — due-delayed because a dead pool means
+ *     promoteDelayed never ran (Codex #5/#7).
+ *   - `lastCompletedClaimable` is freshness of progress on claimable names only.
+ */
+export interface WedgeSignals {
+  stalled: number;
+  activeHealthy: number;
+  waiting: number;
+  waitingClaimable: number;
+  lastCompleted: Date | null;
+  lastCompletedClaimable: Date | null;
+}
+
+export async function queryWedgeSignals(
+  engine: BrainEngine,
+  queue: string,
+  handlerNames: string[],
+  opts?: { signal?: AbortSignal },
+): Promise<WedgeSignals> {
+  const rows = await engine.executeRaw<{
+    stalled: string;
+    active_healthy: string;
+    waiting: string;
+    waiting_claimable: string;
+    last_completed: string | null;
+    last_completed_claimable: string | null;
+  }>(
+    `SELECT
+       count(*) FILTER (WHERE status = 'active' AND lock_until < now())::text AS stalled,
+       count(*) FILTER (WHERE status = 'active' AND lock_until > now())::text AS active_healthy,
+       count(*) FILTER (WHERE status = 'waiting')::text AS waiting,
+       count(*) FILTER (WHERE (status = 'waiting'
+                          OR (status = 'delayed' AND delay_until <= now()))
+                         AND name = ANY($2::text[]))::text AS waiting_claimable,
+       max(updated_at) FILTER (WHERE status = 'completed')::text AS last_completed,
+       max(updated_at) FILTER (WHERE status = 'completed'
+                               AND name = ANY($2::text[]))::text AS last_completed_claimable
+     FROM minion_jobs
+     WHERE queue = $1`,
+    [queue, handlerNames],
+    opts,
+  );
+  const row = rows[0] ?? {
+    stalled: '0', active_healthy: '0', waiting: '0',
+    waiting_claimable: '0', last_completed: null, last_completed_claimable: null,
+  };
+  return {
+    stalled: parseInt(row.stalled ?? '0', 10),
+    activeHealthy: parseInt(row.active_healthy ?? '0', 10),
+    waiting: parseInt(row.waiting ?? '0', 10),
+    waitingClaimable: parseInt(row.waiting_claimable ?? '0', 10),
+    lastCompleted: row.last_completed ? new Date(row.last_completed) : null,
+    lastCompletedClaimable: row.last_completed_claimable
+      ? new Date(row.last_completed_claimable)
+      : null,
+  };
+}
+
+/**
+ * Submit-time queue truthfulness snapshot, attached to submit_job/submit_agent
+ * responses so a job id handed back over a dead lane stops meaning nothing.
+ * Every field is best-effort: a probe failure or timeout collapses to
+ * `{probe_failed: true}` and NEVER errors the (already enqueued, possibly
+ * paid) submission — the enqueue result stands on its own.
+ */
+export interface QueueSubmitState {
+  /** Waiting-job count on the target queue (includes the job just enqueued). */
+  depth?: number;
+  /** Age of the oldest waiting job on the queue, or null when depth is 0. */
+  oldest_waiting_age_seconds?: number | null;
+  /** A supervisor DB lock is live, a registered worker serves the queue, or a live-lock active job proves one exists. Absent when the worker registry is unreadable and nothing else proves a worker (liveness unknown). */
+  worker_alive?: boolean;
+  /** The autopilot pause marker is present — nothing will start until it clears. */
+  paused?: boolean;
+  /** Human-readable submit-time caution; absent when the lane looks healthy. */
+  warning?: string;
+  /** The probe itself failed or timed out; the other fields are absent. */
+  probe_failed?: boolean;
+}
+
+/** Total wall-clock budget for the whole submit-time probe. */
+export const QUEUE_PROBE_TIMEOUT_MS = 1500;
+
+/**
+ * Probe the health of a queue right after a job was enqueued on it.
+ *
+ * Composes three signals the codebase already computes elsewhere:
+ *   - `queryWedgeSignals` (depth + live-lock active evidence) plus the
+ *     doctor-style oldest-waiting age, generalized past embed-backfill;
+ *   - supervisor DB-lock liveness (`inspectLock`/`isLockHolderLive` on
+ *     `supervisorLockId(queue)` — the HOME-independent authority, #2227)
+ *     plus the host-local worker registry (standalone `gbrain jobs work`
+ *     holds no supervisor lock; the MCP server runs on the brain host);
+ *   - the autopilot pause marker (a paused system makes `worker_alive`
+ *     truthful-but-misleading on its own).
+ *
+ * Fail-open by contract: any throw or a `timeoutMs` overrun returns
+ * `{probe_failed: true}`. Warn-only — callers must never gate the enqueue
+ * on this result.
+ */
+export async function probeQueueState(
+  engine: BrainEngine,
+  queue: string,
+  handlerNames: string[],
+  opts: { timeoutMs?: number } = {},
+): Promise<QueueSubmitState> {
+  const timeoutMs = opts.timeoutMs ?? QUEUE_PROBE_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // issue #6 / TODOS "cancel timed-out submit-time queue probes": the losing
+  // inner probe used to keep running on the pool after the race resolved —
+  // under pool exhaustion the abandoned query held a slot and made the
+  // exhaustion worse. The timeout now aborts a per-probe signal so the
+  // in-flight SQL is cancelled (postgres.js .cancel()) and its slot released.
+  const probeAbort = new AbortController();
+  const timeout = new Promise<QueueSubmitState>((resolveTimeout) => {
+    timer = setTimeout(() => {
+      probeAbort.abort();
+      resolveTimeout({ probe_failed: true });
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      probeQueueStateInner(engine, queue, handlerNames, { signal: probeAbort.signal }),
+      timeout,
+    ]);
+  } catch {
+    return { probe_failed: true };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function probeQueueStateInner(
+  engine: BrainEngine,
+  queue: string,
+  handlerNames: string[],
+  opts?: { signal?: AbortSignal },
+): Promise<QueueSubmitState> {
+  const sig = await queryWedgeSignals(engine, queue, handlerNames, opts);
+
+  // Oldest-waiting age, same filter shape as the wedge signals. Perf: the
+  // wave's migration (landing in another lane) adds the btree
+  // (queue, status, updated_at) wedge index whose (queue, status) prefix
+  // covers this WHERE; until it lands, minion_jobs is small enough that a
+  // scan fits comfortably inside the probe's wall-clock budget.
+  const ageRows = await engine.executeRaw<{ age: number | string | null }>(
+    `SELECT EXTRACT(EPOCH FROM (now() - min(created_at)))::int AS age
+       FROM minion_jobs
+      WHERE queue = $1 AND status = 'waiting'`,
+    [queue],
+    opts,
+  );
+  const rawAge = ageRows[0]?.age ?? null;
+  const oldestAge = rawAge === null ? null : Number(rawAge);
+
+  let supervisorLive = false;
+  try {
+    const snap = await inspectLock(engine, supervisorLockId(queue));
+    supervisorLive = snap !== null && isLockHolderLive(snap, SUPERVISOR_LOCK_TTL_MIN);
+  } catch {
+    // Pre-migration brains lack the locks table — registry/active signals stand.
+  }
+  // An unreadable registry leaves the other signals standing, but their absence is then unknown liveness, not "no worker".
+  let registeredWorker = false, registryErrno: string | null = null;
+  try {
+    registeredWorker = readWorkers().some((w) => w.queue === queue);
+  } catch (e) { registryErrno = workerRegistryReadFailure(e).errno; }
+
+  const workerAlive = supervisorLive || registeredWorker || sig.activeHealthy > 0;
+  const livenessUnknown = !workerAlive && registryErrno !== null;
+  const paused = autopilotPaused();
+
+  // Same operator knob the doctor's queue_health depth check reads.
+  const threshold = resolveEnvNumber('GBRAIN_QUEUE_WAITING_THRESHOLD', 10);
+  const warnings: string[] = [];
+  if (paused) {
+    warnings.push(existsSync(autopilotOperatorPauseMarkerPath())
+      ? 'system paused by the operator (gbrain autopilot resume clears it) — job will not start until the pause clears'
+      : 'system paused for migration — job will not start until the pause clears');
+  }
+  if (livenessUnknown) warnings.push(`worker liveness unknown for queue '${queue}': the worker registry is unreadable (${registryErrno}); check gbrain jobs supervisor status`);
+  else if (!workerAlive) warnings.push(`no live worker detected for queue '${queue}' — job will wait until one starts (gbrain jobs work --queue ${queue})`);
+  if (sig.waiting > threshold) {
+    warnings.push(`waiting depth ${sig.waiting} exceeds GBRAIN_QUEUE_WAITING_THRESHOLD (${threshold})`);
+  }
+
+  const state: QueueSubmitState = {
+    depth: sig.waiting,
+    oldest_waiting_age_seconds: oldestAge,
+    ...(livenessUnknown ? {} : { worker_alive: workerAlive }),
+  };
+  if (paused) state.paused = true;
+  if (warnings.length > 0) state.warning = warnings.join('; ');
+  return state;
+}
+
+/** Exit codes for documented agent branching. */
+export const ExitCodes = {
+  CLEAN: 0,
+  MAX_CRASHES: 1,
+  LOCK_HELD: 2,
+  PID_UNWRITABLE: 3,
+  // #1849: the queue-scoped DB lock was lost mid-run (refresh failed past the
+  // threshold). Exit non-zero so the process manager restarts us cleanly
+  // rather than risk two live supervisors on one queue.
+  LOCK_LOST: 4,
+} as const;
+
+/**
+ * #1849: queue-scoped supervisor singleton DB lock.
+ *
+ * The pidfile guard is mutually exclusive only per pidfile PATH — two
+ * supervisors with different $HOME / --pid-file both acquire and run on the
+ * same (db, queue) with conflicting --max-rss. The DB lock makes the mutex
+ * domain match the protected resource (the database + queue), regardless of
+ * pidfile path. TTL > refresh-interval × max-failures so we always exit
+ * before our lock could lapse and let a second supervisor take over.
+ */
+// Exported (issue #2227) so observability surfaces (`gbrain jobs supervisor
+// status`, `gbrain doctor`) compute the lock-freshness steal grace with the
+// SAME TTL the supervisor refreshes against, when detecting a live supervisor
+// via the DB lock instead of the (possibly split-$HOME) pidfile.
+export const SUPERVISOR_LOCK_TTL_MIN = 5;
+const SUPERVISOR_LOCK_REFRESH_MS = 60_000;
+const SUPERVISOR_LOCK_REFRESH_MAX_FAILURES = 3; // 3 × 60s = 180s < 5min TTL
+
+/**
+ * #2308 — how long start() waits for a held queue lock to become takeable
+ * (dead cross-host holder whose TTL hasn't lapsed yet).
+ *   0            → disabled (pre-#2308 one-shot LOCK_HELD exit)
+ *   positive int → hard bound in seconds
+ *   unset/other  → -1 (waitForDbLockTakeover derives TTL + steal-grace + margin)
+ * Exported for tests.
+ */
+export function resolveSupervisorLockWaitSeconds(): number {
+  const raw = process.env.GBRAIN_SUPERVISOR_LOCK_WAIT_SECONDS;
+  if (raw !== undefined && raw !== '') {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n >= 0) return n;
+  }
+  return -1;
+}
+
+/**
+ * #1849: the queue-scoped supervisor singleton lock id. Keyed ONLY on the
+ * queue, because the lock ROW lives inside the target database — the (database)
+ * half of the mutex domain is physical, not part of the key. Keying on a
+ * config-derived DB identity (the prior `currentDbIdentity()`) was a bug: two
+ * supervisors pointed at the SAME physical database via different-but-equivalent
+ * URLs/config paths (pooler vs direct port, host alias, trailing params) hashed
+ * to different ids and BOTH acquired the "singleton" lock in the one shared
+ * locks table. Queue-only keying makes same-DB + same-queue collide correctly,
+ * while different physical databases never collide (separate locks tables).
+ * Exported so `gbrain doctor` queries the same row to surface the holder +
+ * effective --max-rss.
+ */
+export function supervisorLockId(queue: string): string {
+  return `gbrain-supervisor:${queue}`;
+}
+
+/**
+ * #1849 (doctor): pure classification of the supervisor singleton state from
+ * the DB lock holder vs the local pidfile holder. Compares host+pid (bare pid
+ * is meaningless across hosts/containers — Codex #25).
+ *
+ *   - `no_lock`  — no live lock holder (nothing to assert).
+ *   - `single`   — the live lock holder IS the local pidfile holder. Healthy.
+ *   - `mismatch` — a live lock holder differs from the local pidfile holder:
+ *                  a second supervisor likely ran with a different --max-rss. PR #6463: the same pid whose `pidfileHost`
+ *                  (recorded in the PID file at lock time) equals the lock holder's host is `single` despite a drifted `localHost`.
+ */
+export function classifySupervisorSingleton(args: {
+  lockLive: boolean;
+  lockHolderHost: string | null;
+  lockHolderPid: number | null;
+  localHost: string;
+  localPid: number | null;
+  pidfileHost?: string | null;
+}): 'no_lock' | 'single' | 'mismatch' {
+  if (!args.lockLive || args.lockHolderHost === null || args.lockHolderPid === null) {
+    return 'no_lock';
+  }
+  if (args.localPid === null || args.lockHolderPid !== args.localPid) return 'mismatch';
+  return args.lockHolderHost === args.localHost || (args.pidfileHost != null && args.lockHolderHost === args.pidfileHost) ? 'single' : 'mismatch';
+}
+
+export class MinionSupervisor {
+  private processingState: OwnerProcessingState | null = null;
+
+  get processingStatus(): OwnerProcessingStatus | null { return this.processingState?.snapshot ?? null; }
+
+  private get configurationBlocked(): boolean {
+    return this.processingState?.blocked ?? false;
+  }
+  private opts: SupervisorOpts;
+  private engine: BrainEngine;
+  /**
+   * Inner spawn-and-respawn core. Created lazily in `start()` so options
+   * passed via DEFAULTS merge are visible. Stays null when `stopping` is
+   * tripped before `start()` runs (test edge case).
+   */
+  private childSupervisor: ChildWorkerSupervisor | null = null;
+  /** Path to tini binary for zombie reaping, or empty string when absent. */
+  private readonly tiniPath: string;
+  private stopping = false;
+  private healthInFlight = false;
+  private healthTimer: ReturnType<typeof setInterval> | null = null;
+  private exitListener: (() => void) | null = null;
+  private sigtermListener: (() => void) | null = null;
+  private sigintListener: (() => void) | null = null;
+  private releaseSignalOwner: (() => void) | null = null;
+  private shutdownPromise: Promise<void> | null = null;
+  private lockAcquired = false;
+  private consecutiveHealthFailures = 0;
+  // #1849: queue-scoped DB singleton lock (the real authority) + its refresh
+  // timer and consecutive-failure counter (fail-safe exit before TTL lapse).
+  private dbLock: DbLockHandle | null = null;
+  private lockRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  private lockRefreshFailures = 0;
+  // issue #1801 progress-watchdog state.
+  /** Job names the spawned worker can actually claim. Derived once at start()
+   *  from registerBuiltinHandlers so the wedge scopes to real claimable work
+   *  (no false-positive on unhandled names). Empty = watchdog inert. */
+  private handlerNames: string[] = [];
+  /** Consecutive health checks that saw the wedge condition. */
+  private consecutiveWedgedChecks = 0;
+  /** Timestamps of recent wedge restarts (loop-breaker window). */
+  private wedgeRestartTimestamps: number[] = [];
+  /** Whether the `wedge_restart_loop` give-up alert has already fired for the
+   *  current exhausted window — so it emits once, not every health tick. Re-arms
+   *  when a real restart fires again (window drained below budget). */
+  private wedgeLoopAlerted = false;
+  /** True while a restartCurrentChild() is in flight (suppresses re-escalation). */
+  private escalationInFlight = false;
+  /** Wall-clock of the most recent child spawn (startup-grace anchor). */
+  private childStartedAt: number | null = null;
+
+  constructor(engine: BrainEngine, opts: Partial<SupervisorOpts> & { cliPath: string }) {
+    this.engine = engine;
+    this.opts = { ...DEFAULTS, ...opts };
+
+    // issue #1678 (Codex #4): when the caller didn't pin an explicit cap,
+    // auto-size cgroup-aware instead of the flat DEFAULTS.maxRssMb footgun.
+    // The CLI (jobs.ts supervisor) already resolves this and passes a concrete
+    // number; this covers direct-API / programmatic construction so the
+    // standalone supervisor never silently runs on the old 2048 default.
+    if (opts.maxRssMb === undefined) {
+      this.opts.maxRssMb = resolveDefaultMaxRssMb();
+    }
+
+    // issue #1801: default the startup grace to 2× the health interval so a
+    // freshly (re)spawned worker gets at least two health ticks to claim work
+    // before the wedge clock can fire. Honors an explicit override.
+    if (opts.startupGraceMs === undefined) {
+      this.opts.startupGraceMs = this.opts.healthInterval * 2;
+    }
+
+    // Detect tini for zombie reaping. Resolved once at construction so we
+    // don't shell out on every respawn. Belt-and-suspenders with the
+    // SIGCHLD handler in cli.ts — tini catches children spawned by native
+    // addons that bypass the JS event loop. ChildWorkerSupervisor detects
+    // independently; both calls hit the same `which tini` lookup.
+    this.tiniPath = detectTini();
+  }
+
+  /**
+   * Read-only accessor for whether tini was detected at construction.
+   * Used by `test/supervisor-tini.test.ts` to verify the wiring without
+   * exposing the resolved path. Returns true when `worker_spawned` events
+   * will include `tini: true` in their payload.
+   */
+  get isTiniDetected(): boolean {
+    return this.tiniPath !== '';
+  }
+
+  /**
+   * @internal Test seams for the issue #1801 wedge watchdog. The escalation
+   * state machine (counter / thresholds / startup grace / loop budget) is hard
+   * to exercise via the real spawn loop, so tests inject a fake child supervisor
+   * + wedge state and drive a single health check directly.
+   */
+  _setChildSupervisorForTests(
+    cs: Pick<ChildWorkerSupervisor, 'childAlive' | 'inBackoff' | 'restartCurrentChild'>,
+  ): void {
+    this.childSupervisor = cs as unknown as ChildWorkerSupervisor;
+  }
+  /** @internal */
+  _setWedgeStateForTests(s: { handlerNames?: string[]; childStartedAt?: number | null }): void {
+    if (s.handlerNames !== undefined) this.handlerNames = s.handlerNames;
+    if (s.childStartedAt !== undefined) this.childStartedAt = s.childStartedAt;
+  }
+  /** @internal Run one health check (the timer body) synchronously. */
+  async _healthCheckOnceForTests(): Promise<void> {
+    await this.healthCheck();
+  }
+  /** @internal */
+  get _consecutiveWedgedChecksForTests(): number {
+    return this.consecutiveWedgedChecks;
+  }
+  /** @internal */
+  get _wedgeRestartCountForTests(): number {
+    return this.wedgeRestartTimestamps.length;
+  }
+
+  /**
+   * Emit a lifecycle event. In JSON mode, writes a JSONL record to stderr.
+   * In human mode, writes a human-readable log line to stdout (info) or
+   * stderr (warn/error). Also calls `opts.onEvent` if set (Lane C audit
+   * writer hooks here).
+   */
+  private emit(event: SupervisorEvent, fields: Record<string, unknown> = {}): void {
+    const emission: SupervisorEmission = {
+      event,
+      ts: new Date().toISOString(),
+      ...fields,
+    };
+
+    if (this.opts.json) {
+      // stderr is the event channel; stdout stays clean for data (e.g., --detach payload).
+      try {
+        process.stderr.write(JSON.stringify(emission) + '\n');
+      } catch { /* best effort */ }
+    } else {
+      const ts = emission.ts.slice(11, 19);
+      const detail = Object.entries(fields)
+        .filter(([k]) => k !== 'event' && k !== 'ts')
+        .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
+        .join(' ');
+      const isWarn = event === 'health_warn' || event === 'health_error' ||
+                     event === 'worker_spawn_failed' || event === 'max_crashes_exceeded';
+      const line = `[supervisor ${ts}] ${event}${detail ? ' ' + detail : ''}`;
+      if (isWarn) {
+        console.warn(line);
+      } else {
+        console.log(line);
+      }
+    }
+
+    // Audit sink (Lane C plumbs this).
+    if (this.opts.onEvent) {
+      try { this.opts.onEvent(emission); } catch { /* best effort */ }
+    }
+  }
+
+  /** Start the supervisor. Blocks until stopped or max crashes exceeded. */
+  async start(): Promise<void> {
+    // 1. PID file lock (atomic via O_CREAT|O_EXCL).
+    const lockResult = this.acquirePidLock();
+    if (lockResult === 'held') {
+      // Another supervisor owns the lock — exit code 2.
+      process.exit(ExitCodes.LOCK_HELD);
+    }
+    if (lockResult === 'unwritable') {
+      // PID path isn't writable — exit code 3 with helpful hint.
+      process.exit(ExitCodes.PID_UNWRITABLE);
+    }
+
+    this.processingState = new OwnerProcessingState('supervisor', resolve(this.opts.pidFile));
+
+    // 2. Cleanup on process exit (covers any exit path including process.exit).
+    //    Installed BEFORE the DB-lock acquisition below: acquirePidLock just
+    //    wrote OUR pid into the pidfile, so any early `process.exit` after this
+    //    point (notably the LOCK_HELD path in 1b) MUST clean it up or it leaves
+    //    a stale pidfile that blocks the next start on this path. The listener
+    //    only unlinks when the file still holds our pid, so it's a no-op on the
+    //    'held'/'unwritable' paths above (those never created our pidfile).
+    this.exitListener = () => {
+      this.processingState?.close();
+      try {
+        if (existsSync(this.opts.pidFile)) {
+          const contents = readFileSync(this.opts.pidFile, 'utf8').trim().split('\n')[0];
+          if (contents === String(process.pid)) {
+            unlinkSync(this.opts.pidFile);
+          }
+        }
+      } catch { /* best effort */ }
+    };
+    process.on('exit', this.exitListener);
+
+    // 1b. #1849: queue-scoped DB singleton lock — the REAL authority. A second
+    // supervisor with a different $HOME / --pid-file passes the pidfile check
+    // above but loses here, so it can't run a conflicting --max-rss worker on
+    // the same (db, queue). Keyed on the queue alone; the database half of the
+    // mutex is physical (the lock row lives in this DB).
+    this.dbLock = await tryAcquireDbLock(this.engine, this.supervisorLockId(), SUPERVISOR_LOCK_TTL_MIN);
+    if (!this.dbLock) {
+      // #2308: a DEAD holder on ANOTHER host leaves a row whose TTL is still
+      // live — tryAcquireDbLock correctly refuses to steal it (cross_host),
+      // but a one-shot exit here turns a self-healing condition (the row is
+      // takeable after TTL + steal-grace) into an operator page. Wait,
+      // bounded, for the takeover; bail fast when the holder's heartbeat
+      // advances (a genuinely live supervisor). CROSS-HOST holders only:
+      // same-host liveness is already probed by tryAcquireDbLock's
+      // auto-takeover (a dead local holder was reclaimed above; a live one
+      // should keep the immediate LOCK_HELD exit).
+      // GBRAIN_SUPERVISOR_LOCK_WAIT_SECONDS=0 disables the wait (pre-#2308
+      // one-shot behavior); a positive value overrides the derived TTL+grace bound.
+      const waitSeconds = resolveSupervisorLockWaitSeconds();
+      let holderIsCrossHost = false;
+      if (waitSeconds !== 0) {
+        try {
+          const snap = await inspectLock(this.engine, this.supervisorLockId());
+          holderIsCrossHost = snap !== null && snap.holder_host !== hostname();
+        } catch { /* stay one-shot on inspect failure */ }
+      }
+      if (waitSeconds !== 0 && holderIsCrossHost) {
+        console.error(
+          `Supervisor queue lock for '${this.opts.queue}' is held (possibly by a dead ` +
+          `process on another host). Waiting up to ${waitSeconds > 0 ? waitSeconds : 'TTL+grace'}s ` +
+          `for the holder to expire or heartbeat; set GBRAIN_SUPERVISOR_LOCK_WAIT_SECONDS=0 to exit immediately.`,
+        );
+        this.dbLock = await waitForDbLockTakeover(
+          this.engine,
+          this.supervisorLockId(),
+          SUPERVISOR_LOCK_TTL_MIN,
+          {
+            ...(waitSeconds > 0 ? { maxWaitMs: waitSeconds * 1000 } : {}),
+            onWait: ({ snapshot, waitedMs, maxWaitMs }) => {
+              const holder = snapshot
+                ? `pid=${snapshot.holder_pid} host=${snapshot.holder_host}`
+                : 'holder row gone';
+              console.error(
+                `[supervisor] still waiting for queue lock '${this.opts.queue}' ` +
+                `(${holder}, waited ${Math.round(waitedMs / 1000)}s of ${Math.round(maxWaitMs / 1000)}s)`,
+              );
+            },
+          },
+        );
+        if (this.dbLock) {
+          console.error(`[supervisor] queue lock '${this.opts.queue}' taken over from expired holder.`);
+        }
+      }
+    }
+    if (!this.dbLock) {
+      console.error(
+        `Supervisor already running for queue '${this.opts.queue}' on this database ` +
+        `(another supervisor holds the queue lock, regardless of pidfile path). Exiting.`,
+      );
+      // The exit listener installed above removes the pidfile we just created.
+      process.exit(ExitCodes.LOCK_HELD);
+    }
+    // Refresh the lock on its own timer (independent of healthInterval, which
+    // can be 0/disabled) so the TTL never lapses while we're alive.
+    this.lockRefreshTimer = setInterval(() => { void this.refreshDbLock(); }, SUPERVISOR_LOCK_REFRESH_MS);
+
+    // 3. Signal handlers (tracked refs; removed on shutdown for test lifecycle hygiene).
+    this.sigtermListener = () => { void this.shutdown('SIGTERM', ExitCodes.CLEAN); };
+    this.sigintListener = () => { void this.shutdown('SIGINT', ExitCodes.CLEAN); };
+    process.on('SIGTERM', this.sigtermListener);
+    process.on('SIGINT', this.sigintListener);
+    // #5062: own the CLI's termination signals so the generic cleanup pass
+    // (which DELETEs this supervisor's lock row and exits 143) cannot pre-empt
+    // the drain above.
+    this.releaseSignalOwner = registerSignalOwner('jobs-supervisor', (signal) => {
+      void this.shutdown(signal, ExitCodes.CLEAN);
+    });
+
+    // 4. Health monitoring. Skip when healthInterval=0 — that's the explicit
+     // "disable" contract documented on `--health-interval 0`. setInterval(0)
+     // would be a tight DB-hammering loop, not the no-op users expect.
+    if (this.opts.healthInterval > 0) {
+      this.healthTimer = setInterval(() => { void this.healthCheck(); }, this.opts.healthInterval);
+    }
+
+    // 5. Announce start.
+    this.emit('started', {
+      supervisor_pid: process.pid,
+      ...processStartStamp('supervisor_start', process.pid),
+      // Resolved to absolute at emit time (relative to THIS process's cwd,
+      // the only context in which a relative --pid-file was meaningful) so a
+      // later reader (e.g. `gbrain doctor`, possibly running from a
+      // different cwd) doesn't misresolve it. `this.opts.pidFile` itself
+      // stays as-given for this process's own reads/writes below, which are
+      // already correctly relative to this same cwd.
+      pid_file: resolve(this.opts.pidFile),
+      concurrency: this.opts.concurrency,
+      queue: this.opts.queue,
+      max_crashes: this.opts.maxCrashes,
+      // #1849: record the EFFECTIVE --max-rss so `gbrain doctor` can surface
+      // the cap a rogue second supervisor would have fought over.
+      max_rss_mb: this.opts.maxRssMb,
+      // Niceness (issue #1815): record requested + effective so doctor/status can
+      // surface a failed renice even for a detached supervisor whose stderr is gone.
+      ...(this.opts.nice_requested !== undefined ? { nice_requested: this.opts.nice_requested } : {}),
+      ...(this.opts.nice_effective !== undefined ? { nice_effective: this.opts.nice_effective } : {}),
+      ...(this.opts.nice_error ? { nice_error: this.opts.nice_error } : {}),
+    });
+
+    // 6. Derive the claimable job-name set for the wedge watchdog (issue #1801).
+    //    Done before the loop so the first health check can scope correctly.
+    await this.deriveHandlerNames();
+
+    // 7. Run the supervise loop (respawn on crash, bounded by maxCrashes).
+    await this.runSuperviseLoop();
+    if (this.configurationBlocked) await new Promise<void>(() => {});
+  }
+
+  /**
+   * issue #1801: derive the exact set of job names the spawned worker can claim,
+   * by running the real `registerBuiltinHandlers` against a throwaway worker (never
+   * started — no timers, no DB) and reading `registeredNames`. Zero duplication vs
+   * a hand-maintained constant, and it auto-tracks every future handler (Codex
+   * #16). Lazy-imported to avoid the supervisor.ts ↔ jobs.ts / worker.ts import
+   * cycle. On any failure the watchdog stays inert (empty names → waiting_claimable
+   * is always 0 → no restart) rather than risk a misscoped kill — the worker's own
+   * DB probe (fix #2) still covers the dead-pool case.
+   */
+  private async deriveHandlerNames(): Promise<void> {
+    try {
+      const [{ MinionWorker }, { registerBuiltinHandlers }] = await Promise.all([
+        import('./worker.ts'),
+        import('../../commands/jobs.ts'),
+      ]);
+      const probe = new MinionWorker(this.engine, {
+        queue: this.opts.queue,
+        healthCheckInterval: 0,
+      });
+      // `shell` is always registered regardless of allowShellJobs (the env only
+      // gates execution), so registeredNames is a static set — `quiet` just
+      // suppresses the informational startup lines during derivation.
+      await registerBuiltinHandlers(probe, this.engine, { quiet: true });
+      this.handlerNames = [...probe.registeredNames];
+    } catch (e) {
+      this.handlerNames = [];
+      this.emit('health_warn', {
+        reason: 'wedge_watchdog_inert',
+        error: e instanceof Error ? e.message : String(e),
+        queue: this.opts.queue,
+      });
+    }
+  }
+
+  /**
+   * Unified shutdown path. Reason becomes the audit event name; exitCode is
+   * process exit. #5062: every caller (repeated signals included) joins the
+   * same promise. The ordered sequence is: stop restarts (and, via
+   * `stopping`, health actions), keep refreshing the singleton lock while the worker drains (a second
+   * supervisor cannot start mid-drain), stop the worker (SIGTERM, 35s drain,
+   * SIGKILL by liveness, confirmed exit), release the lock, emit `stopped`
+   * with whether the worker actually drained, then run the remaining cleanup
+   * callbacks and exit.
+   */
+  private shutdown(reason: string, exitCode: number): Promise<void> {
+    if (this.configurationBlocked && !SIGNAL_REASONS.has(reason)) return Promise.resolve();
+    this.shutdownPromise ??= this.runShutdown(reason, exitCode);
+    return this.shutdownPromise;
+  }
+
+  private async runShutdown(reason: string, exitCode: number): Promise<void> {
+    this.stopping = true;
+
+    this.emit('shutting_down', { reason, exit_code: exitCode });
+
+    // Stop the worker: SIGTERM, drain window, SIGKILL by liveness, then wait
+    // for the kernel to confirm the kill.
+    const child = this.childSupervisor;
+    const hadWorker = child?.childAlive === true;
+    let forced = false;
+    let workerGone = true;
+    if (child) {
+      child.killChild('SIGTERM');
+      await child.awaitChildExit(WORKER_DRAIN_GRACE_MS);
+      if (child.childAlive) {
+        forced = true;
+        child.killChild('SIGKILL');
+        await child.awaitChildExit(WORKER_KILL_CONFIRM_MS);
+      }
+      workerGone = !(child as ChildWorkerSupervisor).childAlive;
+    }
+    const workerExit = hadWorker ? child?.lastExit ?? null : null;
+    if (this.configurationBlocked && !SIGNAL_REASONS.has(reason)) {
+      this.stopping = false;
+      this.shutdownPromise = null;
+      return;
+    }
+
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = null;
+    }
+
+    // #1849: stop refreshing + release the DB singleton lock so a clean
+    // restart (or a different host) can re-acquire immediately instead of
+    // waiting out the TTL. release() is best-effort; the TTL covers a crash.
+    // #5062: only now, after the worker is gone; the refresh timer kept the
+    // lock alive through the drain.
+    if (this.lockRefreshTimer) {
+      clearInterval(this.lockRefreshTimer);
+      this.lockRefreshTimer = null;
+    }
+    let lockReleased = this.dbLock === null;
+    if (this.dbLock) {
+      const lock = this.dbLock;
+      this.dbLock = null;
+      try { await lock.release(); lockReleased = true; } catch { /* best-effort; TTL fallback covers it */ }
+    }
+
+    // Remove signal handlers so tests that spin up multiple supervisors on
+    // the same process don't accumulate listeners. `process.on('exit', ...)`
+    // is kept registered — it needs to fire synchronously on the final exit.
+    if (this.sigtermListener) {
+      process.removeListener('SIGTERM', this.sigtermListener);
+      this.sigtermListener = null;
+    }
+    if (this.sigintListener) {
+      process.removeListener('SIGINT', this.sigintListener);
+      this.sigintListener = null;
+    }
+    this.releaseSignalOwner?.();
+    this.releaseSignalOwner = null;
+
+    // A worker that needed SIGKILL, is still alive, or exited with anything
+    // but a clean drain did not drain: `jobs supervisor stop` reads this flag.
+    const drained = !hadWorker || (!forced && workerGone && workerExit?.code === 0);
+    this.emit('stopped', {
+      reason,
+      exit_code: exitCode,
+      drained,
+      worker_forced: forced,
+      worker_exit_code: workerExit?.code ?? null,
+      worker_signal: workerExit?.signal ?? null,
+      lock_released: lockReleased,
+    });
+    await triggerCleanupAndExit(exitCode);
+  }
+
+  /** #1849: the queue-scoped DB lock id for this supervisor's queue. */
+  private supervisorLockId(): string {
+    return supervisorLockId(this.opts.queue);
+  }
+
+  /** @internal Test seam: inject a fake DB lock to drive refresh-failure paths. */
+  _setDbLockForTests(lock: DbLockHandle | null): void {
+    this.dbLock = lock;
+  }
+  /** @internal Test seam: run one refresh tick synchronously. */
+  async _refreshDbLockForTests(): Promise<void> {
+    await this.refreshDbLock();
+  }
+
+  /**
+   * #1849 (F1A): refresh the DB lock; FAIL SAFE on loss. If refresh keeps
+   * throwing, our TTL will eventually lapse and a second supervisor could take
+   * over the queue — the exact bug. So past the failure threshold (still well
+   * inside the TTL window) we stop claiming and exit non-zero; the process
+   * manager restarts a single clean supervisor. A single transient blip is
+   * tolerated (counter resets on the next success).
+   */
+  private async refreshDbLock(): Promise<void> {
+    if (!this.dbLock) return;
+    if (this.stopping) {
+      // #5062: still the singleton while the worker drains; a failed refresh
+      // here cannot start a second shutdown (the TTL still covers the drain).
+      try { await this.dbLock.refresh(); } catch { /* best-effort during drain */ }
+      return;
+    }
+    try {
+      const stillOwned = await this.dbLock.refresh();
+      if (this.configurationBlocked) return;
+      if (stillOwned === false) {
+        // W0 fix-wave (D5.10): the fenced refresh matched 0 rows — the lock
+        // was stolen or force-cleared. That is CERTAIN loss, not a blip:
+        // counting it toward the failure threshold (or worse, resetting the
+        // counter as a "success") would let two supervisors drain the same
+        // queue for up to two more refresh windows. Exit immediately; the
+        // process manager restarts a single clean supervisor.
+        this.emit('health_error', {
+          reason: 'supervisor_lock_lost',
+          detail: 'fenced refresh matched 0 rows (stolen or force-cleared)',
+          queue: this.opts.queue,
+        });
+        await this.shutdown('supervisor_lock_lost', ExitCodes.LOCK_LOST);
+        return;
+      }
+      this.lockRefreshFailures = 0;
+    } catch (e) {
+      this.lockRefreshFailures++;
+      if (this.configurationBlocked) return;
+      this.emit('health_warn', {
+        reason: 'supervisor_lock_refresh_failed',
+        consecutive_failures: this.lockRefreshFailures,
+        error: e instanceof Error ? e.message : String(e),
+        queue: this.opts.queue,
+      });
+      if (this.lockRefreshFailures >= SUPERVISOR_LOCK_REFRESH_MAX_FAILURES) {
+        this.emit('health_error', {
+          reason: 'supervisor_lock_lost',
+          queue: this.opts.queue,
+        });
+        await this.shutdown('supervisor_lock_lost', ExitCodes.LOCK_LOST);
+      }
+    }
+  }
+
+  /**
+   * Acquire PID file lock atomically via O_CREAT|O_EXCL.
+   *
+   * Returns:
+   *   'acquired'   — lock is ours, safe to proceed.
+   *   'held'       — another live supervisor owns the lock (exit code 2).
+   *   'unwritable' — can't write to the PID path (permission / missing parent, exit code 3).
+   */
+  private acquirePidLock(): 'acquired' | 'held' | 'unwritable' {
+    // Ensure parent directory exists. Idempotent; creates ~/.gbrain on fresh installs.
+    try {
+      mkdirSync(dirname(this.opts.pidFile), { recursive: true });
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'EEXIST') {
+        console.error(
+          `Cannot create PID file directory ${dirname(this.opts.pidFile)}: ${
+            err instanceof Error ? err.message : String(err)
+          }. Set GBRAIN_SUPERVISOR_PID_FILE or pass --pid-file to a writable location.`
+        );
+        return 'unwritable';
+      }
+    }
+
+    return this.tryAtomicCreate();
+  }
+
+  private tryAtomicCreate(): 'acquired' | 'held' | 'unwritable' {
+    try {
+      // O_CREAT | O_EXCL | O_WRONLY — fails with EEXIST if the file exists.
+      const fd = openSync(this.opts.pidFile, 'wx');
+      try {
+        writeSync(fd, pidFileContents());
+      } finally {
+        closeSync(fd);
+      }
+      this.lockAcquired = true;
+      return 'acquired';
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'EEXIST') {
+        // File exists — check if the owner is alive.
+        let existingPid = -1;
+        try {
+          const contents = readFileSync(this.opts.pidFile, 'utf8').trim().split('\n')[0];
+          existingPid = parseInt(contents, 10);
+        } catch { /* corrupt file */ }
+
+        if (!isNaN(existingPid) && existingPid > 0 && isProcessAlive(existingPid)) {
+          console.error(`Supervisor already running (PID: ${existingPid}). Exiting.`);
+          return 'held';
+        }
+
+        // Stale PID file — unlink and retry atomic create once.
+        try { unlinkSync(this.opts.pidFile); } catch { /* race with another stale-cleaner; retry will EEXIST again */ }
+        try {
+          const fd = openSync(this.opts.pidFile, 'wx');
+          try {
+            writeSync(fd, pidFileContents());
+          } finally {
+            closeSync(fd);
+          }
+          this.lockAcquired = true;
+          return 'acquired';
+        } catch (retryErr) {
+          const retryCode = (retryErr as NodeJS.ErrnoException)?.code;
+          if (retryCode === 'EEXIST') {
+            // Someone else won the race. Treat as held.
+            console.error(`Another supervisor took the PID lock during stale cleanup. Exiting.`);
+            return 'held';
+          }
+          console.error(
+            `Cannot write PID file ${this.opts.pidFile}: ${
+              retryErr instanceof Error ? retryErr.message : String(retryErr)
+            }`
+          );
+          return 'unwritable';
+        }
+      }
+
+      console.error(
+        `Cannot write PID file ${this.opts.pidFile}: ${
+          err instanceof Error ? err.message : String(err)
+        }. Set GBRAIN_SUPERVISOR_PID_FILE or pass --pid-file to a writable location.`
+      );
+      return 'unwritable';
+    }
+  }
+
+  /**
+   * Run the supervise loop. Constructs a ChildWorkerSupervisor with the
+   * D1 lastExitCode classifier + D2 clean-restart budget baked in, then
+   * defers spawn/respawn/backoff to it. Maps the inner ChildSupervisorEvent
+   * stream to MinionSupervisor's existing SupervisorEvent emit() channel
+   * so JSONL audit consumers see byte-compatible output.
+   */
+  private async runSuperviseLoop(): Promise<void> {
+    const workerArgs = buildWorkerArgs(this.opts);
+
+    // Build child env. Explicit handling for GBRAIN_ALLOW_SHELL_JOBS:
+    // inherit only when caller opts in, otherwise strip from the clone.
+    const env: Record<string, string | undefined> = { ...process.env };
+    if (this.opts.allowShellJobs) {
+      env.GBRAIN_ALLOW_SHELL_JOBS = '1';
+    } else {
+      delete env.GBRAIN_ALLOW_SHELL_JOBS;
+    }
+    // Signal to the child worker that it's running under a supervisor.
+    // issue #1801: the worker's DB-liveness probe STILL runs under supervision
+    // (it's the only "is MY pool dead" signal; the supervisor watches a
+    // different connection). This env var only makes the worker skip its STALL
+    // detection — the supervisor's progress watchdog owns forward-progress.
+    env.GBRAIN_SUPERVISED = '1';
+
+    this.childSupervisor = new ChildWorkerSupervisor({
+      processingState: this.processingState ?? undefined,
+      onConfigurationBlocked: (status) => {
+        this.emit('health_error', {
+          reason: 'configuration_blocked',
+          reason_code: status?.reason_code ?? null,
+          queue: this.opts.queue,
+        });
+      },
+      cliPath: this.opts.cliPath,
+      args: [...(this.opts.cliArgsPrefix ?? []), ...workerArgs],
+      env,
+      maxCrashes: this.opts.maxCrashes,
+      // issue #1994: hard permanent-give-up ceiling (the runaway backstop).
+      // Operators can raise/lower or disable (0 = never auto-stop) via
+      // GBRAIN_SUPERVISOR_HARD_STOP_CRASHES; default is maxCrashes × 10.
+      hardStopMaxCrashes: resolveHardStopMaxCrashes(this.opts.maxCrashes),
+      _backoffFloorMs: this.opts._backoffFloorMs,
+      isStopping: () => this.stopping,
+      onMaxCrashesExceeded: (count, max) => {
+        this.emit('max_crashes_exceeded', {
+          crash_count: count,
+          max_crashes: max,
+        });
+        void this.shutdown('max_crashes', ExitCodes.MAX_CRASHES);
+      },
+      onEvent: (event) => this.relayChildEvent(event),
+    });
+
+    await this.childSupervisor.run();
+  }
+
+  /**
+   * Map ChildSupervisorEvent (the inner core's emission shape) to the
+   * existing SupervisorEvent emit channel. The wire shape of audit JSONL
+   * is unchanged — same event names, same field names, same payload
+   * coverage. The `reason='budget_exceeded'` backoff variant is a new
+   * additive field; pre-existing consumers ignore unknown fields.
+   */
+  private relayChildEvent(event: ChildSupervisorEvent): void {
+    switch (event.kind) {
+      case 'worker_startup_timeout':
+        this.emit('health_error', { reason: 'worker_startup_timeout', timeout_ms: event.timeoutMs, queue: this.opts.queue });
+        return;
+      case 'worker_spawned':
+        // issue #1801: anchor the startup grace + reset the wedge counter so a
+        // fresh child is judged on its own forward progress, not the prior
+        // (possibly wedged) one's stale DB state.
+        this.childStartedAt = Date.now();
+        this.consecutiveWedgedChecks = 0;
+        this.emit('worker_spawned', {
+          pid: event.pid >= 0 ? event.pid : undefined,
+          ...(event.pid >= 0 ? processStartStamp('pid_start', event.pid) : {}),
+          cli_path: this.opts.cliPath,
+          ...(event.tini ? { tini: true } : {}),
+          ...(this.opts.nice_requested !== undefined ? { nice: this.opts.nice_requested } : {}),
+        });
+        return;
+
+      case 'worker_spawn_failed':
+        this.emit('worker_spawn_failed', {
+          cli_path: this.opts.cliPath,
+          error: event.error,
+          phase: event.phase,
+          ...(event.errnoCode ? { code: event.errnoCode } : {}),
+        });
+        return;
+
+      case 'worker_exited': {
+        const exitReason = event.signal
+          ? `signal ${event.signal}`
+          : `code ${event.code ?? 'null'}`;
+        this.emit('worker_exited', {
+          pid: event.pid ?? null,
+          code: event.code,
+          signal: event.signal,
+          reason: exitReason,
+          likely_cause: event.likelyCause,
+          crash_count: event.crashCount,
+          max_crashes: this.opts.maxCrashes,
+          run_duration_ms: event.runDurationMs,
+        });
+        return;
+      }
+
+      case 'backoff':
+        this.emit('backoff', {
+          ms: event.ms,
+          crash_count: event.crashCount,
+          reason: event.reason,
+        });
+        return;
+
+      case 'health_warn':
+        this.emit('health_warn', {
+          reason: event.reason,
+          count: event.count,
+          window_ms: event.windowMs,
+          queue: this.opts.queue,
+          // issue #1678 (A3): the supervisor knows the --max-rss it spawned
+          // with; name it in the OOM-loop alert so the operator's fix
+          // ("raise --max-rss") is one glance away. Peak RSS stays in the
+          // worker's own stderr line (the supervisor never sees it).
+          ...(event.reason === 'rss_watchdog_loop' ? { max_rss_mb: this.opts.maxRssMb } : {}),
+          // issue #1994: degraded mode crossed the soft crash budget — surface
+          // it so doctor/status show "retrying with backoff" instead of silence.
+          ...(event.max !== undefined ? { max_crashes: event.max } : {}),
+        });
+        return;
+    }
+  }
+
+  /**
+   * Periodic health check — queries DB for queue health indicators.
+   *
+   * POSTGRES-ONLY. The supervisor cannot run against PGLite (exclusive
+   * file lock blocks the separate worker process). The CLI layer rejects
+   * that combination; we assume Postgres here.
+   *
+   * F9 guard: skip if a previous check is still in flight (hung DB
+   * connection shouldn't stack duplicate checks).
+   */
+  private async healthCheck(): Promise<void> {
+    if (this.healthInFlight || this.configurationBlocked || this.stopping) return;
+    if (this.processingState && !this.processingState.snapshot.processing_ready) return;
+    this.healthInFlight = true;
+
+    try {
+      const sig = await queryWedgeSignals(this.engine, this.opts.queue, this.handlerNames);
+      if (this.configurationBlocked || this.stopping) return;
+
+      // Reset consecutive failure counter on successful health check
+      this.consecutiveHealthFailures = 0;
+
+      const stalledCount = sig.stalled;
+      const activeHealthyCount = sig.activeHealthy;
+      const waitingCount = sig.waiting;
+      const waitingClaimableCount = sig.waitingClaimable;
+
+      const now = Date.now();
+      const minutesSinceCompletion = sig.lastCompleted
+        ? Math.round((now - sig.lastCompleted.getTime()) / 60_000)
+        : null;
+      const minutesSinceClaimable = sig.lastCompletedClaimable
+        ? Math.round((now - sig.lastCompletedClaimable.getTime()) / 60_000)
+        : null;
+
+      // F2 (per-threshold warns) — each is a distinct health_warn with reason.
+      if (stalledCount > 10) {
+        this.emit('health_warn', {
+          reason: 'stalled_jobs',
+          count: stalledCount,
+          queue: this.opts.queue,
+        });
+      }
+
+      if (waitingCount > 0 && minutesSinceCompletion !== null && minutesSinceCompletion > 30) {
+        this.emit('health_warn', {
+          reason: 'no_recent_completions',
+          waiting_count: waitingCount,
+          minutes_since_completion: minutesSinceCompletion,
+          queue: this.opts.queue,
+        });
+      }
+
+      // F4: suppress "worker not alive" warn while we're in the expected
+      // null-child window (crash-exit → backoff-sleep → next-spawn).
+      const cs = this.childSupervisor;
+      const workerAlive = cs !== null && cs.childAlive;
+      const inBackoff = cs !== null && cs.inBackoff;
+      if (!workerAlive && !this.stopping && !inBackoff) {
+        this.emit('health_warn', {
+          reason: 'worker_not_alive',
+          queue: this.opts.queue,
+        });
+      }
+
+      // issue #1801 — progress watchdog. A child that is ALIVE but makes no
+      // forward progress on claimable work is invisible to liveness checks
+      // (the dead-pool zombie that caused the 15h halt). Restart it so the
+      // respawn rebuilds a fresh DB pool.
+      //
+      //   - active_healthy === 0 is the real guard: a worker mid-job holds a
+      //     live lock (active_healthy > 0) and resets the counter; an expired-
+      //     lock active row does NOT suppress (Codex #6).
+      //   - waiting_claimable > 0: there is work THIS worker could claim
+      //     (name-scoped; incl. due-delayed) (Codex #5/#7).
+      //   - claimable progress is stale (or never happened) past the window.
+      //   - startup grace: a freshly (re)spawned worker gets a fair claim
+      //     window before the wedge clock applies (Codex #9/#10).
+      const childAgeMs = this.childStartedAt !== null ? now - this.childStartedAt : 0;
+      const pastStartupGrace = childAgeMs > this.opts.startupGraceMs;
+      const claimableStale =
+        minutesSinceClaimable === null || minutesSinceClaimable > this.opts.wedgeRestartMinutes;
+      const wedged =
+        this.opts.wedgeRestartMinutes > 0 &&
+        waitingClaimableCount > 0 &&
+        activeHealthyCount === 0 &&
+        claimableStale &&
+        workerAlive &&
+        !inBackoff &&
+        !this.stopping &&
+        !this.escalationInFlight &&
+        pastStartupGrace;
+
+      if (wedged) {
+        this.consecutiveWedgedChecks++;
+        if (this.consecutiveWedgedChecks >= this.opts.wedgeRestartChecks) {
+          await this.escalateWedgedWorker(waitingClaimableCount, minutesSinceClaimable);
+        }
+      } else {
+        this.consecutiveWedgedChecks = 0;
+      }
+    } catch (e) {
+      this.consecutiveHealthFailures++;
+      if (this.configurationBlocked || this.stopping) return;
+      const errMsg = e instanceof Error ? e.message : String(e);
+
+      if (this.consecutiveHealthFailures >= 3) {
+        // DB connection is likely dead. Emit a degraded warning.
+        this.emit('health_warn', {
+          reason: 'db_connection_degraded',
+          consecutive_failures: this.consecutiveHealthFailures,
+          error: errMsg,
+          queue: this.opts.queue,
+        });
+        // Attempt to reconnect the engine. #2034: reconnect() is now a
+        // first-class BrainEngine method on both engines (it restores the
+        // config captured at connect()), so call it directly — the old
+        // feature-detection cast is no longer needed.
+        try {
+          await this.engine.reconnect({ error: errMsg });
+          this.consecutiveHealthFailures = 0;
+          this.emit('health_warn', {
+            reason: 'db_reconnected',
+            queue: this.opts.queue,
+          });
+        } catch (reconnErr) {
+          this.emit('health_error', {
+            error: `reconnect failed: ${reconnErr instanceof Error ? reconnErr.message : String(reconnErr)}`,
+            reconnect_failed: true,
+            queue: this.opts.queue,
+          });
+        }
+      } else {
+        // Non-fatal single failure
+        this.emit('health_error', {
+          error: errMsg,
+          queue: this.opts.queue,
+        });
+      }
+    } finally {
+      this.healthInFlight = false;
+    }
+  }
+
+  /**
+   * issue #1801: forcibly restart an alive-but-wedged child. Bounded by a
+   * sliding-window loop budget — a dead-pool wedge resolves in exactly one
+   * restart (fresh process ⇒ fresh pool), so repeated restarts inside the
+   * window mean restart isn't the fix (e.g. a deterministically-failing
+   * handler); switch to alert-only via `wedge_restart_loop` instead of
+   * thrashing. The kill mechanics live in ChildWorkerSupervisor.restartCurrentChild
+   * (owns child identity + the intentional-restart crash accounting).
+   *
+   * Awaited inside healthCheck()'s try, so `healthInFlight` keeps the next
+   * health tick from overlapping the ~grace-bounded restart, and
+   * `escalationInFlight` keeps the wedge predicate from re-firing.
+   */
+  private async escalateWedgedWorker(
+    waitingClaimable: number,
+    minutesSinceCompletion: number | null,
+  ): Promise<void> {
+    if (this.configurationBlocked || this.stopping) return;
+    const cs = this.childSupervisor;
+    if (!cs) return;
+
+    const now = Date.now();
+    this.wedgeRestartTimestamps = this.wedgeRestartTimestamps.filter(
+      (t) => t > now - this.opts.wedgeRestartLoopWindowMs,
+    );
+    // `>=` so the budget is a real ceiling (the Nth restart is the last allowed,
+    // not the N+1th) — issue #1801 Codex #13.
+    if (this.wedgeRestartTimestamps.length >= this.opts.wedgeRestartLoopBudget) {
+      // Give up restarting (restart isn't fixing it). Alert ONCE on entry to
+      // the exhausted state — without this flag the wedge predicate re-fires
+      // every health tick for the whole window and floods the audit log with
+      // identical `wedge_restart_loop` warns. Reset the counter so the predicate
+      // doesn't busy-spin; the flag re-arms below once a real restart fires
+      // again (window drained below budget).
+      if (!this.wedgeLoopAlerted) {
+        this.wedgeLoopAlerted = true;
+        this.emit('health_warn', {
+          reason: 'wedge_restart_loop',
+          count: this.wedgeRestartTimestamps.length,
+          window_ms: this.opts.wedgeRestartLoopWindowMs,
+          waiting_claimable: waitingClaimable,
+          queue: this.opts.queue,
+        });
+      }
+      this.consecutiveWedgedChecks = 0;
+      return;
+    }
+
+    this.wedgeLoopAlerted = false; // re-arm: window has room, we're restarting
+    this.wedgeRestartTimestamps.push(now);
+    this.consecutiveWedgedChecks = 0;
+    this.escalationInFlight = true;
+    this.emit('health_warn', {
+      reason: 'restarting_wedged_worker',
+      waiting_claimable: waitingClaimable,
+      minutes_since_completion: minutesSinceCompletion,
+      consecutive_wedged_checks: this.opts.wedgeRestartChecks,
+      queue: this.opts.queue,
+    });
+    try {
+      await cs.restartCurrentChild(WEDGE_RESTART_GRACE_MS);
+    } finally {
+      this.escalationInFlight = false;
+    }
+  }
+}

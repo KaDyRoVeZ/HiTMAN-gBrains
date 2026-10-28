@@ -1,0 +1,319 @@
+/**
+ * MEMORY_VERBS v1 — `writeSingleFact`: the zero-LLM single-fact write seam
+ * behind the `remember` verb [E1].
+ *
+ * `runFactsPipeline` is extraction-first (LLM-gated in extract.ts) and cannot
+ * back a verb whose fact arrives pre-formed. This module reuses the pipeline's
+ * post-extraction stages directly: resolve → dedup (`decideSingleFact`: exact
+ * fingerprint, then embedding cosine at the model's calibrated
+ * threshold, supersession-threshold.ts) → fence-first
+ * write (markdown durability) with the same legacy DB-only fallbacks
+ * (thin-client, unparented, stub-guard). The `remember` verb itself routes
+ * through the coordinated write (`submitRememberMutation`); the production
+ * caller of this helper is loops extraction.
+ *
+ * Supersession [X1, frozen as implementation-defined]: minimal deterministic
+ * rule, zero LLM — when the top dedup candidate scores >= threshold with the
+ * SAME kind but DIFFERENT text, the new fact supersedes it (a near-duplicate
+ * with changed content is an update: "X at Acme" → "X left Acme"). Same text
+ * → plain duplicate (existing id returned, nothing written).
+ *
+ * Degradation (documented in the protocol doc): with no embedding provider,
+ * the semantic half of dedup/supersession is skipped and near-duplicates may
+ * insert — `degraded_dedup: true` tells the caller; the exact-fingerprint
+ * check always runs (#5152). The check runs before, not inside, the insert
+ * transaction, so dedup is sequential: two identical submissions racing each
+ * other may both insert.
+ *
+ * Entity (#5504): an unmanaged write never mints an unprefixed slug. When the
+ * resolver can only slugify the reference (`fallback_slugify`) the fact is
+ * stored with `entity_slug = NULL`, the convention the facts backstop and
+ * resolve-on-save follow, so the stub guard has nothing to refuse. The managed
+ * path keeps the fallback slug database-only (`attribute_fallback`), where the
+ * coordinated fact intent owns dedup per entity.
+ *
+ * Provenance (c6): callers pass free-text provenance which lands on
+ * `NewFact.source` verbatim — this seam deliberately does NOT take a
+ * FactsBackstopCtx (whose `source` union is pipeline-internal).
+ */
+
+import type { BrainEngine, FactInsertStatus, NewFact } from '../engine.ts';
+import { maintenanceTransaction } from '../persistence/attribution.ts';
+import { recordTaintEdges } from '../trust/taint.ts';
+import type { TaintInput, WriteTrust } from '../trust/tier.ts';
+import { recordFlaggedRow, type GatedRowDecision } from '../write-gate-store.ts';
+
+/**
+ * #4755: null-like entity tokens LLM extractors emit for subjectless
+ * statements. A caller passing the STRING "null" means what JSON `null`
+ * means — no entity. Without this filter the token sails past the
+ * non-empty check, fails resolution, falls back to itself as the slug,
+ * and the facts land unreachable under entity_slug='null' (the stub
+ * guard rightly refuses to create the page, so no page renders them and
+ * no entity lookup can reach them).
+ */
+const NULL_LIKE_ENTITY_TOKENS: ReadonlySet<string> = new Set([
+  'null', 'undefined', 'none', 'n/a', 'nil', '-',
+]);
+
+/** True when an entity ref is absent or a null-like placeholder token. */
+export function isNullLikeEntity(entity: string | null | undefined): boolean {
+  if (entity == null) return true;
+  const t = entity.trim().toLowerCase();
+  return t === '' || NULL_LIKE_ENTITY_TOKENS.has(t);
+}
+
+export interface SingleFactInput {
+  fact: string;
+  /** Free-text attribution, stored verbatim as the fact's `source`. */
+  provenance: string;
+  kind?: NewFact['kind'];
+  /** Free-form entity ref; canonicalized via resolveEntitySlugWithSource. */
+  entity?: string | null;
+  /** Facts-layer default 'private'; the remember VERB passes 'world' [F2]. */
+  visibility?: 'private' | 'world';
+  validUntil?: Date | null;
+  sessionId?: string | null;
+  confidence?: number;
+  /** #5575 I2: a deriver's taint (e.g. loops extraction from an email page); the new row gets its tier and input edges. */
+  derivation?: { trust: WriteTrust; inputs: readonly TaintInput[] };
+  /** #5575 B3: the caller's write-gate decision (an `insert`); a flag records its receipt on the new row. */
+  gate?: GatedRowDecision;
+  /**
+   * Caller trust for the dedup lookup. Fail-closed: only `false` (the local
+   * CLI, a local maintenance job) may dedup against a fact whose provenance
+   * page is private; anything else, including an unset value, treats such a
+   * fact as unseen and inserts.
+   */
+  remote?: boolean;
+}
+
+export interface SingleFactResult {
+  id: number;
+  status: FactInsertStatus;
+  entity_slug: string | null;
+  valid_until: Date | null;
+  /** True when no embedding was available: semantic dedup/supersession skipped; the exact-fingerprint check still ran. */
+  degraded_dedup: boolean;
+}
+
+export async function writeSingleFact(
+  engine: BrainEngine,
+  sourceId: string,
+  input: SingleFactInput,
+): Promise<SingleFactResult> {
+  const { managedPersistenceEnabled } = await import('../persistence/ownership.ts');
+  const managed = await managedPersistenceEnabled(engine);
+
+  const { resolveEntitySlugWithSource } = await import('../entities/resolve.ts');
+  const { decideSingleFact } = await import('./single-prepare.ts');
+  const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+  const { writeFactsToFence, lookupSourceLocalPath } = await import('./fence-write.ts');
+  const { isAvailable, embedOne, getEmbeddingModel } = await import('../ai/gateway.ts');
+
+  const factText = input.fact.trim();
+  const kind = input.kind ?? 'fact';
+  const visibility = input.visibility ?? 'private';
+  const validUntil = input.validUntil ?? null;
+  // #4755: normalize null-like entity refs to ABSENT before resolution so
+  // the `resolved?.slug ?? entityRef` fallback can never adopt "null" as a
+  // slug. Applied here (not only at the verb boundary) so every
+  // writeSingleFact caller (google/loops-extract, future verbs) gets the
+  // same guard.
+  const entityRef = isNullLikeEntity(input.entity) ? null : input.entity!.trim();
+  const resolved = entityRef
+    ? await resolveEntitySlugWithSource(engine, sourceId, entityRef)
+    : null;
+  // #5504: a slug the resolver invented is not an entity. Unmanaged writes
+  // store NULL (nothing for the stub guard to refuse); the managed intent keeps
+  // it database-only as attribution. Decided before the dedup lookup so the
+  // exact check keys on the entity the row will carry.
+  const fallbackResolution = resolved?.source === 'fallback_slugify';
+  const resolvedSlug = !entityRef ? null : fallbackResolution && !managed ? null : (resolved?.slug ?? entityRef);
+  // #4108: provenance for the fence writer's stub guard. Null when the
+  // resolver returned nothing (fail-closed — no live page was verified).
+  const resolutionSource = resolved?.source ?? null;
+
+  const { isFactWithdrawn } = await import('./withdrawal.ts');
+  if (await isFactWithdrawn(engine, sourceId, visibility, factText, resolvedSlug)) {
+    const { factWithdrawnRefusal } = await import('./single-prepare.ts');
+    throw await factWithdrawnRefusal(engine, sourceId, { fact: factText, kind, visibility, entity_slug: resolvedSlug },
+      { excludePrivate: await resolveExcludePrivatePages(engine, input.remote) });
+  }
+
+  // Embedding (NOT an LLM call): powers dedup + downstream recall. Fail-soft —
+  // a missing/failing provider degrades dedup, never the write.
+  let embedding: Float32Array | null = null;
+  let embeddingModel: string | null = null;
+  let degradedDedup = false;
+  const { factEmbeddingDisabled } = await import('../embedding-disabled.ts');
+  if (!await factEmbeddingDisabled(engine) && isAvailable('embedding')) {
+    try {
+      embeddingModel = getEmbeddingModel();
+      embedding = await embedOne(factText, { embeddingModel, inputType: 'document' });
+    } catch {
+      degradedDedup = true;
+    }
+  } else {
+    degradedDedup = true;
+  }
+
+  if (managed) {
+    // The coordinator's fact intent owns dedup, supersession, the fence row and
+    // the file on a managed brain; the legacy direct writes stay unmanaged. An
+    // entity with no page keeps its resolver slug database-only, as the
+    // unmanaged path stores it, so dedup is per entity.
+    const { publishManagedEntityFacts } = await import('./managed-fact-write.ts');
+    const written = await publishManagedEntityFacts(engine, sourceId, resolvedSlug, [{ fact: factText, kind, notability: 'medium',
+      source: input.provenance, visibility, confidence: input.confidence ?? 1.0, validFrom: new Date(), validUntil,
+      embedding, embedding_model: embeddingModel, sessionId: input.sessionId ?? null }], { supersede: true, attributeFallback: true, derivation: input.derivation });
+    const [stored] = await engine.executeRaw<{ entity_slug: string | null }>('SELECT entity_slug FROM facts WHERE id=$1', [written.ids[0]]);
+    return { id: written.ids[0], status: written.superseded ? 'superseded' : written.inserted ? 'inserted' : 'duplicate', entity_slug: stored?.entity_slug ?? null,
+      valid_until: validUntil, degraded_dedup: degradedDedup };
+  }
+
+  // Dedup + supersession decision (#5152): the same SQL-first decision the
+  // managed path and the backstop use. Exact fingerprint first (NULL-entity
+  // aware), then cosine when an embedding exists; a cosine match of the same
+  // kind is an update (X1), a different kind a duplicate. A private-sourced
+  // candidate is visible only to a trusted local caller.
+  let supersedeId: number | null = null;
+  const excludePrivate = await resolveExcludePrivatePages(engine, input.remote);
+  const decision = await decideSingleFact(engine, sourceId, { fact: factText, kind, visibility, entity_slug: resolvedSlug },
+    embedding, embeddingModel, input.provenance, { excludePrivate });
+  if (decision.status === 'duplicate') {
+    return {
+      id: decision.candidate!.id,
+      status: 'duplicate',
+      entity_slug: resolvedSlug,
+      valid_until: decision.candidate!.valid_until ?? null,
+      degraded_dedup: degradedDedup,
+    };
+  }
+  if (decision.status === 'superseded') supersedeId = decision.candidate!.id;
+
+  const newFact: NewFact = {
+    fact: factText,
+    kind,
+    entity_slug: resolvedSlug,
+    visibility,
+    source: input.provenance,
+    source_session: input.sessionId ?? null,
+    confidence: input.confidence ?? 1.0,
+    valid_until: validUntil,
+    embedding,
+    embedding_model: embedding ? embeddingModel : null,
+  };
+
+  // Fence-first write (markdown durability — same policy as the pipeline):
+  // requires a resolved, prefixed entity slug and a local_path. Everything
+  // else takes the legacy DB-only insertFact path, which also handles the
+  // supersedeId bookkeeping engine-side.
+  const localPath = resolvedSlug ? await lookupSourceLocalPath(engine, sourceId) : null;
+  const fenceable = resolvedSlug !== null && localPath !== null;
+
+  if (fenceable) {
+    const result = await writeFactsToFence(
+      engine,
+      { sourceId, localPath, slug: resolvedSlug, resolutionSource },
+      [
+        {
+          fact: factText,
+          kind,
+          notability: 'medium',
+          source: input.provenance,
+          context: null,
+          visibility,
+          confidence: input.confidence ?? 1.0,
+          validFrom: new Date(),
+          validUntil,
+          embedding,
+          embedding_model: embedding ? embeddingModel : null,
+          sessionId: input.sessionId ?? null,
+          ...(input.gate ? { gate: input.gate } : {}),
+        },
+      ],
+      input.derivation,
+    );
+
+    if (result.fenceWriteFailed) {
+      if (result.fenceRefusal) throw result.fenceRefusal;
+      // Parse-validate rejected the .tmp (quarantined). Hard failure — do NOT
+      // fall through to a DB row whose fence is broken (pipeline policy).
+      throw new Error(
+        `facts fence write failed for ${resolvedSlug} — .tmp quarantined; see the facts write-failure JSONL log`,
+      );
+    }
+    if (!result.stubGuardBlocked && !result.legacyFallback && !result.targetUnresolvable) {
+      const newId = result.ids[0];
+      if (supersedeId !== null && newId !== undefined) {
+        await expireSuperseded(engine, supersedeId, newId);
+        return {
+          id: newId,
+          status: 'superseded',
+          entity_slug: resolvedSlug,
+          valid_until: validUntil,
+          degraded_dedup: degradedDedup,
+        };
+      }
+      return {
+        id: newId,
+        status: 'inserted',
+        entity_slug: resolvedSlug,
+        valid_until: validUntil,
+        degraded_dedup: degradedDedup,
+      };
+    }
+    // stubGuardBlocked / legacyFallback (sync.write_through off, or the
+    // defensive null-localPath echo) / targetUnresolvable (#4204: source
+    // tree unusable) → DB-only path below.
+  }
+
+  const inserted = await maintenanceTransaction(engine, async tx => {
+    const row = await tx.insertFact(newFact, { // gbrain-allow-direct-insert: writeSingleFact legacy path for unparented / thin-client / stub-guarded facts (mirrors the pipeline's fallback buckets)
+      source_id: sourceId,
+      ...(supersedeId !== null ? { supersedeId } : {}),
+    });
+    if (row.status !== 'duplicate' && input.derivation) await recordTaintEdges(tx, { table: 'facts', id: row.id, sourceId }, input.derivation.inputs);
+    if (row.status !== 'duplicate' && input.gate) await recordFlaggedRow(tx, input.gate, { table: 'facts', id: row.id, sourceId });
+    return row;
+  }, input.derivation?.trust);
+
+  return {
+    id: inserted.id,
+    status: supersedeId !== null ? 'superseded' : inserted.status,
+    entity_slug: resolvedSlug,
+    valid_until: validUntil,
+    degraded_dedup: degradedDedup,
+  };
+}
+
+/**
+ * Fence-path supersession bookkeeping: strike the old row in the fence with a
+ * `superseded by #N` reference (strikethrough + valid_until) and link
+ * `superseded_by` for the audit trail. A supersession is an update, never a
+ * durable withdrawal: the old claim stays rememberable and no other page is
+ * invalidated. Both steps best-effort — the new fact is already durably
+ * written; a partial supersede is an audit gap, not data loss — but a
+ * failure is logged with both ids, never swallowed.
+ */
+async function expireSuperseded(engine: BrainEngine, oldId: number, newId: number): Promise<void> {
+  const report = (step: string, err: unknown) => console.warn(
+    `[facts.supersede] FACTS_SUPERSEDE_BOOKKEEPING_FAILED: ${step} for fact ${oldId} -> ${newId}: ${err instanceof Error ? err.message : String(err)}`,
+  );
+  try {
+    const { forgetFactInFence } = await import('./forget.ts');
+    const [replacement] = await engine.executeRaw<{ row_num: number | null; same_page: boolean }>(
+      `SELECT n.row_num, n.source_markdown_slug IS NOT DISTINCT FROM o.source_markdown_slug AS same_page
+         FROM facts n, facts o WHERE n.id = $1 AND o.id = $2`, [newId, oldId]);
+    const rowNum = replacement?.same_page && replacement.row_num !== null ? Number(replacement.row_num) : null;
+    await forgetFactInFence(engine, oldId, { supersededBy: { rowNum } });
+  } catch (err) {
+    report('fence strike', err);
+  }
+  try {
+    await maintenanceTransaction(engine, tx => tx.executeRaw(`UPDATE facts SET superseded_by = $1 WHERE id = $2`, [newId, oldId]));
+  } catch (err) {
+    report('superseded_by link', err);
+  }
+}

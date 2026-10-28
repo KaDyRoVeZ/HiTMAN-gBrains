@@ -1,0 +1,408 @@
+{
+ "main": {
+  "product": {
+   "package": "gbrain",
+   "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+   "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+   "version": "0.60.53.0",
+   "package_sha256": "f9ea5abe120986dffa9b8065b823c4c194931c848ea3af170ba72938824be109",
+   "loaded_git_head": "0ed580f7d97363a42d0525b5889f45ba2c85af0a"
+  },
+  "overlay_commit": null,
+  "world": {
+   "seed": 1,
+   "salted": false,
+   "pages": 32652,
+   "links": 77489,
+   "hubs": [
+    {
+     "slug": "companies/delta-3",
+     "target": 5000,
+     "realized": 5008
+    },
+    {
+     "slug": "companies/apple-4",
+     "target": 10000,
+     "realized": 10008
+    },
+    {
+     "slug": "companies/accel-5",
+     "target": 20000,
+     "realized": 20008
+    },
+    {
+     "slug": "companies/amazon-3",
+     "target": 30000,
+     "realized": 30008
+    }
+   ],
+   "inbound_quantiles": {
+    "p50": 7,
+    "p90": 149,
+    "p99": 20008,
+    "max": 30008
+   }
+  },
+  "config_readback": {
+   "32": {
+    "search.hub_dampening": "32",
+    "search.graph_signals": "true"
+   },
+   "100": {
+    "search.hub_dampening": "100",
+    "search.graph_signals": "true"
+   },
+   "200": {
+    "search.hub_dampening": "200",
+    "search.graph_signals": "true"
+   },
+   "600": {
+    "search.hub_dampening": "600",
+    "search.graph_signals": "true"
+   },
+   "off": {
+    "search.hub_dampening": "off",
+    "search.graph_signals": "true"
+   },
+   "graph-off": {
+    "search.hub_dampening": "off",
+    "search.graph_signals": "false"
+   }
+  },
+  "summary": {
+   "off:concept": {
+    "n": 428,
+    "ndcg_at_5": 0.3798790127090229,
+    "recall_at_5": 0.24685135736537636,
+    "hit_at_1": 0.37616822429906543,
+    "latency_p95_ms": 332.3799999999999
+   },
+   "off:hub-answer": {
+    "n": 20,
+    "ndcg_at_5": 0.9815464876785729,
+    "recall_at_5": 1,
+    "hit_at_1": 0.95,
+    "latency_p95_ms": 75.81000000000004
+   },
+   "off:bridge": {
+    "n": 32,
+    "ndcg_at_5": 0,
+    "recall_at_5": 0,
+    "hit_at_1": 0,
+    "latency_p95_ms": 515.98
+   },
+   "off:one-hop": {
+    "n": 145,
+    "ndcg_at_5": 0.5764884094453867,
+    "recall_at_5": 0.7398850574712644,
+    "hit_at_1": 0.3793103448275862,
+    "latency_p95_ms": 468.35999999999905
+   },
+   "32:concept": {
+    "n": 428,
+    "ndcg_at_5": 0.4102713408614539,
+    "recall_at_5": 0.2551290609701827,
+    "hit_at_1": 0.4439252336448598,
+    "latency_p95_ms": 304.09
+   },
+   "32:hub-answer": {
+    "n": 20,
+    "ndcg_at_5": 0.1963544202418024,
+    "recall_at_5": 0.4,
+    "hit_at_1": 0.05,
+    "latency_p95_ms": 46.515
+   },
+   "32:bridge": {
+    "n": 32,
+    "ndcg_at_5": 0,
+    "recall_at_5": 0,
+    "hit_at_1": 0,
+    "latency_p95_ms": 492.18
+   },
+   "32:one-hop": {
+    "n": 145,
+    "ndcg_at_5": 0.5700469313908735,
+    "recall_at_5": 0.7318390804597702,
+    "hit_at_1": 0.36551724137931035,
+    "latency_p95_ms": 463.3599999999993
+   },
+   "100:concept": {
+    "n": 428,
+    "ndcg_at_5": 0.4031340963945704,
+    "recall_at_5": 0.2524032042723634,
+    "hit_at_1": 0.42990654205607476,
+    "latency_p95_ms": 312.395
+   },
+   "100:hub-answer": {
+    "n": 20,
+    "ndcg_at_5": 0.15109557689252054,
+    "recall_at_5": 0.3,
+    "hit_at_1": 0.05,
+    "latency_p95_ms": 54.93
+   },
+   "100:bridge": {
+    "n": 32,
+    "ndcg_at_5": 0,
+    "recall_at_5": 0,
+    "hit_at_1": 0,
+    "latency_p95_ms": 492.795
+   },
+   "100:one-hop": {
+    "n": 145,
+    "ndcg_at_5": 0.5875601388949866,
+    "recall_at_5": 0.7387356321839081,
+    "hit_at_1": 0.4,
+    "latency_p95_ms": 464.97999999999905
+   },
+   "200:concept": {
+    "n": 428,
+    "ndcg_at_5": 0.39791175997560013,
+    "recall_at_5": 0.25218624833110836,
+    "hit_at_1": 0.4158878504672897,
+    "latency_p95_ms": 307.8099999999998
+   },
+   "200:hub-answer": {
+    "n": 20,
+    "ndcg_at_5": 0.15109557689252054,
+    "recall_at_5": 0.3,
+    "hit_at_1": 0.05,
+    "latency_p95_ms": 46.809999999999995
+   },
+   "200:bridge": {
+    "n": 32,
+    "ndcg_at_5": 0,
+    "recall_at_5": 0,
+    "hit_at_1": 0,
+    "latency_p95_ms": 490.81
+   },
+   "200:one-hop": {
+    "n": 145,
+    "ndcg_at_5": 0.5888306039315341,
+    "recall_at_5": 0.7398850574712644,
+    "hit_at_1": 0.4,
+    "latency_p95_ms": 461.69999999999914
+   },
+   "600:concept": {
+    "n": 428,
+    "ndcg_at_5": 0.39370269073403924,
+    "recall_at_5": 0.2504339118825102,
+    "hit_at_1": 0.4088785046728972,
+    "latency_p95_ms": 300.1649999999999
+   },
+   "600:hub-answer": {
+    "n": 20,
+    "ndcg_at_5": 0.15109557689252054,
+    "recall_at_5": 0.3,
+    "hit_at_1": 0.05,
+    "latency_p95_ms": 46.135000000000005
+   },
+   "600:bridge": {
+    "n": 32,
+    "ndcg_at_5": 0,
+    "recall_at_5": 0,
+    "hit_at_1": 0,
+    "latency_p95_ms": 487.075
+   },
+   "600:one-hop": {
+    "n": 145,
+    "ndcg_at_5": 0.5894841094104519,
+    "recall_at_5": 0.7412643678160921,
+    "hit_at_1": 0.41379310344827586,
+    "latency_p95_ms": 465.31999999999914
+   },
+   "graph-off:concept": {
+    "n": 428,
+    "ndcg_at_5": 0.3794892237818287,
+    "recall_at_5": 0.24607254116599941,
+    "hit_at_1": 0.37616822429906543,
+    "latency_p95_ms": 298.3399999999999
+   },
+   "graph-off:hub-answer": {
+    "n": 20,
+    "ndcg_at_5": 0.9815464876785729,
+    "recall_at_5": 1,
+    "hit_at_1": 0.95,
+    "latency_p95_ms": 44.785000000000004
+   },
+   "graph-off:bridge": {
+    "n": 32,
+    "ndcg_at_5": 0,
+    "recall_at_5": 0,
+    "hit_at_1": 0,
+    "latency_p95_ms": 486.64000000000004
+   },
+   "graph-off:one-hop": {
+    "n": 145,
+    "ndcg_at_5": 0.5391643665558398,
+    "recall_at_5": 0.6950574712643679,
+    "hit_at_1": 0.3448275862068966,
+    "latency_p95_ms": 459.53999999999917
+   }
+  },
+  "run_status": "completed"
+ },
+ "rival-remove": {
+  "product": {
+   "package": "gbrain",
+   "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+   "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+   "version": "0.60.53.0",
+   "package_sha256": "a6899e032ec282c1b1fa688b30efb309e4ce0cd526b1358c6124d002f3da56c5",
+   "loaded_git_head": "bdf04ed21c27ee77b3bad08df0e8cec9b10149af"
+  },
+  "overlay_commit": null,
+  "world": {
+   "seed": 1,
+   "salted": false,
+   "pages": 32652,
+   "links": 77489,
+   "hubs": [
+    {
+     "slug": "companies/delta-3",
+     "target": 5000,
+     "realized": 5008
+    },
+    {
+     "slug": "companies/apple-4",
+     "target": 10000,
+     "realized": 10008
+    },
+    {
+     "slug": "companies/accel-5",
+     "target": 20000,
+     "realized": 20008
+    },
+    {
+     "slug": "companies/amazon-3",
+     "target": 30000,
+     "realized": 30008
+    }
+   ],
+   "inbound_quantiles": {
+    "p50": 7,
+    "p90": 149,
+    "p99": 20008,
+    "max": 30008
+   }
+  },
+  "config_readback": {
+   "off": {
+    "search.hub_dampening": "off",
+    "search.graph_signals": "true"
+   }
+  },
+  "summary": {
+   "off:concept": {
+    "n": 428,
+    "ndcg_at_5": 0.44531191061917225,
+    "recall_at_5": 0.27587894971072563,
+    "hit_at_1": 0.4976635514018692,
+    "latency_p95_ms": 308.7699999999999
+   },
+   "off:hub-answer": {
+    "n": 20,
+    "ndcg_at_5": 0.8465338279036697,
+    "recall_at_5": 1,
+    "hit_at_1": 0.7,
+    "latency_p95_ms": 51.795
+   },
+   "off:bridge": {
+    "n": 32,
+    "ndcg_at_5": 0,
+    "recall_at_5": 0,
+    "hit_at_1": 0,
+    "latency_p95_ms": 498.46999999999997
+   },
+   "off:one-hop": {
+    "n": 145,
+    "ndcg_at_5": 0.48275447899307383,
+    "recall_at_5": 0.6298850574712643,
+    "hit_at_1": 0.27586206896551724,
+    "latency_p95_ms": 472.23999999999904
+   }
+  },
+  "run_status": "completed"
+ },
+ "rival-cap": {
+  "product": {
+   "package": "gbrain",
+   "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+   "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+   "version": "0.60.53.0",
+   "package_sha256": "b28806e00b0f6be28a17a6c2f29432604675b45478bf69b90ad41e678394456f",
+   "loaded_git_head": "b1cb1d0ea96296ed8e97305e168fff93a42655b0"
+  },
+  "overlay_commit": null,
+  "world": {
+   "seed": 1,
+   "salted": false,
+   "pages": 32652,
+   "links": 77489,
+   "hubs": [
+    {
+     "slug": "companies/delta-3",
+     "target": 5000,
+     "realized": 5008
+    },
+    {
+     "slug": "companies/apple-4",
+     "target": 10000,
+     "realized": 10008
+    },
+    {
+     "slug": "companies/accel-5",
+     "target": 20000,
+     "realized": 20008
+    },
+    {
+     "slug": "companies/amazon-3",
+     "target": 30000,
+     "realized": 30008
+    }
+   ],
+   "inbound_quantiles": {
+    "p50": 7,
+    "p90": 149,
+    "p99": 20008,
+    "max": 30008
+   }
+  },
+  "config_readback": {
+   "off": {
+    "search.hub_dampening": "off",
+    "search.graph_signals": "true"
+   }
+  },
+  "summary": {
+   "off:concept": {
+    "n": 428,
+    "ndcg_at_5": 0.4396213452025708,
+    "recall_at_5": 0.26979862038273283,
+    "hit_at_1": 0.4953271028037383,
+    "latency_p95_ms": 328.155
+   },
+   "off:hub-answer": {
+    "n": 20,
+    "ndcg_at_5": 0.8530803155822426,
+    "recall_at_5": 1,
+    "hit_at_1": 0.7,
+    "latency_p95_ms": 98.55500000000002
+   },
+   "off:bridge": {
+    "n": 32,
+    "ndcg_at_5": 0,
+    "recall_at_5": 0,
+    "hit_at_1": 0,
+    "latency_p95_ms": 501.78499999999997
+   },
+   "off:one-hop": {
+    "n": 145,
+    "ndcg_at_5": 0.4916331932066562,
+    "recall_at_5": 0.6350574712643677,
+    "hit_at_1": 0.30344827586206896,
+    "latency_p95_ms": 466.27999999999923
+   }
+  },
+  "run_status": "completed"
+ }
+}

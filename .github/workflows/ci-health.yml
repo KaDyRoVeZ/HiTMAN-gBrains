@@ -1,0 +1,79 @@
+name: CI health
+
+# CI health report (scripts/ci-health-report.ts; docs/ci-red-runbook.md#ci-health-report):
+# first-attempt pass rate of same-repository PR runs and push-to-master runs,
+# the exit criteria (met / missed / indeterminate), stress-gate failures,
+# failure classes, cancellation and completion coverage, master-red time to
+# first response, the nightly-watch residual, the test files with the most
+# failure annotations, shard spread with the weights miner command, new serial
+# files and nightly-watch's own status. Weekly on schedule; a dispatch with
+# since/until reports an explicit acceptance window (the day-8 check after a
+# wave merges) and opens a follow-up issue when a target is missed. Reads
+# runs, jobs, check-run annotations and issues only (no logs, no fork runs
+# or artifacts). nightly-watch watches this workflow like any scheduled one.
+# A second step writes the CI cost ledger (scripts/ci-cost-ledger.ts) to the
+# step summary: Ubicloud runner $/week by workflow, event and conclusion and
+# the median $/run of green Test and E2E runs against
+# scripts/ci-cost-baseline.json. It is report-only: a rise over 20% shows as
+# a warning annotation, never a red run.
+
+on:
+  schedule:
+    - cron: '0 10 * * 1'  # weekly, Monday 10:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the report instead of writing the issue
+        type: boolean
+        default: true
+      since:
+        description: Window start, YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ (UTC); empty = the last 7 days
+        type: string
+        default: ''
+      until:
+        description: Window end (inclusive day or timestamp, UTC); empty = now
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: ci-health
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+      checks: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+          # git history for the "serial files added this week" line.
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - name: Upsert the weekly CI health issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+          SINCE: ${{ inputs.since }}
+          UNTIL: ${{ inputs.until }}
+        run: |
+          set -euo pipefail
+          args=(--repo "$GITHUB_REPOSITORY")
+          [ -z "$SINCE" ] || args+=(--since "$SINCE")
+          [ -z "$UNTIL" ] || args+=(--until "$UNTIL")
+          [ -z "$DRY_RUN" ] || args+=("$DRY_RUN")
+          bun scripts/ci-health-report.ts "${args[@]}"
+      - name: CI cost ledger (report only)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/ci-cost-ledger.ts --repo "$GITHUB_REPOSITORY" --report-only --step-summary --max-requests 500

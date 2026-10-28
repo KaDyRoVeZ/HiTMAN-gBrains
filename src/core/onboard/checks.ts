@@ -1,0 +1,796 @@
+// src/core/onboard/checks.ts
+// sourcescope:file-brain-wide — every SQL site here is intentionally
+// brain-wide aggregate. The onboard checks REPORT across all sources
+// (orphan_count, stale_count, link_coverage, takes_count) so adding
+// source_id WHERE clauses would change the semantic. Per A26.
+//
+// v0.41.18.0 (A16, T4). Four new doctor checks consumed by both:
+//   - src/commands/doctor.ts runDoctor      (local surface)
+//   - src/core/doctor-remote.ts             (thin-client surface)
+//   - src/core/onboard/plan-from-checks.ts  (onboard remediation aggregator)
+//
+// Each helper is shaped: compute metric → return both Check entry (for
+// doctor render) and RemediationStep[] (for onboard's extra-remediation
+// plumbing per A2). Helpers stay PURE wrt config: no engine.connect, no
+// process.exit. SQL via engine.executeRaw with `sourceScopeOpts(ctx)`
+// when ctx threads — onboard surface threads explicitly per A26.
+
+import { embedBackfillFix } from '../embed-consent.ts';
+import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
+import type { BrainEngine } from '../engine.ts';
+import type { RemediationStep } from '../remediation-step.ts';
+import { makeRemediationStep } from '../remediation-step.ts';
+import { QUARANTINE_FILTER_FRAGMENT } from '../quarantine.ts';
+import { renderFragment, sqlFragment, trustedSql, type SqlFragment } from '../engine-sql/fragment.ts';
+import { entityTypePredicateSql, resolveEntityTypes, type EntityTypeFilter, type EntityTypeResolution } from '../schema-pack/entity-types.ts';
+import type { Action } from '../agent-output.ts';
+import { embeddingEnablement, type ReadinessState } from '../readiness.ts';
+import { embeddingsDisabled } from '../embedding-disabled.ts';
+import { loadConfig } from '../config.ts';
+import { MIN_ENTITY_PAGES_FOR_COVERAGE } from '../types.ts';
+import { ORPHANED_ALIAS_COUNTS_SQL, SOFT_DELETED_ALIAS_COUNT_SQL } from '../repair/aliases.ts';
+import { repairPreviewCommand } from '../repair/registry.ts';
+import { isMissingSchemaObject } from '../utils.ts';
+
+/** Shared shape returned by all four checks. */
+export interface OnboardCheckResult {
+  check: {
+    name: string;
+    status: 'ok' | 'warn' | 'fail';
+    message: string;
+    details?: Record<string, unknown>;
+    /** Agent contract v1 (doctor E1/E2): see src/commands/doctor/check-fix.ts. */
+    fix?: Action;
+    severity?: 'info';
+    readiness_state?: ReadinessState;
+  };
+  remediations: RemediationStep[];
+}
+
+/** Internal sql helper. Returns first row or empty object on throw. */
+async function safeCount(engine: BrainEngine, sql: string, params: unknown[] = []): Promise<number> {
+  try {
+    const result = await engine.executeRaw(sql, params);
+    const rows = (result as { rows?: Array<Record<string, unknown>> } | undefined)?.rows
+      ?? (result as Array<Record<string, unknown>> | undefined)
+      ?? [];
+    const row = rows[0] ?? {};
+    const raw = (row as Record<string, unknown>).count ?? (row as Record<string, unknown>).c ?? 0;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** #4772: a live, visible page whose type the active pack(s) declare as an entity, per source (the get_health predicate). */
+function visibleEntityPredicate(filter: EntityTypeFilter): SqlFragment {
+  return sqlFragment`${entityTypePredicateSql('p', filter)} AND p.deleted_at IS NULL AND ${trustedSql(QUARANTINE_FILTER_FRAGMENT)}`;
+}
+
+/**
+ * A pack in scope did not load, so the entity population is unknown: a warn
+ * with `entity_types_unavailable`, never a coverage read over an empty or
+ * legacy list.
+ */
+function entityTypesUnavailableResult(name: string, resolution: Extract<EntityTypeResolution, { status: 'pack_unavailable' }>): OnboardCheckResult {
+  const where = resolution.unresolved.filter(Boolean);
+  return {
+    check: {
+      name, status: 'warn',
+      message: `Entity types unknown: could not resolve the active schema pack${where.length ? ` for source${where.length > 1 ? 's' : ''} ${where.map((id) => `'${id}'`).join(', ')}` : ''}, so ${name} cannot be graded. Run \`gbrain schema active --json\` to debug.`,
+      details: { code: 'entity_types_unavailable', entity_types_status: 'pack_unavailable', unresolved_sources: where },
+      fix: { argv: ['gbrain', 'schema', 'active', '--json', ...(where.length ? ['--source', where[0]!] : [])], consent: [], actor: 'agent', requires_exclusive: false,
+        why: 'Read-only: shows which pack is active, the tier it comes from and why it did not load.', verify: { argv: ['gbrain', 'doctor', '--only', name, '--json'] } },
+    },
+    remediations: [],
+  };
+}
+
+/** Count the visible entity pages under `filter`. */
+async function countVisibleEntities(engine: BrainEngine, filter: EntityTypeFilter): Promise<number> {
+  const sql = renderFragment(sqlFragment`SELECT COUNT(*) AS count FROM pages p WHERE ${visibleEntityPredicate(filter)}`);
+  return safeCount(engine, sql.text, sql.params);
+}
+
+/**
+ * Coverage is a ratio over the visible entity population, and below
+ * MIN_ENTITY_PAGES_FOR_COVERAGE that ratio is noise: BrainHealth reports
+ * null there, so a warn from these checks would contradict it and could never
+ * be cleared by extraction. Returns the not-applicable `ok` result for an
+ * ungraded population, or null when the caller should compute coverage.
+ */
+function ungradedCoverageResult(name: string, entityPages: number): OnboardCheckResult | null {
+  if (entityPages >= MIN_ENTITY_PAGES_FOR_COVERAGE) return null;
+  const message = entityPages === 0
+    ? 'No entity pages — coverage check vacuous'
+    : `Only ${entityPages} entity ${entityPages === 1 ? 'page' : 'pages'} (< ${MIN_ENTITY_PAGES_FOR_COVERAGE}) — coverage ratio not meaningful at this scale`;
+  return { check: { name, status: 'ok', message }, remediations: [] };
+}
+
+export type CoverageFeature =
+  | { table: 'links'; pageIdColumn: 'to_page_id' }
+  | { table: 'timeline_entries'; pageIdColumn: 'page_id' };
+
+/** entity_link_coverage counts inbound links; timeline_coverage counts timeline entries. */
+export const LINK_COVERAGE_FEATURE: CoverageFeature = { table: 'links', pageIdColumn: 'to_page_id' };
+export const TIMELINE_COVERAGE_FEATURE: CoverageFeature = { table: 'timeline_entries', pageIdColumn: 'page_id' };
+
+/**
+ * One row `{ sample_size, matched }`: the visible entity pages (optionally
+ * TABLESAMPLEd) and how many of them have `feature`. The coverage checks and
+ * remediation impact capture both read coverage through this query, so a
+ * `gbrain onboard --history` row measures the population the check grades.
+ */
+export function visibleEntityCoverageSql(feature: CoverageFeature, filter: EntityTypeFilter, sampleClause = ''): { text: string; params: unknown[] } {
+  return renderFragment(sqlFragment`WITH sampled_entities AS (
+         SELECT p.id
+           FROM pages p ${trustedSql(sampleClause)}
+          WHERE ${visibleEntityPredicate(filter)}
+       )
+       SELECT
+         COUNT(*)::int AS sample_size,
+         COUNT(*) FILTER (
+           WHERE EXISTS (
+             SELECT 1
+               FROM ${trustedSql(feature.table)} f
+              WHERE f.${trustedSql(feature.pageIdColumn)} = s.id
+           )
+         )::int AS matched
+         FROM sampled_entities s`);
+}
+
+interface EntityCoverageSample {
+  matched: number;
+  sampleSize: number;
+}
+
+/** Parse a SQL count defensively: coverage is an operator-facing health metric,
+ * so a malformed driver value must not escape as NaN or a negative count. */
+function finiteCount(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+}
+
+/**
+ * Count the feature numerator and denominator from the SAME sampled CTE.
+ * TABLESAMPLE BERNOULLI returns a random number of rows; deriving its
+ * denominator from `total * requestedPercent` can make coverage exceed 100%.
+ */
+async function sampleVisibleEntityCoverage(
+  engine: BrainEngine,
+  sampleClause: string,
+  feature: CoverageFeature,
+  filter: EntityTypeFilter,
+): Promise<EntityCoverageSample | { error: string }> {
+  try {
+    const sql = visibleEntityCoverageSql(feature, filter, sampleClause);
+    const result = await engine.executeRaw(sql.text, sql.params);
+    const rows = (result as { rows?: Array<Record<string, unknown>> } | undefined)?.rows
+      ?? (result as Array<Record<string, unknown>> | undefined)
+      ?? [];
+    const row = rows[0] ?? {};
+    const sampleSize = finiteCount(row.sample_size);
+    // The SQL shape guarantees matched <= sample_size. Keep a defensive clamp
+    // at the rendering boundary so a driver/fixture anomaly still cannot emit
+    // impossible percentages or feed a negative value into sqrt().
+    const matched = Math.min(sampleSize, finiteCount(row.matched));
+    return { matched, sampleSize };
+  } catch (error) {
+    return { error: redactConnectionInfo(error instanceof Error ? error.message : String(error)) };
+  }
+}
+
+/** #7145: a coverage read that failed or sampled no row measured nothing, so it is not "0% coverage". */
+function unmeasuredCoverage(name: string, sample: EntityCoverageSample | { error: string }): OnboardCheckResult {
+  const why = 'error' in sample ? `the coverage read failed (${sample.error})` : 'the sampled read returned no entity page';
+  return { check: { name, status: 'warn', message: `Coverage unknown: ${why}; rerun doctor.`, details: { health: 'unknown', reason: 'error' in sample ? 'error' : 'empty_sample' } }, remediations: [] };
+}
+
+function coverageWithConfidence(sample: EntityCoverageSample): { coverage: number; ci: number } {
+  const rawCoverage = sample.sampleSize > 0 ? sample.matched / sample.sampleSize : 0;
+  const coverage = Math.min(1, Math.max(0, rawCoverage));
+  const variance = Math.max(0, coverage * (1 - coverage));
+  const ci = Math.sqrt(variance / Math.max(1, sample.sampleSize));
+  return { coverage, ci };
+}
+
+/**
+ * embed_staleness: count of chunks awaiting embedding.
+ *
+ * Uses `engine.countStaleChunks()`, the embed worker's own predicate (the
+ * registry-active embedding column plus its embed_skip/quarantine
+ * exclusions), so the check and the worker agree. A failed count is "not
+ * verified" (#5432), never "No stale chunks".
+ */
+export async function checkEmbedStaleness(
+  engine: BrainEngine,
+): Promise<OnboardCheckResult> {
+  if (await embeddingsDisabled(engine)) {
+    const cfg = loadConfig();
+    return {
+      check: {
+        name: 'embed_staleness', status: 'ok', severity: 'info', readiness_state: 'disabled_by_choice',
+        message: 'Not applicable: embeddings are disabled on this brain by choice, so chunks have no vectors by design (keyword search keeps working).',
+        ...(cfg ? { fix: embeddingEnablement(cfg) } : {}),
+      },
+      remediations: [],
+    };
+  }
+  let staleCount: number;
+  try {
+    staleCount = await engine.countStaleChunks();
+  } catch (e) {
+    const reason = redactConnectionInfo(e instanceof Error ? e.message : String(e)).slice(0, 200);
+    return {
+      check: {
+        name: 'embed_staleness',
+        status: 'warn',
+        message: `Not verified: the stale-chunk count failed (${reason}). Fix the cause, then re-run \`gbrain doctor\`.`,
+        details: { code: 'not_verified', verified: false, reason, fix: 'gbrain doctor', docs: 'docs/guides/troubleshooting.md#not-verified-doctor-checks' },
+      },
+      remediations: [],
+    };
+  }
+  const remediations: RemediationStep[] = [];
+  let status: 'ok' | 'warn' | 'fail' = 'ok';
+  let message: string;
+
+  if (staleCount === 0) {
+    message = 'No stale chunks';
+  } else if (staleCount < 1000) {
+    status = 'warn';
+    message = `${staleCount} stale chunks (small backlog)`;
+    remediations.push(makeRemediationStep({
+      id: 'onboard.embed_catch_up',
+      job: 'embed-catch-up',
+      params: { batchSize: 500 },
+      severity: 'medium',
+      est_seconds: Math.min(900, Math.ceil(staleCount * 0.2)),
+      est_usd_cost: staleCount * 0.00002,
+      rationale: `${staleCount} chunks awaiting embedding`,
+      status: 'remediable',
+    }));
+  } else {
+    // v0.41.18.0: warn-only even on large backlogs. Doctor exit code should
+    // not flip from a brain that has pages waiting to be embedded — that's
+    // a "needs work" condition, not a "broken" one. The high-severity
+    // remediation still surfaces via onboard's plan.
+    status = 'warn';
+    message = `${staleCount} stale chunks (large backlog — vector search returning outdated content)`;
+    remediations.push(makeRemediationStep({
+      id: 'onboard.embed_catch_up',
+      job: 'embed-catch-up',
+      params: { batchSize: 1000, priority: 'recent' },
+      severity: 'high',
+      est_seconds: Math.min(3600, Math.ceil(staleCount * 0.2)),
+      est_usd_cost: staleCount * 0.00002,
+      rationale: `${staleCount} chunks awaiting embedding; recent-first catch-up`,
+      status: 'remediable',
+    }));
+  }
+  return {
+    check: { name: 'embed_staleness', status, message, ...(staleCount > 0 ? { fix: embedBackfillFix({ backlog: staleCount, verifyCheck: 'embed_staleness' }) } : {}) },
+    remediations,
+  };
+}
+
+/**
+ * Can `extract-ner` actually do anything on this brain?
+ *
+ * Three-state on purpose. The recommender must be able to tell "the pack
+ * declares no NER rules" (a real, explainable no-auto-fix) from "the pack
+ * could not be resolved at all" (an operator problem). Collapsing both into
+ * a bare `false` is what turns a phantom recommendation into a phantom
+ * SILENCE: the nag disappears and nothing says why.
+ *
+ * Resolution goes through `loadActivePackForLocalEngine`, which is also what
+ * the `extract-ner` handler uses — so recommender and handler cannot resolve
+ * different packs and then disagree about the same brain. That helper pins
+ * `remote: false` (an onboard check is a LOCAL surface; the generic
+ * `loadActivePackBestEffort` defaults `remote: ctx.remote ?? true`, and a
+ * tier-1 trust rejection would arrive here masquerading as "pack has no NER
+ * rules") and pairs file-only config with the engine's DB-side `schema_pack`,
+ * matching `checkPackUpgradeAvailable` / `checkTypeProliferation` below.
+ *
+ * Those two siblings still open-code the same resolution rather than calling
+ * the shared helper: their outer `catch` returns a distinguishable
+ * `Check skipped: <message>`, which a null-swallowing helper would flatten
+ * into "No active pack".
+ */
+async function resolveNerInferenceCapability(
+  engine: BrainEngine,
+): Promise<'supported' | 'no_rules' | 'unresolved'> {
+  try {
+    const { loadActivePackForLocalEngine, packSupportsNerInference } =
+      await import('../schema-pack/best-effort.ts');
+    const pack = await loadActivePackForLocalEngine(engine);
+    if (!pack) return 'unresolved';
+    return packSupportsNerInference(pack) ? 'supported' : 'no_rules';
+  } catch {
+    return 'unresolved';
+  }
+}
+
+/**
+ * entity_link_coverage: fraction of entity pages with at least one inbound link.
+ *
+ * Per A21 + codex finding #15: TABLESAMPLE BERNOULLI on Postgres when
+ * total_pages > 50K, with pinned sample rate (LEAST 100, GREATEST 2,
+ * targeting ~5000 sampled rows). PGLite path: full scan.
+ *
+ * The ±sqrt(p(1-p)/n) confidence interval is embedded in the message
+ * itself so doctor + onboard render show "coverage: 31% ± 1.3%" not
+ * a misleading point estimate.
+ */
+export async function checkEntityLinkCoverage(
+  engine: BrainEngine,
+): Promise<OnboardCheckResult> {
+  // Total visible entity pages. Quarantined pages are hidden from the brain,
+  // so they are outside both the coverage numerator and denominator.
+  const entityTypes = await resolveEntityTypes(engine, null);
+  if (entityTypes.status === 'pack_unavailable') return entityTypesUnavailableResult('entity_link_coverage', entityTypes);
+  const totalEntities = await countVisibleEntities(engine, entityTypes.filter);
+
+  const ungraded = ungradedCoverageResult('entity_link_coverage', totalEntities);
+  if (ungraded) return ungraded;
+
+  // Decide TABLESAMPLE policy (PG only, when >50K entities)
+  const useSample = engine.kind === 'postgres' && totalEntities > 50_000;
+  const samplePct = useSample
+    ? Math.max(2.0, Math.min(100.0, (5000.0 / totalEntities) * 100))
+    : 100;
+  const sampleClause = useSample ? `TABLESAMPLE BERNOULLI (${samplePct.toFixed(2)})` : '';
+
+  const sample = await sampleVisibleEntityCoverage(
+    engine,
+    sampleClause,
+    LINK_COVERAGE_FEATURE,
+    entityTypes.filter,
+  );
+  if ('error' in sample || sample.sampleSize === 0) return unmeasuredCoverage('entity_link_coverage', sample);
+  const { coverage, ci } = coverageWithConfidence(sample);
+
+  const pct = Math.round(coverage * 100);
+  const ciPct = (ci * 100).toFixed(1);
+  const sampleNote = useSample ? ` (sampled ${samplePct.toFixed(1)}%)` : '';
+
+  const remediations: RemediationStep[] = [];
+  let status: 'ok' | 'warn' | 'fail' = 'ok';
+  let message: string;
+
+  // v0.41.18.0: warn-only, never fail. Empty entity link coverage is "needs
+  // work" not "broken" — doctor's exit code should not flip from a fresh
+  // brain with entity pages but no auto-extracted links yet. Fail status
+  // would break `gbrain doctor exits 0` contract; the recommendation
+  // surfaces the same fix via the onboard plan either way.
+  if (coverage >= 0.7) {
+    message = `Coverage ${pct}% ± ${ciPct}%${sampleNote}`;
+  } else {
+    status = 'warn';
+    message = `Coverage ${pct}% ± ${ciPct}% (target 70%)${sampleNote}`;
+    // Only recommend NER extraction if the active pack actually declares
+    // inference.regex rules — otherwise `extract-ner` is a structural no-op
+    // (pack_unavailable, 0 links) and the recommendation could never clear.
+    //
+    // Recommender and handler now share BOTH halves of the question: the same
+    // resolver (`loadActivePackForLocalEngine`) picks the pack, and the same
+    // predicate (`packSupportsNerInference`) judges its capability. Sharing
+    // only the predicate would still have let the two resolve different packs.
+    const nerCapability = await resolveNerInferenceCapability(engine);
+    if (nerCapability === 'supported') {
+      remediations.push(makeRemediationStep({
+        id: 'onboard.extract_ner_links',
+        job: 'extract-ner',
+        params: {},
+        severity: coverage >= 0.4 ? 'medium' : 'high',
+        est_seconds: coverage >= 0.4 ? 300 : 600,
+        est_usd_cost: 0,
+        rationale: `Entity link coverage at ${pct}%; NER extraction lifts typed-link density`,
+        status: 'remediable',
+      }));
+    } else if (nerCapability === 'no_rules') {
+      message += ' — no auto-fix: the active schema pack declares no NER inference rules'
+        + ' (add link_types[].inference.regex, or upgrade the pack)';
+    } else {
+      message += ' — no auto-fix: could not resolve the active schema pack, so NER'
+        + ' capability is unknown (see `gbrain doctor` schema_pack checks)';
+    }
+  }
+  return {
+    check: { name: 'entity_link_coverage', status, message },
+    remediations,
+  };
+}
+
+/**
+ * timeline_coverage: fraction of entity pages with at least one timeline entry.
+ *
+ * Same TABLESAMPLE policy as entity_link_coverage for big brains.
+ */
+export async function checkTimelineCoverage(
+  engine: BrainEngine,
+): Promise<OnboardCheckResult> {
+  const entityTypes = await resolveEntityTypes(engine, null);
+  if (entityTypes.status === 'pack_unavailable') return entityTypesUnavailableResult('timeline_coverage', entityTypes);
+  const totalEntities = await countVisibleEntities(engine, entityTypes.filter);
+
+  const ungraded = ungradedCoverageResult('timeline_coverage', totalEntities);
+  if (ungraded) return ungraded;
+
+  const useSample = engine.kind === 'postgres' && totalEntities > 50_000;
+  const samplePct = useSample
+    ? Math.max(2.0, Math.min(100.0, (5000.0 / totalEntities) * 100))
+    : 100;
+  const sampleClause = useSample ? `TABLESAMPLE BERNOULLI (${samplePct.toFixed(2)})` : '';
+
+  const sample = await sampleVisibleEntityCoverage(
+    engine,
+    sampleClause,
+    TIMELINE_COVERAGE_FEATURE,
+    entityTypes.filter,
+  );
+  if ('error' in sample || sample.sampleSize === 0) return unmeasuredCoverage('timeline_coverage', sample);
+  const { coverage, ci } = coverageWithConfidence(sample);
+  const pct = Math.round(coverage * 100);
+  const ciPct = (ci * 100).toFixed(1);
+  const sampleNote = useSample ? ` (sampled ${samplePct.toFixed(1)}%)` : '';
+
+  const remediations: RemediationStep[] = [];
+  let status: 'ok' | 'warn' | 'fail' = 'ok';
+  let message: string;
+
+  // v0.41.18.0: warn-only, never fail. Same posture as entity_link_coverage —
+  // the recommendation still surfaces in onboard's plan, but doctor exit
+  // code doesn't flip on a fresh brain.
+  if (coverage >= 0.9) {
+    message = `Coverage ${pct}% ± ${ciPct}%${sampleNote}`;
+  } else {
+    status = 'warn';
+    message = `Coverage ${pct}% ± ${ciPct}% (target 90%)${sampleNote}`;
+    // Only recommend meeting-derived timeline extraction if there are dated
+    // meeting pages to extract FROM — otherwise the job creates 0 entries
+    // (it skips meetings without effective_date) and the rec never clears.
+    const datableMeetings = await safeCount(
+      engine,
+      `SELECT COUNT(*) AS count FROM pages
+         WHERE type = 'meeting' AND effective_date IS NOT NULL AND deleted_at IS NULL`,
+    );
+    if (datableMeetings > 0) {
+      remediations.push(makeRemediationStep({
+        id: 'onboard.extract_timeline_from_meetings',
+        job: 'extract-timeline-from-meetings',
+        params: {},
+        severity: coverage >= 0.7 ? 'medium' : 'high',
+        est_seconds: coverage >= 0.7 ? 240 : 480,
+        est_usd_cost: 0,
+        rationale: `Timeline coverage at ${pct}%; meeting-derived entries lift it`,
+        status: 'remediable',
+      }));
+    } else {
+      message += ' — no auto-fix: no dated meeting pages to extract timeline entries from';
+    }
+  }
+  return {
+    check: { name: 'timeline_coverage', status, message },
+    remediations,
+  };
+}
+
+/**
+ * takes_count: number of takes (typed claims) in the brain.
+ *
+ * Per A12 two-gate consent: the remediation only emits when
+ * `takes.bootstrap_enabled` config is true. Otherwise the check shows
+ * a status + hint, but no autopilot-eligible remediation.
+ */
+export async function checkTakesCount(
+  engine: BrainEngine,
+): Promise<OnboardCheckResult> {
+  const takesCount = await safeCount(
+    engine,
+    `SELECT COUNT(*) AS count FROM takes`,
+  );
+
+  let bootstrapEnabled = false;
+  try {
+    const cfg = await engine.getConfig('takes.bootstrap_enabled');
+    bootstrapEnabled = cfg === 'true' || cfg === '1';
+  } catch {
+    bootstrapEnabled = false;
+  }
+
+  const remediations: RemediationStep[] = [];
+  let status: 'ok' | 'warn' | 'fail' = 'ok';
+  let message: string;
+
+  if (takesCount >= 100) {
+    message = `${takesCount} takes (calibration ready)`;
+  } else if (takesCount === 0) {
+    status = 'warn';
+    if (bootstrapEnabled) {
+      message = `0 takes (bootstrap eligible — gbrain takes extract --from-pages)`;
+      remediations.push(makeRemediationStep({
+        id: 'onboard.takes_bootstrap',
+        job: 'extract-takes-from-pages',
+        protected: true,
+        params: {},
+        severity: 'medium',
+        est_seconds: 1800,
+        est_usd_cost: 5.00,
+        rationale: '0 takes; LLM-bearing extraction over concept/atom/lore pages',
+        status: 'remediable',
+      }));
+    } else {
+      return {
+        check: {
+          name: 'takes_count', status: 'ok', severity: 'info', readiness_state: 'disabled_by_choice',
+          message: '0 takes (takes.bootstrap_enabled is false; opt in to enable)',
+          fix: {
+            argv: ['gbrain', 'config', 'set', 'takes.bootstrap_enabled', 'true'], consent: ['paid'], actor: 'agent', requires_exclusive: false,
+            why: 'Takes (typed claims) are opt-in. Enabling the bootstrap lets maintenance extract them from existing pages with a chat model (about $5 on a typical brain), which feeds calibration.',
+            user_message: 'gbrain can extract typed claims ("takes") from your pages so it can track calibration over time. It uses a paid chat model (roughly $5 once). Turn it on?',
+            verify: { argv: ['gbrain', 'doctor', '--only', 'takes_count', '--json'] },
+          },
+        },
+        remediations,
+      };
+    }
+  } else {
+    message = `${takesCount} takes (calibration usable; >100 ideal)`;
+  }
+  return {
+    check: { name: 'takes_count', status, message },
+    remediations,
+  };
+}
+
+/**
+ * Run all four checks in parallel; aggregate into a single payload.
+ * Consumed by onboard's plan generation + (later) doctor's runDoctor.
+ *
+ * Per A20: callers can race this against an AbortSignal-bound timer for
+ * partial-results fallthrough. Each individual safeCount() returns 0
+ * on throw so a single check failure doesn't break the aggregate.
+ */
+export async function runAllOnboardChecks(
+  engine: BrainEngine,
+): Promise<OnboardCheckResult[]> {
+  return Promise.all([
+    checkEmbedStaleness(engine),
+    checkEntityLinkCoverage(engine),
+    checkTimelineCoverage(engine),
+    checkTakesCount(engine),
+    // v0.42 type-unification (T13-T15): 3 new checks added to onboard.
+    checkPackUpgradeAvailable(engine),
+    checkTypeProliferation(engine),
+    checkDanglingAliases(engine),
+  ]);
+}
+
+// ===========================================================================
+// v0.42 Type Unification (T13-T15) — 3 onboard checks
+// ===========================================================================
+
+/**
+ * pack_upgrade_available: fires when the active schema pack has a successor
+ * pack declared via `migration_from`. v0.42 ships gbrain-base-v2 as the
+ * declared successor of gbrain-base@1.x. Emits a manual_only RemediationStep
+ * (D17) targeting the unify-types Minion handler.
+ */
+export async function checkPackUpgradeAvailable(
+  engine: BrainEngine,
+): Promise<OnboardCheckResult> {
+  try {
+    const { loadActivePack, findPackSuccessors } = await import('../schema-pack/load-active.ts');
+    const { loadConfigFileOnly } = await import('../config.ts');
+    // Read the engine's DB-side schema_pack so a post-unify flip is visible
+    // here even before the file-plane config catches up. File-only config
+    // preserves tier-6 schema_pack without merging transient env/database state.
+    let dbConfig: string | undefined;
+    try {
+      dbConfig = (await engine.getConfig('schema_pack')) ?? undefined;
+    } catch { /* engine.config may not exist on very old brains */ }
+    const active = await loadActivePack({ cfg: loadConfigFileOnly(), remote: false, dbConfig })
+      .catch(() => null);
+    if (!active) {
+      return {
+        check: { name: 'pack_upgrade_available', status: 'ok', message: 'No active pack' },
+        remediations: [],
+      };
+    }
+    const successors = await findPackSuccessors(active.manifest.name, active.manifest.version);
+    if (successors.length === 0) {
+      return {
+        check: {
+          name: 'pack_upgrade_available',
+          status: 'ok',
+          message: `Active pack ${active.identity} is current (no successor declared)`,
+        },
+        remediations: [],
+      };
+    }
+    const successor = successors[0];
+    const { managedPersistenceEnabled } = await import('../persistence/ownership.ts');
+    if (await managedPersistenceEnabled(engine)) {
+      // #6196: retype runs outside the persistence coordinator, so a managed brain cannot run the apply job.
+      return {
+        check: {
+          name: 'pack_upgrade_available', status: 'ok', severity: 'info', readiness_state: 'degraded',
+          message: `Active pack: ${active.identity}. Successor available: ${successor.identity}. On a managed brain unify-types switches the pack only when no page needs retyping, linking or aliasing; coordinated retype is not available yet, so do not submit the apply job while the preview shows pages to change. Preview: \`gbrain onboard --check --explain\``,
+          fix: { argv: ['gbrain', 'onboard', '--check', '--explain'], consent: [], actor: 'agent', requires_exclusive: false,
+            why: 'Previews the pack upgrade read-only. Applying it on a managed brain waits for coordinated retype unless the preview shows nothing to change.' },
+        },
+        remediations: [],
+      };
+    }
+    return {
+      check: {
+        name: 'pack_upgrade_available',
+        status: 'warn',
+        message:
+          `Active pack: ${active.identity}. Successor available: ${successor.identity}. ` +
+          `Preview: \`gbrain onboard --check --explain\``,
+      },
+      remediations: [
+        makeRemediationStep({
+          id: 'onboard.pack_upgrade_' + successor.manifest.name,
+          job: 'unify-types',
+          // #1575: the worker defaults `apply` to false (dry-run); a
+          // remediation step is a consented apply, so carry it explicitly.
+          params: { target_pack: successor.manifest.name, apply: true },
+          severity: 'medium',
+          est_seconds: 600,  // ~10min on 186K-page brain (production proxy)
+          est_usd_cost: 0,   // pure SQL; no LLM spend
+          protected: true,   // PROTECTED handler; manual-only by job name (remediation/manual-only.ts)
+          rationale:
+            `Pack upgrade ${active.manifest.name} → ${successor.manifest.name}; ` +
+            `collapses redundant page types into the new canonical taxonomy. ` +
+            `Reversible via 72h soft-delete TTL on alias/link pages + ` +
+            `frontmatter.legacy_type preservation on retyped pages.`,
+          status: 'remediable',
+        }),
+      ],
+    };
+  } catch (e) {
+    return {
+      check: {
+        name: 'pack_upgrade_available',
+        status: 'ok',
+        message: `Check skipped: ${(e as Error).message}`,
+      },
+      remediations: [],
+    };
+  }
+}
+
+/**
+ * type_proliferation (D16): pack-aware ratio. Warns when distinct typed
+ * pages exceed pack-declared types + 5; fails at declared × 2. No false
+ * positives on custom packs (compares to actual pack declaration count,
+ * not a hardcoded threshold).
+ *
+ * #6289: each source is graded against its own resolved pack (per-source
+ * DB config included); sources sharing a pack pool their labels, and an
+ * alias counts as its canonical type. A source whose pack does not resolve,
+ * or a failed query, is "not verified" (warn), never ok.
+ */
+export async function checkTypeProliferation(
+  engine: BrainEngine,
+): Promise<OnboardCheckResult> {
+  const result = (status: 'ok' | 'warn' | 'fail', message: string): OnboardCheckResult =>
+    ({ check: { name: 'type_proliferation', status, message }, remediations: [] });
+  let rows: Array<{ source_id: string; type: string }>;
+  try {
+    rows = await engine.executeRaw<{ source_id: string; type: string }>(
+      `SELECT DISTINCT source_id, type FROM pages WHERE deleted_at IS NULL AND type IS NOT NULL ORDER BY source_id, type`);
+  } catch (e) {
+    return result('warn', `type_proliferation not verified: the page type query failed (${(e as Error).message}).`);
+  }
+  const { loadActivePackForLocalEngine } = await import('../schema-pack/best-effort.ts');
+  const { classifyStoredType } = await import('../schema-pack/type-usage.ts');
+  const pools = new Map<string, { pack: NonNullable<Awaited<ReturnType<typeof loadActivePackForLocalEngine>>>; sources: Set<string>; labels: Set<string>; undeclared: Set<string> }>();
+  const unresolved = new Set<string>();
+  for (const sourceId of new Set(rows.map(r => r.source_id))) {
+    const pack = await loadActivePackForLocalEngine(engine, { sourceId });
+    if (!pack) { unresolved.add(sourceId); continue; }
+    const pool = pools.get(pack.identity) ?? { pack, sources: new Set<string>(), labels: new Set<string>(), undeclared: new Set<string>() };
+    pool.sources.add(sourceId);
+    for (const { type } of rows.filter(r => r.source_id === sourceId)) {
+      const cls = classifyStoredType(type, pack.manifest);
+      pool.labels.add(cls.kind === 'alias_of' ? cls.canonical : type);
+      if (cls.kind === 'undeclared') pool.undeclared.add(type);
+    }
+    pools.set(pack.identity, pool);
+  }
+  const graded = [...pools.values()].map(pool => {
+    const declared = pool.pack.manifest.page_types.length;
+    const n = pool.labels.size;
+    return { pool, declared, n, status: n > declared * 2 ? 'fail' as const : n > declared + 5 ? 'warn' as const : 'ok' as const };
+  });
+  const rank = { ok: 0, warn: 1, fail: 2 };
+  const worst = graded.sort((a, b) => rank[b.status] - rank[a.status] || b.n - b.declared - (a.n - a.declared))[0];
+  const where = (g: typeof graded[number]) => {
+    const undeclared = [...g.pool.undeclared].sort();
+    const names = undeclared.slice(0, 5).join(', ') + (undeclared.length > 5 ? `, +${undeclared.length - 5} more` : '');
+    return ` (source${g.pool.sources.size > 1 ? 's' : ''} ${[...g.pool.sources].sort().join(', ')}, pack ${g.pool.pack.manifest.name}${names ? `; undeclared: ${names}` : ''})`;
+  };
+  const notVerified = unresolved.size
+    ? ` Not verified: the schema pack for source${unresolved.size > 1 ? 's' : ''} ${[...unresolved].sort().join(', ')} does not resolve (run \`gbrain schema active --source <id>\`).`
+    : '';
+  if (worst?.status === 'fail') {
+    return result('fail',
+      `${worst.n} distinct page types (pack declares ${worst.declared})${where(worst)}. ` +
+      `Run \`gbrain onboard --check --explain\` to preview a pack upgrade ` +
+      `or define a custom pack with mapping_rules.${notVerified}`);
+  }
+  if (worst?.status === 'warn') {
+    return result('warn', `${worst.n} distinct page types vs ${worst.declared} declared in pack — consider unification${where(worst)}.${notVerified}`);
+  }
+  if (notVerified) return result('warn', `type_proliferation${notVerified.trimEnd()}`);
+  if (!worst) return result('ok', 'no typed pages');
+  return result('ok', graded.map(g => `${g.n} distinct typed values (pack ${g.pool.pack.manifest.name} declares ${g.declared})`).join('; '));
+}
+
+/**
+ * dangling_aliases (F12): surfaces both slug_aliases redirects and
+ * page_aliases free-text names whose target page is gone or soft-deleted.
+ * Source-scoped JOINs prevent cross-source false positives.
+ *
+ * #6619: the two cases are reported apart. Aliases whose target has no page
+ * row (purged or hard-deleted) are cleared by `gbrain repair aliases`, named
+ * per source; aliases of a soft-deleted page are kept for `gbrain restore`
+ * and removed when that page is purged, so nothing is offered for them. The
+ * alias tables carry the managed writer guard, so raw SQL is never offered.
+ *
+ * Defensive: pre-v105 brains don't have slug_aliases yet; a failed read
+ * counts nothing (ok).
+ */
+export async function checkDanglingAliases(
+  engine: BrainEngine,
+): Promise<OnboardCheckResult> {
+  let orphaned: Array<{ source_id: string; slug_redirects: number; page_aliases: number }> = [];
+  let soft = { slug_redirects: 0, page_aliases: 0 };
+  try {
+    orphaned = await engine.executeRaw(ORPHANED_ALIAS_COUNTS_SQL);
+    const [row] = await engine.executeRaw<typeof soft>(SOFT_DELETED_ALIAS_COUNT_SQL);
+    if (row) soft = row;
+  } catch (error) {
+    // #7145: only a pre-v105 brain (no alias tables) has nothing to report; any other failure is unknown, not clear.
+    if (!isMissingSchemaObject(error, 'table', ['slug_aliases', 'page_aliases'])) {
+      return { check: { name: 'dangling_aliases', status: 'warn', details: { health: 'unknown' },
+        message: `Dangling aliases unknown: the alias read failed (${redactConnectionInfo(error instanceof Error ? error.message : String(error))}); rerun doctor.` }, remediations: [] };
+    }
+  }
+  const slugAliases = orphaned.reduce((sum, row) => sum + Number(row.slug_redirects), 0) + Number(soft.slug_redirects);
+  const pageAliases = orphaned.reduce((sum, row) => sum + Number(row.page_aliases), 0) + Number(soft.page_aliases);
+  const n = slugAliases + pageAliases;
+  if (n === 0) {
+    return {
+      check: { name: 'dangling_aliases', status: 'ok', message: 'No dangling aliases' },
+      remediations: [],
+    };
+  }
+  const commands = orphaned.map(row => repairPreviewCommand('aliases', { source: row.source_id }));
+  const softTotal = Number(soft.slug_redirects) + Number(soft.page_aliases);
+  const orphanedText = orphaned.length
+    ? `${n - softTotal} point at pages that no longer exist (${orphaned.map(row => `${row.source_id}: ${Number(row.slug_redirects) + Number(row.page_aliases)}`).join(', ')}); `
+      + `preview their cleanup with ${commands.join('; ')}, then run the --apply command it prints. `
+    : '';
+  const softText = softTotal
+    ? `${softTotal} belong to soft-deleted pages and are kept for gbrain restore; purging the page removes them, so nothing needs running for those.`
+    : '';
+  return {
+    check: {
+      name: 'dangling_aliases',
+      status: 'warn',
+      message:
+        `${n} alias rows point at missing/deleted pages ` +
+        `(${slugAliases} slug redirects; ${pageAliases} free-text page aliases). ${orphanedText}${softText}`.trimEnd(),
+      details: { orphaned, soft_deleted: soft },
+      ...(orphaned.length ? { fix: { argv: commands[0]!.split(' '), consent: [], actor: 'agent' as const, requires_exclusive: false,
+        why: 'Lists the orphaned alias rows of that source without changing anything; its output prints the apply command.' } } : {}),
+    },
+    remediations: [],
+  };
+}

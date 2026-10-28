@@ -1,0 +1,1408 @@
+name: Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # Merge queue (inert until the queue is enabled on master): the PR profile,
+  # run against the queued merge commit. docs/RELEASING.md#merge-queue.
+  merge_group:
+  # Nightly full matrix: every Bun version and native target, like a push to master.
+  schedule:
+    - cron: '23 7 * * *'
+  # Manual dispatch lets a local dev/agent offload the suite to GitHub's
+  # on-demand runners from ANY branch (see scripts/ship-remote-tests.sh).
+  # Frees a load-saturated local machine (e.g. many Conductor agents running
+  # their own bun-test suites at once — load avg 120 on 16 cores).
+  # Dispatch inputs select manual modes only; they never apply to pull_request,
+  # merge_group, push or schedule events (docs/TESTING.md#event-parity).
+  workflow_dispatch:
+    inputs:
+      native_only:
+        description: Run native platform checks only; this does not satisfy full CI
+        type: boolean
+        default: false
+        required: false
+      # Diagnostic modes (docs/TESTING.md#stress-gate, docs/TESTING.md#race-hunt):
+      # either one runs only its lane, never the full suite, and its result never
+      # opens, updates or closes an issue.
+      race_hunt:
+        description: Run only the race hunt (every test/postgres-unit-arms.txt file 10 times); diagnostic
+        type: boolean
+        default: false
+        required: false
+      stress_files:
+        description: Run only the stress gate on these test files (space- or comma-separated test/…/*.test.ts); diagnostic
+        type: string
+        default: ''
+        required: false
+      stress_base:
+        description: Run only the stress gate on the test files changed versus this ref or SHA; diagnostic
+        type: string
+        default: ''
+        required: false
+      stress_head:
+        description: Head ref or SHA for stress_base (default HEAD of the dispatched ref)
+        type: string
+        default: ''
+        required: false
+
+permissions:
+  contents: read
+
+# Cancel a superseded run when a newer commit lands on the same PR/branch.
+# Keyed on the PR number for pull_request events (unique per PR, so two PRs
+# from forks sharing a branch name don't cancel each other) and falls back to
+# github.ref for push/scheduled runs. Mirrors heavy-tests.yml; frees runners
+# and stops a stale-SHA run from reporting a flaky failure on an obsolete commit.
+# Explicit native-only retries use a separate group so full persistence soaks finish.
+# Each diagnostic dispatch (race_hunt, stress_*) gets its own group, so one
+# replay never cancels another or a full run.
+# Event parity (docs/TESTING.md#event-parity): the event suffixes only separate
+# runs that must not cancel each other; they change no job, matrix or parameter.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.native_only == true && '-native-only' || '' }}${{ github.event_name == 'workflow_dispatch' && (inputs.race_hunt == true || inputs.stress_files != '' || inputs.stress_base != '') && format('-diagnostic-{0}', github.run_id) || '' }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
+  cancel-in-progress: true
+
+jobs:
+  # Planning gate for the native platform matrix. Pull requests that touch
+  # native, lock, IPC, publication, backup, export or sync paths run every
+  # native target on the primary Bun version; other pull requests run the Linux
+  # x64 smoke cell. Pushes, schedules and manual runs always run the full matrix.
+  # Named exception (docs/TESTING.md#event-parity): the native-locks scope
+  # reduction on pull requests and merge-queue runs (cross-target cells) is
+  # covered by every push to master and the nightly Test schedule,
+  # which both run scope=full.
+  changes:
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      native-scope: ${{ steps.scope.outputs.native }}
+      convergence: ${{ steps.convergence.outputs.convergence }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
+      reuse-source-run-id: ${{ steps.reuse.outputs.source_run_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          sparse-checkout: |
+            scripts/ci-native-scope.sh
+            scripts/ci-manifest-diff.sh
+            scripts/ci-convergence-scope.sh
+            scripts/ci-reuse.ts
+            scripts/lib/gh-issue.ts
+          sparse-checkout-cone-mode: false
+      - if: github.event_name == 'push'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      # Master-push reuse (P2, scripts/ci-reuse.ts): a push whose tree equals the
+      # tree of a passed full-suite run skips every full lane and records the
+      # reused run. Any doubt, a crash included, leaves reuse unset: a full run.
+      - id: reuse
+        if: github.event_name == 'push'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun scripts/ci-reuse.ts --workflow test --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY" --record "$RUNNER_TEMP/reuse.json"
+      - if: steps.reuse.outputs.reuse == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reused-full-suite
+          path: ${{ runner.temp }}/reuse.json
+          if-no-files-found: error
+          retention-days: 90
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = merge_group ]; then
+            # PR profile for the queue: every native target on the primary Bun.
+            scope=primary
+          elif [ "$EVENT" != pull_request ]; then
+            scope=full
+          elif ! [[ "$CHANGED_FILES" =~ ^[0-9]{1,4}$ ]] || [ "$CHANGED_FILES" -ge 3000 ]; then
+            # The PR files API returns at most 3000 files. An unknown or
+            # capped diff cannot establish that native paths are untouched.
+            scope=primary
+          elif files=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename'); then
+            listed=$(printf '%s\n' "$files" | awk 'NF { count++ } END { print count+0 }')
+            if [ "$listed" -ne "$CHANGED_FILES" ]; then
+              scope=primary
+            else
+              # A version-only package.json / openclaw.plugin.json diff (every
+              # release PR) cannot change native behavior (C11).
+              kept=$(printf '%s\n' "$files" | bash scripts/ci-manifest-diff.sh drop-version-only) || kept=$files
+              if [ -z "$kept" ]; then
+                scope=smoke
+              else
+                scope=$(printf '%s' "$kept" | bash scripts/ci-native-scope.sh) || scope=primary
+              fi
+            fi
+          else
+            scope=primary
+          fi
+          echo "native scope: $scope"
+          echo "native=$scope" >> "$GITHUB_OUTPUT"
+      # Named exception (docs/TESTING.md#event-parity): a pull request runs the
+      # managed-sync convergence gate only when scripts/ci-convergence-scope.sh
+      # selects its diff (persistence, sync, projections, storage, the harness
+      # and its workflow; never package.json alone). Merge-queue runs, every push
+      # to master and the nightly Test schedule always run it; an unknown or
+      # unreadable diff runs it too.
+      - id: convergence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          convergence=run
+          if [ "$EVENT" = pull_request ] && [[ "$CHANGED_FILES" =~ ^[0-9]{1,4}$ ]] && [ "$CHANGED_FILES" -lt 3000 ] \
+            && files=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename') \
+            && [ "$(printf '%s\n' "$files" | awk 'NF { count++ } END { print count+0 }')" -eq "$CHANGED_FILES" ]; then
+            convergence=$(printf '%s' "$files" | bash scripts/ci-convergence-scope.sh) || convergence=run
+          fi
+          echo "convergence gate: $convergence"
+          echo "convergence=$convergence" >> "$GITHUB_OUTPUT"
+
+  # Re-run checks for every event, except a master push reusing a passed full-suite run of its exact tree (scripts/ci-reuse.ts). Only dependencies and PGLite snapshots are cached.
+  gitleaks:
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0
+      # Use the open-source gitleaks CLI, not gitleaks-action@v2: the v2 action
+      # now enforces a paid GITLEAKS_LICENSE (fails the job with "missing
+      # gitleaks license" for accounts it can't validate). The CLI is free, uses
+      # the committed .gitleaks.toml allowlist, and scans the same commit range.
+      - name: Cache gitleaks tarball
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: /tmp/gitleaks-dl
+          key: gitleaks-8.30.1-linux-x64
+      - name: Install gitleaks (pinned + checksum-verified)
+        run: |
+          set -euo pipefail
+          VER=8.30.1
+          BASE="gitleaks_${VER}_linux_x64.tar.gz"
+          URL="https://github.com/gitleaks/gitleaks/releases/download/v${VER}"
+          mkdir -p /tmp/gitleaks-dl
+          [ -f "/tmp/gitleaks-dl/${BASE}" ] || curl -fsSL -o "/tmp/gitleaks-dl/${BASE}" "${URL}/${BASE}"
+          # Checksums fetched fresh EVERY run: a cache-restored tarball is
+          # re-verified against the published digest, never trusted.
+          curl -fsSL -o /tmp/gitleaks_checksums.txt "${URL}/gitleaks_${VER}_checksums.txt"
+          ( cd /tmp/gitleaks-dl && grep " ${BASE}\$" /tmp/gitleaks_checksums.txt | sha256sum -c - )
+          tar -xzf "/tmp/gitleaks-dl/${BASE}" -C /tmp gitleaks
+          install /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: Verify scanner detects secrets outside exact fixture exceptions
+        run: bash scripts/test-gitleaks-config.sh
+      # Event parity (docs/TESTING.md#event-parity): every event scans the commit
+      # range it introduces.
+      - name: Scan for secrets (gitleaks CLI, .gitleaks.toml)
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            RANGE="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          elif [ "${{ github.event_name }}" = "merge_group" ]; then
+            RANGE="${{ github.event.merge_group.base_sha }}..${{ github.event.merge_group.head_sha }}"
+          else
+            BEFORE="${{ github.event.before }}"
+            case "$BEFORE" in
+              ""|0000000000000000000000000000000000000000) RANGE="${{ github.sha }}~1..${{ github.sha }}" ;;
+              *) RANGE="${BEFORE}..${{ github.sha }}" ;;
+            esac
+          fi
+          echo "Scanning commit range: $RANGE"
+          gitleaks detect --redact --no-banner --log-opts "$RANGE"
+
+  security-regressions:
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && 'ubicloud-standard-2-ubuntu-2404' || matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-26, windows-latest]
+        bun: ['1.4.4']
+        # Event parity: every event, pull requests and merge-queue runs
+        # included, runs every supported Bun version on every OS
+        # (docs/TESTING.md#event-parity).
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      - name: Boundary and transport regressions
+        run: bun test --timeout 60000 test/frontmatter-security.test.ts test/data-frontmatter.test.ts test/authorization-boundaries.test.ts test/url-safety.test.ts test/guarded-http.test.ts test/bundle-files-segments.test.ts
+      - name: Isolated TLS and proxy regressions
+        run: bun test --timeout 60000 test/guarded-http-tls.serial.test.ts
+      - name: Colon-slug Windows refusals and bound explicit reads (#5032, #5081)
+        run: bun test --timeout 60000 test/colon-slug-windows-5032.test.ts test/cross-lane-5081-5032.test.ts
+      - name: Windows durability, skill bundles and local-writer flags (#5595, #5475)
+        run: bun test --timeout 60000 test/fs-durable.test.ts test/persistence-windows-flush-5595.test.ts test/bundle-files-windows-5475.test.ts test/init-packaged-skills-native.test.ts test/auth-local-writer-dry-run.test.ts test/scripts/durable-flush-guard.test.ts test/binary-self-update-durable-download.test.ts
+      # test/persistence-administration.test.ts is not on this row yet: on
+      # windows-latest Bun 1.4.2 segfaults ("Segmentation fault at address
+      # 0x42") in its private-IPC test right after the native lock probe; the
+      # crash is Bun's, tracked in #6462, and the #5332 bound it exercised is
+      # covered by the forced probe inside postgres-disconnect-bounded.
+      # Upstream: oven-sh/bun#40023 ("Windows: dispatch libuv events from the
+      # event loop, not from inside libuv callbacks") is the fix for the
+      # class: on Windows a socket or pipe closed during a nested tick is
+      # freed while the outer libuv dispatch still holds it. Re-try the file
+      # on this row once a Bun release carries that change.
+      - name: Teardown bounds that used to park the Windows unit run (#5332)
+        run: bun test --timeout 120000 test/postgres-disconnect-bounded.test.ts
+      # Every earlier step runs under PowerShell 7, so Windows PowerShell 5.1, which the backup's owner-only protection
+      # launches, is still cold here: on #7409 its first starts outlasted the warm-up's 30 s and the protection's 15 s
+      # bounds. The cold path itself is covered by test/backup-powershell-warmup.serial.test.ts.
+      - name: Start Windows PowerShell once before the backup steps
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        run: powershell.exe -NoLogo -NoProfile -NonInteractive -Command "exit 0"
+      - name: Backup archive round trip on this host (#5312)
+        run: bun test --timeout 60000 test/backup-archive-roundtrip-5312.test.ts
+      # The stale-socket sweep's native AF_UNIX reparse-point path exists only on Windows; macOS runs the POSIX cases
+      # here (#6573: the fixture root is under /private/tmp, so the data-dir socket stays under gbrain's 103-byte limit
+      # instead of moving to the shortened fallback path); Linux runs them in the unit shards.
+      - name: Stale AF_UNIX socket sweep (native tag check on Windows, POSIX cases on macOS) (#5312, #6573)
+        if: runner.os == 'Windows' || runner.os == 'macOS'
+        run: bun test --timeout 60000 test/backup-stale-socket-5312.test.ts
+      - name: Hidden console windows from detached processes (#4992)
+        run: bun test --timeout 300000 test/windows-hidden-console.test.ts test/spawn-windows-hide.test.ts test/scripts/windows-hide-guard.test.ts
+      # A PGLite data dir too deep for afunix's 108-byte sun_path binds its sockets in the per-user run dir instead,
+      # under a non-ASCII profile path, with a 20-cycle bind/close stability probe (Bun Windows IPC crash class, #6462).
+      - name: Long Windows PGLite IPC paths use the per-user run dir (#6573)
+        if: runner.os == 'Windows'
+        run: bun test --timeout 120000 test/windows-ipc-long-path-6573.serial.test.ts
+
+  # bun audit blocks on pushes, schedules, manual runs, and pull requests or
+  # merge-queue entries that change bun.lock, admin/bun.lock, patches/ or a
+  # package.json dependency field (or carry the `dependency-audit` label).
+  # Elsewhere a new upstream advisory is a warning, so it cannot turn every
+  # open PR red at once; the push and nightly runs still fail on it (B11).
+  # Named exception with its rule (docs/ci-event-parity.md#dependency-audit-rule): a
+  # push-to-master red from a newly published advisory opens the Test master-red
+  # issue and a scheduled red the nightly-red issue; the repair PR bumps,
+  # overrides, patches or removes the dependency; when no fix exists, an
+  # expiring ignore entry needs Garry's approval.
+  dependency-audit:
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != pull_request ] && [ "$EVENT" != merge_group ]; then
+            printf 'blocking=true\nreason=%s runs always block\n' "$EVENT" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$LABELS" | grep -q '"dependency-audit"'; then
+            printf 'blocking=true\nreason=the dependency-audit label is set\n' >> "$GITHUB_OUTPUT"
+          else
+            files=''
+            if [ "$EVENT" = pull_request ]; then
+              if [[ "$CHANGED_FILES" =~ ^[0-9]{1,4}$ ]] && [ "$CHANGED_FILES" -lt 3000 ] \
+                && listed=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename') \
+                && [ "$(printf '%s\n' "$listed" | awk 'NF { n++ } END { print n+0 }')" -eq "$CHANGED_FILES" ]; then
+                files=$listed
+              fi
+            elif listed=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" --jq 'if (.files | length) >= 300 then error("capped") else .files[].filename end'); then
+              files=$listed
+            fi
+            # An unknown or capped diff stays empty, which classifies as blocking.
+            printf '%s' "$files" | bash scripts/ci-manifest-diff.sh dependency-scope >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun ../scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+        working-directory: admin
+      - name: bun audit (root + admin)
+        env:
+          BLOCKING: ${{ steps.scope.outputs.blocking }}
+          REASON: ${{ steps.scope.outputs.reason }}
+        run: bash scripts/ci-dependency-audit.sh
+
+  verify:
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
+    # Pre-test gates: privacy/jsonb/source-id/etc + admin-build (tsc runs in the typecheck job).
+    # Lives in its own runner so the matrix shards aren't carrying ~2-3min
+    # of verify work in addition to their test files (the old shape stuffed
+    # this into `test (1)` via `if: matrix.shard == 1`, which made shard 1
+    # the slowest matrix worker). scripts/run-verify-parallel.sh fans out
+    # the 20 checks via & + wait (~5s vs ~15-25s sequential).
+    # 8 vCPUs: measured 51s vs 48s on 16 and 58s on 4.
+    runs-on: ubicloud-standard-8-ubuntu-2404
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      # This job is the ONE designated saver of the bun cache (the others
+      # restore-only, so 5 redundant post-job save attempts disappear).
+      # admin/bun.lock is in the key because verify's check:admin-build
+      # installs from it.
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock', 'admin/bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-
+      # verify's runner sources test-env.sh and builds the snapshot for its
+      # PGLite-booting eval checks — restore the cache so it's the ~40ms
+      # freshness check, not a cold build ahead of all ~47 checks.
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: |
+            test/fixtures/pglite-snapshot.tar
+            test/fixtures/pglite-snapshot.version
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/ops/execution-prerequisites.ts', 'src/core/page-body/page-shape.ts', 'src/core/page-body/schema.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/insert-guard-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts', 'src/core/postgres-engine/read-write-transactions.ts', 'src/core/belief/schema.ts', 'src/core/fence-repair/reasons.ts', 'src/core/fence-repair/measured.ts', 'src/core/ai/errors.ts') }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
+      # check:schema-migration-order compares new schema migrations with
+      # origin/master's latest version; a depth-1 fetch of the ref is enough.
+      - run: git fetch --no-tags --depth=1 origin +refs/heads/master:refs/remotes/origin/master
+      # check:vendor-postgres rebuilds vendor/postgres from two pinned downloads (npm, GitHub). They are kept by content
+      # hash, so a transient outage cannot turn verify red; every file is hash-checked on use, so a mismatch still fails.
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.cache/gbrain-vendor
+          key: gbrain-vendor-${{ hashFiles('vendor/update-postgres.sh') }}
+      # Receipts (X2): verify records every check's real outcome (pass, fail,
+      # timeout, self-skip) as one JUnit testcase; logs stay on failure.
+      # The typecheck job below runs tsc, so verify skips its own copy here.
+      - run: bun run verify
+        env:
+          GBRAIN_VERIFY_SKIP_TYPECHECK: '1'
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+          GBRAIN_VERIFY_LOG_DIR: ${{ runner.temp }}/verify-logs
+      - name: Upload verify logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verify-logs
+          path: ${{ runner.temp }}/verify-logs
+          retention-days: 14
+          if-no-files-found: ignore
+          overwrite: true
+      # Guard: no bare `bun test` in workflows/scripts — bun ignores
+      # bunfig.toml's timeout, and hooks (beforeAll/afterAll) get the 5s
+      # default regardless of per-test third-arg timeouts. Runs directly
+      # (not via verify's CHECKS array) to avoid a package.json edit.
+      - run: bash scripts/check-bun-test-timeout.sh
+      # #5810: every tracked *.sh must parse under bash 3.2 (macOS /bin/bash).
+      # The real parser runs in the digest-pinned bash:3.2 image; REQUIRE
+      # turns a missing Docker into a failure instead of a skip, and makes the
+      # test's real-parser fixture cases mandatory.
+      - name: Shell scripts parse under bash 3.2
+        env:
+          GBRAIN_TEST_BASH32_REQUIRE: '1'
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+        run: |
+          bun run check:bash32
+          bash scripts/run-with-receipt.sh verify-tests bash32 -- bun test --timeout 60000 test/scripts/check-bash32.test.ts
+      # recipes/agent-voice's vitest unit suite (109 tests) ran in no workflow;
+      # pinned vitest + ws into a temp prefix, ~10s.
+      - name: agent-voice recipe unit tests (vitest)
+        run: bun run test:agent-voice
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-verify
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+
+  typecheck:
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base) }}
+    # tsc runs here, in parallel with verify, instead of inside verify's pool
+    # with its 120 s per-check cap. A change to a widely imported type (any new
+    # error code in src/core/error-registry.ts) makes the incremental check
+    # almost cold. On master c8354664 (run 39140170894), the cold check took
+    # 121 s in verify's pool and timed out at the cap. A timed-out tsc also
+    # writes no tsbuildinfo, so every rerun restored the same stale state.
+    # Step timeout from measurement: 3 x the worst cold CI time (121 s) is
+    # about 6 minutes. tsc is single-threaded, so 4 vCPUs (16 GB; peak heap
+    # is about 5.3 GB) do the work of verify's 8.
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock', 'admin/bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
+      # #6056: `bun run typecheck` is incremental against this tsbuildinfo, so
+      # a restored one from an earlier run lets tsc recheck only what changed.
+      # Rolling key: every run saves under its own SHA and the next run
+      # restores the newest one for the same bun.lock + tsconfig.json
+      # (a dependency or compiler-option change starts cold). After
+      # `bun install`, which (re)creates node_modules.
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: node_modules/.cache/gbrain-typecheck.tsbuildinfo
+          key: tsbuildinfo-${{ runner.os }}-${{ hashFiles('bun.lock', 'tsconfig.json') }}-${{ github.sha }}
+          restore-keys: |
+            tsbuildinfo-${{ runner.os }}-${{ hashFiles('bun.lock', 'tsconfig.json') }}-
+      - name: Typecheck (tsc, incremental)
+        timeout-minutes: 6
+        run: bun run typecheck
+      # Saved even when this check finds type errors, and whatever the other
+      # jobs do: tsc writes its state on an error too, so the next master run
+      # starts from this commit instead of an older, colder state.
+      - name: Save the typecheck state
+        if: always()
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: node_modules/.cache/gbrain-typecheck.tsbuildinfo
+          key: tsbuildinfo-${{ runner.os }}-${{ hashFiles('bun.lock', 'tsconfig.json') }}-${{ github.sha }}
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only. A
+  # pull request runs the cheap tier; this job runs in the full-ci dispatch on its
+  # head before merge (merge-train requires full-suite), on every push to master
+  # and on the nightly schedule.
+  serial-tests:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.reuse != 'true' && (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base))) }}
+    # *.serial.test.ts — one bun process per file (module-registry isolation),
+    # POOLED across files by scripts/run-serial-tests.sh (was strictly
+    # sequential: an 8.5-minute job whose serialization the quarantine
+    # contract never required). Lives in its own runner so the matrix shards
+    # aren't carrying the serial tail.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    # The pool is min(cpus, 4) processes: 8 vCPUs measured 222s for shard 2,
+    # the same as 16 (224s); 4 vCPUs took 277s. 4 vCPUs (C8): the shards
+    # finish in 2-3 minutes, far off the critical path, so the extra ~55s
+    # costs nothing while halving the lane's vCPU-minutes.
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    # Keep the existing timeout headroom for memory-constrained runners,
+    # bounded rescue attempts, and the machine-exclusive tail on shard 1.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-
+      # PGLite schema snapshot (~42MB): the runner builds it when absent or
+      # stale (its runtime hash is authoritative — a stale restore is rebuilt,
+      # never trusted). Cached so the build is paid once per schema change,
+      # not once per job per run. This job SAVES; verify + matrix + slow jobs
+      # restore-only. The key is an approximation on purpose: it only has to
+      # be a superset-trigger of real schema changes.
+      # HASH INPUTS HAVE 14 HOMES: 12 legacy keys (five here, six in
+      # e2e.yml, one in stress.yml) plus two default-profile keys here
+      # (slow-brainbench and brainbench). Edit all together when schema dependencies change;
+      # profile names stay distinct, and the serial save reuses its restore key.
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        id: snapshot-cache
+        with:
+          path: |
+            test/fixtures/pglite-snapshot.tar
+            test/fixtures/pglite-snapshot.version
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/ops/execution-prerequisites.ts', 'src/core/page-body/page-shape.ts', 'src/core/page-body/schema.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/insert-guard-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts', 'src/core/postgres-engine/read-write-transactions.ts', 'src/core/belief/schema.ts', 'src/core/fence-repair/reasons.ts', 'src/core/fence-repair/measured.ts', 'src/core/ai/errors.ts') }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
+      - run: bun run test:serial
+        env:
+          SHARD: ${{ matrix.shard }}/4
+          COVERAGE_DIR: ${{ runner.temp }}/coverage
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-serial-${{ matrix.shard }}
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+      - name: Upload coverage (serial lane)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-serial-${{ matrix.shard }}
+          path: ${{ runner.temp }}/coverage
+          retention-days: 14
+          if-no-files-found: ignore
+          overwrite: true
+      - name: Save legacy snapshot (single writer)
+        if: success() && matrix.shard == 1
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            test/fixtures/pglite-snapshot.tar
+            test/fixtures/pglite-snapshot.version
+          key: ${{ steps.snapshot-cache.outputs.cache-primary-key }}
+      - name: Upload serial timings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: timings-serial-${{ matrix.shard }}
+          path: |
+            .context/serial-timings.json
+            .context/serial-durations.txt
+          include-hidden-files: true
+          retention-days: 14
+          overwrite: true
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only. A
+  # pull request runs the cheap tier; this job runs in the full-ci dispatch on its
+  # head before merge (merge-train requires full-suite), on every push to master
+  # and on the nightly schedule.
+  slow-brainbench-e2e:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.reuse != 'true' && (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base))) }}
+    # Dedicated runner for the BrainBench CLI e2e file. At 98s mined it was
+    # the matrix's single heaviest atom (10% of the whole corpus weight) and
+    # the hard floor on shard-count scaling; a Phase-2 rewrite (spawn batching
+    # + deleting the CI-gate-duplicated full-corpus test) cut it to ~72s
+    # local, still far past the ~40s keep-in-matrix bar.
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: |
+            test/fixtures/pglite-snapshot.tar
+            test/fixtures/pglite-snapshot.version
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/ops/execution-prerequisites.ts', 'src/core/page-body/page-shape.ts', 'src/core/page-body/schema.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/insert-guard-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts', 'src/core/postgres-engine/read-write-transactions.ts', 'src/core/belief/schema.ts', 'src/core/fence-repair/reasons.ts', 'src/core/fence-repair/measured.ts', 'src/core/ai/errors.ts') }}
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            test/fixtures/pglite-snapshot-default.tar
+            test/fixtures/pglite-snapshot-default.version
+          key: pglite-snapshot-default-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/ops/execution-prerequisites.ts', 'src/core/page-body/page-shape.ts', 'src/core/page-body/schema.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/insert-guard-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts', 'src/core/postgres-engine/read-write-transactions.ts', 'src/core/belief/schema.ts', 'src/core/fence-repair/reasons.ts', 'src/core/fence-repair/measured.ts', 'src/core/ai/errors.ts') }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
+      - name: Ensure PGLite snapshot (build-or-validate, non-fatal)
+        # Absolutized: this file's batch jobs spawn CLI children with varying
+        # cwd (the outside-cwd case) where a relative path would silently miss.
+        run: |
+          . scripts/lib/test-env.sh
+          ensure_pglite_snapshot slow-brainbench
+          ensure_default_pglite_snapshot slow-brainbench
+          echo "GBRAIN_TEST_DEFAULT_SNAPSHOT=${GBRAIN_TEST_DEFAULT_SNAPSHOT:-}" >> "$GITHUB_ENV"
+          # Export absolute (CLI children spawn with varying cwd); keep an
+          # already-absolute inherited path as-is; export nothing on build failure.
+          if [ -n "${GBRAIN_PGLITE_SNAPSHOT:-}" ]; then
+            case "$GBRAIN_PGLITE_SNAPSHOT" in
+              /*) echo "GBRAIN_PGLITE_SNAPSHOT=$GBRAIN_PGLITE_SNAPSHOT" >> "$GITHUB_ENV" ;;
+              *)  echo "GBRAIN_PGLITE_SNAPSHOT=$PWD/$GBRAIN_PGLITE_SNAPSHOT" >> "$GITHUB_ENV" ;;
+            esac
+          fi
+      - run: bash scripts/run-with-receipt.sh slow brainbench-e2e -- bun test test/eval-brainbench-e2e.slow.test.ts --timeout=300000 --coverage --coverage-reporter=lcov --coverage-dir=${{ runner.temp }}/coverage/slowbrainbench
+        env:
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      - name: Write coverage lane manifest
+        run: |
+          printf '{"lane":"slowbrainbench","sha":"%s","lcovCount":%s,"complete":true}\n' \
+            "$GITHUB_SHA" "$(find "$RUNNER_TEMP/coverage" -name lcov.info | wc -l | tr -d ' ')" \
+            > "$RUNNER_TEMP/coverage/lane-manifest.json"
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-slow-brainbench
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+      - name: Upload coverage (slow-brainbench lane)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-slowbrainbench
+          path: ${{ runner.temp }}/coverage
+          retention-days: 14
+          if-no-files-found: ignore
+          overwrite: true
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only. A
+  # pull request runs the cheap tier; this job runs in the full-ci dispatch on its
+  # head before merge (merge-train requires full-suite), on every push to master
+  # and on the nightly schedule.
+  brainbench:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.reuse != 'true' && (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base))) }}
+    # BrainBench memory-conformance gate (Cathedral 2). Hermetic: in-memory
+    # PGLite, zero API keys, ~15s for the full 141-fixture × 3-harness run.
+    # Governance (decision 4): compares HEAD's run against MAIN's committed
+    # baseline via `git show origin/master:evals/brainbench/baselines/main.json`
+    # — a PR cannot rewrite the thing it's compared against. Exit 1 blocks the
+    # merge until the regression is fixed or blessed (justification in the
+    # updated baseline / fixture diff in corpus-bless mode).
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 10  # ~15s hermetic run; matches the per-job-timeout hardening (#2254)
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Fetch origin/master baseline ref (shallow)
+        # The gate reads ONE file via `git show origin/master:...` — a depth-1
+        # fetch of the master ref replaces the previous full 3700-commit clone.
+        run: git fetch --no-tags --depth=1 origin +refs/heads/master:refs/remotes/origin/master
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            test/fixtures/pglite-snapshot-default.tar
+            test/fixtures/pglite-snapshot-default.version
+          key: pglite-snapshot-default-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/ops/execution-prerequisites.ts', 'src/core/page-body/page-shape.ts', 'src/core/page-body/schema.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/insert-guard-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts', 'src/core/postgres-engine/read-write-transactions.ts', 'src/core/belief/schema.ts', 'src/core/fence-repair/reasons.ts', 'src/core/fence-repair/measured.ts', 'src/core/ai/errors.ts') }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
+      - run: bash scripts/ci-brainbench-gate.sh
+        env:
+          BRAINBENCH_OUT: ${{ runner.temp }}/brainbench-result.json
+      - name: BrainBench delta → step summary
+        if: always()
+        run: |
+          if [ -f "${{ runner.temp }}/brainbench-result.json" ]; then
+            bun scripts/render-brainbench-delta.ts "${{ runner.temp }}/brainbench-result.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only. A
+  # pull request runs the cheap tier; this job runs in the full-ci dispatch on its
+  # head before merge (merge-train requires full-suite), on every push to master
+  # and on the nightly schedule.
+  slow-entity-resolve-perf:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.reuse != 'true' && (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base))) }}
+    # Dedicated runner for the entity-resolve perf test (~159s, single perf
+    # describe with one test that builds 5000+ pages and asserts the NEW
+    # tryPrefixExpansion shape is 5x faster than the OLD shape — not
+    # subdivisible without weakening the perf guarantee). Pulled out of the
+    # matrix (see scripts/test-shard.sh) so a single 159s atom doesn't
+    # dominate a shard's wallclock. Runs in parallel with the matrix.
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: |
+            test/fixtures/pglite-snapshot.tar
+            test/fixtures/pglite-snapshot.version
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/ops/execution-prerequisites.ts', 'src/core/page-body/page-shape.ts', 'src/core/page-body/schema.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/insert-guard-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts', 'src/core/postgres-engine/read-write-transactions.ts', 'src/core/belief/schema.ts', 'src/core/fence-repair/reasons.ts', 'src/core/fence-repair/measured.ts', 'src/core/ai/errors.ts') }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
+      - name: Ensure PGLite snapshot (build-or-validate, non-fatal)
+        run: bash -c '. scripts/lib/test-env.sh && ensure_pglite_snapshot slow-perf && echo "GBRAIN_PGLITE_SNAPSHOT=${GBRAIN_PGLITE_SNAPSHOT:-}" >> "$GITHUB_ENV"'
+      # Two bun processes: each needs its own coverage dir (a reused dir is
+      # silently overwritten by the second process).
+      - run: bash scripts/run-with-receipt.sh slow entity-resolve-perf -- bun test test/entity-resolve-perf.slow.test.ts --timeout=300000 --coverage --coverage-reporter=lcov --coverage-dir=${{ runner.temp }}/coverage/perf-a
+        env:
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      # MEMORY_VERBS v1 (Cathedral 1): the entity() p99 < 100ms contract gate
+      # (20K-page corpus + ratio guard) shares this runner — same perf-job
+      # shape, runs in parallel with the matrix.
+      - run: bash scripts/run-with-receipt.sh slow entity-card-perf -- bun test test/entity-card-perf.slow.test.ts --timeout=300000 --coverage --coverage-reporter=lcov --coverage-dir=${{ runner.temp }}/coverage/perf-b
+        env:
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      # Export at scale: pull requests prove bounded keyset enumeration, sidecars
+      # and fence normalization on 10,001 pages (~30s); pushes, schedules and
+      # manual runs keep the 100,001-page scale (~4-10 minutes, one core).
+      # Named exception (docs/TESTING.md#event-parity): covered by every push to
+      # master and the nightly Test schedule.
+      - run: bash scripts/run-with-receipt.sh slow export-scale -- bun test test/export-scale.slow.test.ts --timeout=900000 --coverage --coverage-reporter=lcov --coverage-dir=${{ runner.temp }}/coverage/perf-c
+        env:
+          GBRAIN_TEST_EXPORT_SCALE_PAGES: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '10001' || '100001' }}
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+      - name: Write coverage lane manifest
+        run: |
+          printf '{"lane":"slowperf","sha":"%s","lcovCount":%s,"complete":true}\n' \
+            "$GITHUB_SHA" "$(find "$RUNNER_TEMP/coverage" -name lcov.info | wc -l | tr -d ' ')" \
+            > "$RUNNER_TEMP/coverage/lane-manifest.json"
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-slow-perf
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+      - name: Upload coverage (slow-perf lane)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-slowperf
+          path: ${{ runner.temp }}/coverage
+          retention-days: 14
+          if-no-files-found: ignore
+          overwrite: true
+      # Protocol self-certification: init a scratch brain and run the
+      # conformance kit against gbrain's own stdio server. --synthesize is
+      # safe here: no LLM key in CI, so it asserts the clean `unavailable`
+      # protocol error instead of spending tokens.
+      - name: MEMORY_VERBS conformance (self-certify, stdio)
+        run: |
+          export GBRAIN_HOME="$RUNNER_TEMP/gbrain-conformance"
+          bun run src/cli.ts init --pglite --no-embedding --non-interactive
+          bun run src/cli.ts protocol conformance --synthesize
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only. A
+  # pull request runs the cheap tier; this job runs in the full-ci dispatch on its
+  # head before merge (merge-train requires full-suite), on every push to master
+  # and on the nightly schedule.
+  test:
+    name: test (${{ join(matrix.shards, ', ') }})
+    needs: [changes]
+    if: ${{ needs.changes.outputs.reuse != 'true' && (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base))) }}
+    # Pure matrix shard — no verify, no serial. Each shard runs its slice
+    # of the unit test set under one `bun test` invocation.
+    #
+    # Two shards per runner (UNIT_SHARDS_PER_JOB, scripts/test-shard-pack.sh):
+    # one shard keeps 1.1-1.5 of the 4 vCPUs busy, so a runner runs two at
+    # once, each with its own coverage lane, receipts and timing log under the
+    # per-shard artifact names. Weights mined from these jobs include that
+    # contention: run 39181487354 (green, 9 jobs, 460 vCPU-minutes against
+    # 568 for 18 solo jobs) mined ~12,640s of file time, ~1.4x the solo
+    # weights.
+    #
+    # 22 shards (UNIT_SHARDS in scripts/sharding.ts): those ~12,640s are ~575s
+    # per shard. A shard's mined weight must fit this job's 22 minutes twice
+    # over, after a minute of setup, with a minute to spare
+    # (UNIT_SHARD_BUDGET_MS, 600s; test/scripts/unit-shard-budget.test.ts).
+    # At 18 the packed weights put every shard at ~702s; at 10 (~950s per
+    # shard) shards ran 0.8-1.4x their prediction and shard 5 was cancelled
+    # at the timeout on master run 39121354115.
+    #
+    # Partition policy is weight-aware LPT bin-packing via scripts/sharding.ts
+    # (replaces FNV-1a path hash). Weights live in scripts/test-weights.json,
+    # mined from real CI logs via scripts/mine-shard-weights.ts. Missing
+    # weights fall back to the corpus p75 — new test files work immediately.
+    # 4 vCPUs: a shard is one bun process (1.1-1.5 busy cores on average), but
+    # on 2 vCPUs the unit shard mean rose from 542s to 608s on PR #6013 and
+    # made Test the PR critical path, so shards stay on 4.
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    # 22, not 15: under parallel PR load the PGLite WASM cold-starts stretch a
+    # shard past 15 min while every test is still passing — the timeout then
+    # cancels the job and the test-status gate reads it as a failure. 13 runs
+    # died this way on 2026-07-21/22 alone.
+    timeout-minutes: 22
+    strategy:
+      fail-fast: false
+      matrix:
+        shards: [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], [11, 12], [13, 14], [15, 16], [17, 18], [19, 20], [21, 22]]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-
+      # Restore-only: test-shard.sh validates the snapshot's runtime hash and
+      # rebuilds when stale (the serial-tests job is the designated saver).
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: |
+            test/fixtures/pglite-snapshot.tar
+            test/fixtures/pglite-snapshot.version
+          key: pglite-snapshot-${{ runner.os }}-${{ hashFiles('src/core/*.ts', 'src/core/audit/redact-connection-info.ts', 'src/core/engine-sql/bootstrap.ts', 'src/core/schema-migrations/**', 'src/core/ai/defaults.ts', 'src/core/company-brain/receipt-schema.ts', 'src/core/entities/resolve.ts', 'src/core/facts/withdrawal-schema.ts', 'src/core/facts/relink-schema.ts', 'src/core/google/*.ts', 'src/core/grants/*.ts', 'src/core/minions/tools/brain-allowlist.ts', 'src/core/ops/contract.ts', 'src/core/ops/execution-prerequisites.ts', 'src/core/page-body/page-shape.ts', 'src/core/page-body/schema.ts', 'src/core/page-state/*schema.ts', 'src/core/persistence/*.ts', 'src/core/schema-pack/link-inference.ts', 'src/core/schema-pack/redos-guard.ts', 'src/core/search/alias-normalize.ts', 'src/core/search/private-visibility.ts', 'src/core/search/projection-statistics.ts', 'src/core/search/relational-intent.ts', 'src/core/shared-skills/*schema*.ts', 'src/core/ai/decide/schema.ts', 'test/helpers/legacy-embedding-config.ts', 'scripts/build-pglite-snapshot.ts', 'src/core/facts/purge-schema.ts', 'src/core/facts/insert-guard-schema.ts', 'src/core/facts/fts-index.ts', 'src/core/eligibility/generation-schema.ts', 'src/core/trust/schema.ts', 'src/core/trust/tier.ts', 'src/core/trust/allow-rules.ts', 'src/core/write-gate-schema.ts', 'src/core/questions/schema.ts', 'src/core/questions/identity.ts', 'src/core/questions/auto-think-migration.ts', 'src/core/loops/loops-schema.ts', 'src/core/postgres-engine/schema-lock-timeout.ts', 'src/core/postgres-engine/read-write-transactions.ts', 'src/core/belief/schema.ts', 'src/core/fence-repair/reasons.ts', 'src/core/fence-repair/measured.ts', 'src/core/ai/errors.ts') }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
+      # Runner diagnostics (GBRA-79), before and after the shard: cores, load,
+      # cumulative steal jiffies and the CPU model. A shard far above its
+      # predicted weight (test-shard.sh prints it) with high steal or a
+      # different model name is a slow or silently downgraded runner draw,
+      # not a test regression; the same shard at low steal is the tests.
+      # The memory sampler runs until the job ends: two shards share 16 GB.
+      - name: Runner diagnostics (before shard)
+        shell: bash
+        run: |
+          echo "nproc: $(nproc)"
+          echo "loadavg: $(cat /proc/loadavg)"
+          awk '/^cpu /{print "steal_jiffies", $9}' /proc/stat
+          lscpu | grep -m1 'Model name'
+          (while true; do free -m | awk '/^Mem:/{print $3, $7}' >> "$RUNNER_TEMP/mem.log"; sleep 5; done) > /dev/null 2>&1 &
+      - name: Run test shards ${{ join(matrix.shards, ' and ') }} of 22
+        shell: bash
+        run: bash scripts/test-shard-pack.sh 22 ${{ join(matrix.shards, ' ') }}
+        env:
+          GBRAIN_SHARD_PACK_DIR: ${{ runner.temp }}/shards
+      - name: Runner diagnostics (after shard)
+        if: always()
+        shell: bash
+        run: |
+          echo "nproc: $(nproc)"
+          echo "loadavg: $(cat /proc/loadavg)"
+          awk '/^cpu /{print "steal_jiffies", $9}' /proc/stat
+          lscpu | grep -m1 'Model name'
+          echo "memory MB: peak used $(sort -n -k1 "$RUNNER_TEMP/mem.log" | tail -1 | cut -d' ' -f1), least available $(sort -n -k2 "$RUNNER_TEMP/mem.log" | head -1 | cut -d' ' -f2), total $(free -m | awk '/^Mem:/{print $2}')"
+      - name: Upload receipts (shard ${{ matrix.shards[0] }})
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-unit-${{ matrix.shards[0] }}
+          path: ${{ runner.temp }}/shards/${{ matrix.shards[0] }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+      - name: Upload coverage (shard lane ${{ matrix.shards[0] }})
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-shard-${{ matrix.shards[0] }}
+          path: ${{ runner.temp }}/shards/${{ matrix.shards[0] }}/coverage
+          retention-days: 14
+          if-no-files-found: ignore
+          overwrite: true
+      - name: Upload unit timing log (shard ${{ matrix.shards[0] }})
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: timings-unit-${{ matrix.shards[0] }}
+          path: ${{ runner.temp }}/shards/${{ matrix.shards[0] }}/unit.log
+          retention-days: 14
+          overwrite: true
+      - name: Upload receipts (shard ${{ matrix.shards[1] }})
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-unit-${{ matrix.shards[1] }}
+          path: ${{ runner.temp }}/shards/${{ matrix.shards[1] }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+      - name: Upload coverage (shard lane ${{ matrix.shards[1] }})
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-shard-${{ matrix.shards[1] }}
+          path: ${{ runner.temp }}/shards/${{ matrix.shards[1] }}/coverage
+          retention-days: 14
+          if-no-files-found: ignore
+          overwrite: true
+      - name: Upload unit timing log (shard ${{ matrix.shards[1] }})
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: timings-unit-${{ matrix.shards[1] }}
+          path: ${{ runner.temp }}/shards/${{ matrix.shards[1] }}/unit.log
+          retention-days: 14
+          overwrite: true
+
+
+  # ──────────────────────────────────────────────────────────────────────
+  # coverage-report: merges the PR corpus (22 unit + 4 serial + 2 slow
+  # lanes) into one honest number, renders it to the step summary, and runs
+  # the diff + baseline gates in report-only mode (COVERAGE_GATE_ENFORCE=0).
+  # ADVISORY during the report-only window: deliberately NOT in test-status's
+  # required set — coverage reporting stays advisory until the gate
+  # graduates (that PR adds it to the aggregate and flips ENFORCE).
+  # `always()` is load-bearing: without it, a failed shard skips this job at
+  # exactly the moment the (degraded) report matters most.
+  # ──────────────────────────────────────────────────────────────────────
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only. A
+  # pull request runs the cheap tier; this job runs in the full-ci dispatch on its
+  # head before merge (merge-train requires full-suite), on every push to master
+  # and on the nightly schedule.
+  coverage-report:
+    needs: [changes, serial-tests, slow-entity-resolve-perf, slow-brainbench-e2e, test]
+    if: ${{ needs.changes.outputs.reuse != 'true' && always() && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base)) }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          fetch-depth: 0  # diff gate needs origin/master; baseline gate reads git show origin/master:
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile
+      - name: Download per-lane coverage artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: coverage-*
+          path: ${{ runner.temp }}/coverage-artifacts
+      - name: Merge lanes
+        env:
+          COVERAGE_CORPUS: prCorpus
+        run: |
+          bun scripts/merge-lcov.ts \
+            --out-lcov "$RUNNER_TEMP/coverage-merged/lcov.info" \
+            --out-json "$RUNNER_TEMP/coverage-merged/summary.json" \
+            --manifest-expect shard-1,shard-2,shard-3,shard-4,shard-5,shard-6,shard-7,shard-8,shard-9,shard-10,shard-11,shard-12,shard-13,shard-14,shard-15,shard-16,shard-17,shard-18,shard-19,shard-20,shard-21,shard-22,serial-1,serial-2,serial-3,serial-4,slowperf,slowbrainbench \
+            "$RUNNER_TEMP/coverage-artifacts"
+      - name: Coverage summary → step summary
+        run: bun scripts/render-coverage-summary.ts --summary "$RUNNER_TEMP/coverage-merged/summary.json" --structural scripts/structural-suites.tsv >> "$GITHUB_STEP_SUMMARY"
+      - name: Diff coverage gate (report-only until graduation)
+        # shell: bash is load-bearing: the default `bash -e {0}` has NO
+        # pipefail, so the tee pipe would mask the gate's exit code — the
+        # graduated gate could never fail the job.
+        shell: bash
+        env:
+          COVERAGE_GATE_ENFORCE: '0'
+        run: bun scripts/coverage-diff-gate.ts --summary "$RUNNER_TEMP/coverage-merged/summary.json" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Baseline gate (prCorpus, like-for-like)
+        shell: bash
+        env:
+          COVERAGE_GATE_ENFORCE: '0'
+        run: bun scripts/coverage-baseline-gate.ts --summary "$RUNNER_TEMP/coverage-merged/summary.json" --corpus prCorpus | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload merged coverage
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage-merged
+          path: ${{ runner.temp }}/coverage-merged
+          retention-days: 14
+          if-no-files-found: ignore
+          overwrite: true
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): a pull request (cheap
+  # tier) runs the native cells only when its diff touches native code (scope other
+  # than smoke); the full-ci dispatch, every push and the nightly run them all.
+  native-locks:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.reuse != 'true' && ((github.event_name != 'pull_request' || needs.changes.outputs.native-scope != 'smoke') && (github.event_name != 'workflow_dispatch' || (inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base))) }}
+    uses: ./.github/workflows/native-locks.yml
+    # statuses: the darwin-x64 cells' diag/native-heartbeat/<cell> commit statuses (native-locks.yml); actions: read for its
+    # heartbeat-finalize job, which reads the run's job conclusions.
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    with:
+      scope: ${{ needs.changes.outputs.native-scope }}
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): a pull request (cheap
+  # tier) calls it only when its diff can change persistence or managed sync, and
+  # then runs only the crash robot and convergence; the full-ci dispatch, every
+  # push and the nightly run every lane.
+  persistence-validation:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.reuse != 'true' && ((github.event_name != 'pull_request' || needs.changes.outputs.convergence != 'skip') && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base))) }}
+    uses: ./.github/workflows/persistence-validation.yml
+    with:
+      convergence: ${{ needs.changes.outputs.convergence || 'run' }}
+
+  # PR stress gate (docs/TESTING.md#stress-gate): every added or modified test
+  # file, plus direct importers of changed test/helpers/ files by the fan-in
+  # rule, runs 10 times with a fresh database per iteration. Named exception
+  # (docs/TESTING.md#event-parity): outside pull_request and merge_group it
+  # succeeds with "not a PR event", since push and nightly runs execute every
+  # file. Its conclusion is success or failure, never skipped, so test-status
+  # gates on it.
+  stress-changed-tests:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only != true }}
+    permissions:
+      contents: read
+      issues: read
+      actions: read
+    uses: ./.github/workflows/stress.yml
+    with:
+      mode: gate
+      stress_files: ${{ inputs.stress_files || '' }}
+      stress_base: ${{ inputs.stress_base || '' }}
+      stress_head: ${{ inputs.stress_head || '' }}
+
+  # Race hunt (docs/TESTING.md#race-hunt): every file in test/postgres-unit-arms.txt
+  # 10 times against Postgres. Named exception (docs/TESTING.md#event-parity):
+  # the nightly Test schedule and a race_hunt dispatch only, and outside
+  # test-status: a red lands in the Test nightly-red issue, one line per file.
+  race-hunt:
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.race_hunt == true) }}
+    permissions:
+      contents: read
+      issues: read
+      actions: read
+    uses: ./.github/workflows/stress.yml
+    with:
+      mode: race-hunt
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only. A
+  # pull request runs the cheap tier; this job runs in the full-ci dispatch on its
+  # head before merge (merge-train requires full-suite), on every push to master
+  # and on the nightly schedule.
+  admin-browser:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.reuse != 'true' && (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base))) }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun ../scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+        working-directory: admin
+      # The browser download comes from Playwright's CDN, which has served it at
+      # 250 KB/s (.204, #6613); restoring it keeps most runs off the CDN. The key
+      # is the browser revisions the installed Playwright pins. The suite runs
+      # headless, so only the headless shell is installed (114 MiB, not 301).
+      - name: Restore the pinned Chromium browser
+        id: playwright-browsers
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-browsers-${{ runner.os }}-${{ hashFiles('node_modules/playwright-core/browsers.json') }}
+      - name: Install the pinned Chromium browser and OS dependencies (bounded, retried once)
+        timeout-minutes: 10
+        run: bun scripts/ci-bounded-run.ts --idle-s 120 --total-s 560 --retry-s 10 --hint "an apt mirror or browser CDN stall; this normally takes 15-50s" -- bunx playwright install --with-deps --only-shell chromium
+      - name: Save the pinned Chromium browser
+        if: steps.playwright-browsers.outputs.cache-hit != 'true'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684  # v4.2.3
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ steps.playwright-browsers.outputs.cache-primary-key }}
+      - name: Build the shipped admin assets
+        run: bun run build:admin
+      - name: Exercise owner administration and native OAuth in Chromium
+        run: bun run test:admin
+      - name: Retain browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: admin-browser-failures
+          path: .context/admin-browser-results
+          include-hidden-files: true
+          retention-days: 7
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only. A
+  # pull request runs the cheap tier; this job runs in the full-ci dispatch on its
+  # head before merge (merge-train requires full-suite), on every push to master
+  # and on the nightly schedule.
+  shared-skills-compatibility:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.reuse != 'true' && (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base))) }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      - name: Build the pinned pre-feature executable
+        run: bash scripts/build-shared-skills-baseline.sh "$RUNNER_TEMP/gbrain-before-shared-skills"
+      - name: Reject old consumers before they change shared skill state
+        env:
+          GBRAIN_TEST_OLD_BINARY: ${{ runner.temp }}/gbrain-before-shared-skills
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+        run: bash scripts/run-with-receipt.sh shared-skills old-binary -- bun test --timeout 180000 test/persistence-skill-old-binary.slow.test.ts
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-shared-skills
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+
+  # Report-only executed-test ledger (X2): every lane's receipts in one
+  # identity table (step summary + JSON artifact). Not in test-status: a
+  # comparison against a baseline run is the parent's local call:
+  #   bun scripts/ci-executed-counts.ts --base-run <id> --head-run <id>
+  executed-receipts:
+    needs: [changes, verify, serial-tests, slow-entity-resolve-perf, slow-brainbench-e2e, test, shared-skills-compatibility, persistence-validation]
+    if: ${{ needs.changes.outputs.reuse != 'true' && always() && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base)) }}
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          sparse-checkout: |
+            scripts/ci-executed-counts.ts
+            scripts/ci-manifest.ts
+            docs/test-audit/2026-10-04/expected-deltas.tsv
+          sparse-checkout-cone-mode: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.4.4
+      - name: Download receipts
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: receipts-*
+          path: ${{ runner.temp }}/receipts
+      - name: Executed-test identities → step summary (report-only)
+        run: |
+          mkdir -p "$RUNNER_TEMP/receipts"
+          bun scripts/ci-executed-counts.ts --head-dir "$RUNNER_TEMP/receipts" --report-only \
+            --expect-attempt "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" \
+            --summary "$GITHUB_STEP_SUMMARY" --json "$RUNNER_TEMP/executed-identities.json" > /dev/null
+      - name: Upload identity ledger
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: executed-identities
+          path: ${{ runner.temp }}/executed-identities.json
+          retention-days: 14
+          if-no-files-found: ignore
+          overwrite: true
+      # Versioned failure and execution manifest bound to this SHA, run and
+      # attempt; nightly-watch reads it to list every failing test and to
+      # prove a file ran and passed before it clears a master-red failure.
+      - name: Failure and execution manifest (nightly-watch evidence)
+        if: always()
+        run: bun scripts/ci-manifest.ts --receipts-dir "$RUNNER_TEMP/receipts" --out "$RUNNER_TEMP/ci-manifest.json" --summary "$GITHUB_STEP_SUMMARY"
+      - name: Upload failure manifest
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-manifest
+          path: ${{ runner.temp }}/ci-manifest.json
+          retention-days: 30
+          if-no-files-found: warn
+          overwrite: true
+
+  # The stable aggregate succeeds only when every required lane ran successfully.
+  # Coverage percentages remain advisory until their separate graduation.
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only. A
+  # pull request runs the cheap tier; this job runs in the full-ci dispatch on its
+  # head before merge (merge-train requires full-suite), on every push to master
+  # and on the nightly schedule.
+  test-status:
+    name: ${{ (github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.native_only == true || inputs.race_hunt == true || inputs.stress_files != '' || inputs.stress_base != ''))) && 'full-suite-not-run' || 'test-status' }}
+    needs: [changes, gitleaks, security-regressions, dependency-audit, verify, typecheck, serial-tests, slow-entity-resolve-perf, slow-brainbench-e2e, brainbench, test, native-locks, persistence-validation, admin-browser, shared-skills-compatibility, stress-changed-tests]
+    if: ${{ needs.changes.outputs.reuse != 'true' && always() && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base)) }}
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate result
+        run: |
+          CHANGES="${{ needs.changes.result }}"
+          GITLEAKS="${{ needs.gitleaks.result }}"
+          SECURITY="${{ needs.security-regressions.result }}"
+          AUDIT="${{ needs.dependency-audit.result }}"
+          VERIFY="${{ needs.verify.result }}"
+          TYPECHECK="${{ needs.typecheck.result }}"
+          SERIAL="${{ needs.serial-tests.result }}"
+          SLOW_PERF="${{ needs.slow-entity-resolve-perf.result }}"
+          SLOW_BRAINBENCH="${{ needs.slow-brainbench-e2e.result }}"
+          BRAINBENCH="${{ needs.brainbench.result }}"
+          TEST="${{ needs.test.result }}"
+          NATIVE_LOCKS="${{ needs.native-locks.result }}"
+          PERSISTENCE="${{ needs.persistence-validation.result }}"
+          ADMIN_BROWSER="${{ needs.admin-browser.result }}"
+          SKILL_COMPATIBILITY="${{ needs.shared-skills-compatibility.result }}"
+          STRESS="${{ needs.stress-changed-tests.result }}"
+          echo "changes=$CHANGES  gitleaks=$GITLEAKS  security-regressions=$SECURITY  dependency-audit=$AUDIT  verify=$VERIFY  typecheck=$TYPECHECK  serial-tests=$SERIAL  slow-entity-resolve-perf=$SLOW_PERF  slow-brainbench-e2e=$SLOW_BRAINBENCH  brainbench=$BRAINBENCH  test=$TEST  native-locks=$NATIVE_LOCKS  persistence=$PERSISTENCE  admin-browser=$ADMIN_BROWSER"
+          echo "shared-skills-compatibility=$SKILL_COMPATIBILITY  stress-changed-tests=$STRESS"
+          for r in "$CHANGES" "$GITLEAKS" "$SECURITY" "$AUDIT" "$VERIFY" "$TYPECHECK" "$SERIAL" "$SLOW_PERF" "$SLOW_BRAINBENCH" "$BRAINBENCH" "$TEST" "$NATIVE_LOCKS" "$PERSISTENCE" "$ADMIN_BROWSER" "$SKILL_COMPATIBILITY" "$STRESS"; do
+            if [ "$r" != "success" ]; then
+              echo "✗ gated job did not succeed (got $r) — CI fail"
+              exit 1
+            fi
+          done
+          echo "✓ all gated jobs succeeded — CI green"
+
+
+  # Full CI on pull requests (docs/ci-event-parity.md#full-ci-on-pull-requests): the
+  # check merge-train reads. It succeeds only when test-status did on the same
+  # run, and a pull-request run (the cheap tier) names it full-suite-not-run, so
+  # a cheap green can never produce it. Its artifact records the tree the run
+  # tested, which scripts/ci-reuse.ts compares on a push to master.
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only;
+  # a pull request gets it from the full-ci dispatch on its head.
+  full-suite:
+    name: ${{ (github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && (inputs.native_only == true || inputs.race_hunt == true || inputs.stress_files != '' || inputs.stress_base != ''))) && 'full-suite-not-run' || 'full-suite' }}
+    needs: [changes, test-status]
+    if: ${{ needs.changes.outputs.reuse != 'true' && always() && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || (inputs.native_only != true && inputs.race_hunt != true && !inputs.stress_files && !inputs.stress_base)) }}
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - name: Require test-status
+        env:
+          TEST_STATUS: ${{ needs.test-status.result }}
+        run: |
+          if [ "$TEST_STATUS" != success ]; then
+            echo "::error::full-suite requires test-status to succeed on this run (got $TEST_STATUS)"
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/ci-full-suite-tree.sh
+          sparse-checkout-cone-mode: false
+      - name: Record the tested tree
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/full-suite
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW: ${{ github.workflow }}
+          EVENT: ${{ github.event_name }}
+        run: bash scripts/ci-full-suite-tree.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: full-suite-tree
+          path: ${{ runner.temp }}/full-suite/tree.json
+          retention-days: 30
+          overwrite: true
+
+  # The cheap tier's result (docs/ci-event-parity.md#full-ci-on-pull-requests). It never
+  # reports test-status or full-suite; its name and step summary say the full
+  # suite did not run. The persistence and native lanes may be skipped only when
+  # their own diff selectors left them out.
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): pull requests only;
+  # every other event runs the full profile and reports full-suite instead.
+  cheap-tier:
+    name: cheap-tier (full suite not run)
+    needs: [changes, gitleaks, security-regressions, dependency-audit, verify, typecheck, stress-changed-tests, native-locks, persistence-validation]
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/ci-cheap-tier.sh
+          sparse-checkout-cone-mode: false
+      - name: Aggregate the cheap tier
+        env:
+          GITLEAKS: ${{ needs.gitleaks.result }}
+          SECURITY: ${{ needs.security-regressions.result }}
+          AUDIT: ${{ needs.dependency-audit.result }}
+          VERIFY: ${{ needs.verify.result }}
+          TYPECHECK: ${{ needs.typecheck.result }}
+          STRESS: ${{ needs.stress-changed-tests.result }}
+          NATIVE: ${{ needs.native-locks.result }}
+          NATIVE_SCOPE: ${{ needs.changes.outputs.native-scope }}
+          PERSISTENCE: ${{ needs.persistence-validation.result }}
+          CONVERGENCE: ${{ needs.changes.outputs.convergence }}
+        run: bash scripts/ci-cheap-tier.sh
+
+  # Master-push reuse marker (scripts/ci-reuse.ts, scripts/release-gate.ts): exists
+  # only in a push run that reused a passed full-suite run of its exact tree; the
+  # release gate reads its reuse.json.
+  reused-full-suite:
+    needs: [changes]
+    if: ${{ needs.changes.outputs.reuse == 'true' }}
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 2
+    steps:
+      - env:
+          SOURCE: ${{ needs.changes.outputs.reuse-source-run-id }}
+        run: echo "Reused full-suite run $SOURCE (identical tree)"
+
+  # A native-only run emits its own scoped result, never the required full-suite check.
+  native-only-status:
+    name: Native-only result (full CI not run)
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.native_only == true }}
+    needs: [native-locks]
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - name: Record validation scope
+        env:
+          NATIVE_RESULT: ${{ needs.native-locks.result }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
+          case "$NATIVE_RESULT" in success|failure|cancelled|skipped) ;; *) exit 1 ;; esac
+          printf '{"scope":"native-only","full_ci":false,"head":"%s","run_id":"%s","native_result":"%s"}\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$NATIVE_RESULT" > native-only-scope.json
+          echo 'Native-only validation. The full Test suite was not run.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload validation scope
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-only-validation-scope
+          path: native-only-scope.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Require native success
+        env:
+          NATIVE_RESULT: ${{ needs.native-locks.result }}
+        run: test "$NATIVE_RESULT" = success

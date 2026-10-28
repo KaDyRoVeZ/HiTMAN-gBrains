@@ -1,0 +1,411 @@
+/**
+ * v0.40.3.0 — per-chunk synopsis generator.
+ *
+ * For the tokenmax tier (D1 — Anthropic's published per-chunk synopsis
+ * method), this module owns:
+ *
+ *   - Routing the synopsis call through `gateway.chat()` —
+ *     the cheapest tier per CLAUDE.md gateway docs.
+ *   - The richer failure envelope from D27 P1-2: distinguishing
+ *     refusal / empty / malformed (→ page-level fall-back to title-only
+ *     per D14) from auth_failure / rate_limit / timeout / network /
+ *     provider_5xx (→ retry per gateway, or throw to Minion retry).
+ *   - Process-local LRU cache keyed by
+ *     `(content_hash, chunk_index, corpus_generation, source_text_hash)`
+ *     per D27 P1-4. Source-text changes (adjacent chunks, frontmatter,
+ *     fallback chain) invalidate the cache correctly because
+ *     source_text_hash is in the key.
+ *
+ * Calibration injection is DELIBERATELY ABSENT (D21 reversed the original
+ * D7 acceptance: bias tags are mutable answer-time context that don't
+ * belong in static document vectors — embedding the calibration profile
+ * would silently stale embeddings on every calibration cycle update).
+ * Calibration-driven personalization belongs at query time, not at embed
+ * time; see `~/.gstack/projects/garrytan-gbrain/ceo-plans/
+ * 2026-05-22-v0403-contextual-retrieval.md` "Deferred to TODOS.md" for
+ * the v0.41+ query-side personalization wave.
+ *
+ * No DB access — pure orchestration over gateway + LRU cache. The service
+ * layer (`src/core/contextual-retrieval-service.ts`) drives the per-page
+ * loop and handles page-level fall-back.
+ */
+
+import { readProviderFailureSignals } from './ai/errors.ts';
+import { chat, type ChatOpts, type ChatResult } from './ai/gateway.ts';
+import { logSynopsisFailure, type SynopsisFailureKind } from './audit-synopsis.ts';
+import { sanitizeSynopsis } from './embedding-context.ts';
+import { resolveTierDefault } from './model-config.ts';
+import { reservationCostUsd } from './budget/reservation-cost.ts';
+import { safeSplitIndex } from './text-safe.ts';
+
+/**
+ * Default cap on synopsis output tokens. ~200 tokens gives 50-100 token
+ * synopsis with some headroom; the wrapper layer caps the final
+ * synopsis at SUMMARY_HARD_CAP_CHARS (300) regardless.
+ *
+ * #3883: overridable per call via `GeneratePerChunkSynopsisArgs.maxTokens`,
+ * threaded from the `models.synopsis_max_tokens` config by the service
+ * layer (this module stays DB-free). Exported so the service's config
+ * resolver and tests share the default.
+ */
+export const SYNOPSIS_MAX_TOKENS = 200;
+
+/**
+ * Stable synopsis-model anchor for corpus_generation hashing (title-mode
+ * pages and the inline import path) — NOT the live chat default. Changing
+ * this string invalidates prior embeddings via the D27 P1-5 contract; the
+ * live default is the key-aware utility tier (#3813).
+ */
+export const DEFAULT_SYNOPSIS_MODEL = 'anthropic:claude-haiku-4-5-20251001';
+
+/**
+ * Hard cap on `documentText` length (chars) before send.
+ *
+ * 2026-05-25 fix wave: small local chat models (Gemma 4 E2B, Qwen3 4B) get
+ * dramatically slower on long contexts even with 131K-token windows declared.
+ * A 73K-char page synopsis on Gemma 4 E2B takes 60-120s, exceeding the
+ * worker's default 30s `lockDuration` and tripping `lock-lost` errors.
+ *
+ * Truncate to a budget that fits a small model's effective throughput while
+ * preserving enough document context for the synopsis to be useful. Truncates
+ * the TAIL because the head (title, frontmatter, intro) carries the
+ * document-level anchor the synopsis needs.
+ *
+ * Override per workload via `GBRAIN_SYNOPSIS_DOC_MAX_CHARS`. Default 32768
+ * (~8K tokens at 4 chars/tok) keeps small-model synopsis under ~30s.
+ * Anthropic Haiku is unaffected at this cap; bump higher when running
+ * frontier models if you want richer document anchoring.
+ */
+export const SYNOPSIS_DOC_MAX_CHARS = (() => {
+  const env = process.env.GBRAIN_SYNOPSIS_DOC_MAX_CHARS;
+  if (env && /^\d+$/.test(env)) {
+    const n = parseInt(env, 10);
+    if (n >= 512 && n <= 1_048_576) return n;
+  }
+  return 32768;
+})();
+
+/**
+ * Synopsis prompt version. Folded into corpus_generation so prompt edits
+ * invalidate prior embeddings via the v0.40.3.0 query_cache.page_generations
+ * contract (D27 P1-5). Bump on any prompt-text change that meaningfully
+ * shifts synopsis semantics.
+ */
+export const SYNOPSIS_PROMPT_VERSION = 1;
+
+export const SYNOPSIS_SYSTEM_PROMPT = [
+  'You generate one-sentence chunk synopses for a personal knowledge brain.',
+  '',
+  'Given a document (the FULL_DOCUMENT block) and a chunk from it (the CHUNK',
+  'block), write a single concise sentence that orients the chunk within the',
+  'document. Name the entities, time, and topic that the chunk is about,',
+  'using terms that would appear in user queries.',
+  '',
+  'Rules:',
+  '- One sentence, 15-30 words.',
+  '- No preamble like "This chunk is about" — just write the synopsis.',
+  '- Use the exact entity names from the document, not generic terms.',
+  '- If the chunk is structural (heading, code block, list of links), say so.',
+  '- Plain text only. No markdown, no quotes, no XML tags.',
+].join('\n');
+
+export interface GeneratePerChunkSynopsisArgs {
+  /** The full document text (source file, chunk-concat, or chunk-alone per D11). */
+  documentText: string;
+  /** The chunk for which we're generating the synopsis. */
+  chunkText: string;
+  /** The page's title — gives the synopsis model a document-level anchor. */
+  pageTitle: string;
+  /** Page slug for audit logging on failure. */
+  pageSlug: string;
+  /** Source id for audit logging on failure. */
+  sourceId: string;
+  /** Chunk index (0-based) for audit logging on failure. */
+  chunkIndex: number;
+  /** Optional model override (resolves through gateway recipes). */
+  model?: string;
+  /** Optional abort signal threaded through gateway.chat. */
+  abortSignal?: AbortSignal;
+  /**
+   * #3883: output-token cap for the synopsis call. Defaults to
+   * SYNOPSIS_MAX_TOKENS (200). The service layer threads the
+   * `models.synopsis_max_tokens` config here.
+   */
+  maxTokens?: number;
+}
+
+/**
+ * Discriminated result. Caller dispatches on `kind`:
+ *
+ *   - `success` → use `.synopsis` as the wrapper input
+ *   - failure variants → see D27 P1-2 dispatch in the service layer
+ */
+export type GeneratePerChunkSynopsisResult =
+  | { kind: 'success'; synopsis: string; usage?: ChatResult['usage'] }
+  | { kind: SynopsisFailureKind; detail?: string; usage?: ChatResult['usage'] };
+
+/**
+ * Generate one synopsis for one chunk. ~$0.00006 per call at Haiku 4.5
+ * pricing (assuming ~500 input tokens + 50 output tokens for typical
+ * personal-brain page sizes).
+ *
+ * Caller is responsible for:
+ *   - Rate-leasing via `src/core/minions/rate-leases.ts` (the SERVICE
+ *     layer does this with a resolved-model-specific synopsis key per D26 P0-3).
+ *   - LRU caching by `(content_hash, chunk_index, corpus_generation,
+ *     source_text_hash)`. This module is a pure transformer — no cache
+ *     lookup here; the service decides when to call us.
+ *   - Audit logging on failure (we DO emit `logSynopsisFailure` for the
+ *     forensic trail per D17, but `page_level_fallback` is set by the
+ *     service after deciding whether refusal triggered the D14 page-wide
+ *     fall-back to title-only).
+ */
+export async function generatePerChunkSynopsis(
+  args: GeneratePerChunkSynopsisArgs,
+): Promise<GeneratePerChunkSynopsisResult> {
+  const maxTokens = args.maxTokens ?? SYNOPSIS_MAX_TOKENS;
+
+  const chatOpts: ChatOpts = {
+    // #3813: key-aware tier default, not the hardcoded hash anchor above —
+    // an OPENAI_API_KEY-only install must not route to Anthropic.
+    model: args.model ?? resolveTierDefault('utility'),
+    system: SYNOPSIS_SYSTEM_PROMPT,
+    // PR #6341: the title + document block is the only prefix every chunk of
+    // a page shares (the ~190-token system prompt is below every published
+    // minimum cacheable length), so it rides on its own `cache: true` block
+    // and the chunk follows in a second block. Joined with '\n' the two are
+    // byte-identical to the former single string (that is how the claude-cli
+    // adapter renders them), so SYNOPSIS_PROMPT_VERSION is unchanged.
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: buildPagePrompt(args.pageTitle, args.documentText), cache: true },
+        { type: 'text', text: buildChunkPrompt(args.chunkText) },
+      ],
+    }],
+    maxTokens,
+    thinking: 'off',
+    abortSignal: args.abortSignal,
+    cacheSystem: true,
+  };
+
+  let result: ChatResult;
+  try {
+    result = await chat(chatOpts);
+  } catch (err) {
+    const classified = classifyChatError(err);
+    logSynopsisFailure({
+      pageSlug: args.pageSlug,
+      sourceId: args.sourceId,
+      chunkIndex: args.chunkIndex,
+      kind: classified.kind,
+      detail: classified.detail,
+      // Whether this triggers page-level fall-back depends on the
+      // refusal/empty/malformed vs transient distinction — service decides
+      // after seeing the result. Audit reflects the service-known state at
+      // log time; here we conservatively record what we know.
+      pageLevelFallback: classified.kind === 'refusal' || classified.kind === 'empty' || classified.kind === 'malformed',
+    });
+    return { kind: classified.kind, detail: classified.detail };
+  }
+
+  // Refusal-class signals from the chat result. Gateway maps provider-
+  // specific stop reasons to the union in `ChatResult.stopReason`.
+  if (result.stopReason === 'refusal' || result.stopReason === 'content_filter') {
+    logSynopsisFailure({
+      pageSlug: args.pageSlug,
+      sourceId: args.sourceId,
+      chunkIndex: args.chunkIndex,
+      kind: 'refusal',
+      detail: `stop_reason=${result.stopReason}`,
+      pageLevelFallback: true,
+    });
+    return { kind: 'refusal', detail: `stop_reason=${result.stopReason}`, usage: result.usage };
+  }
+
+  // #3883: stop_reason 'length' means the model hit maxTokens mid-sentence —
+  // the text is a truncated fragment, not a synopsis. Embedding it would bake
+  // the truncation artifact into the vector; classify as malformed so the
+  // service demotes the page to the title-only fall-back (same lane as an
+  // unparseable response), instead of silently embedding truncated text.
+  if (result.stopReason === 'length') {
+    const detail = `stop_reason=length (maxTokens=${maxTokens} exhausted; raise models.synopsis_max_tokens)`;
+    logSynopsisFailure({
+      pageSlug: args.pageSlug,
+      sourceId: args.sourceId,
+      chunkIndex: args.chunkIndex,
+      kind: 'malformed',
+      detail,
+      pageLevelFallback: true,
+    });
+    return { kind: 'malformed', detail, usage: result.usage };
+  }
+
+  const synopsis = sanitizeSynopsis(result.text);
+  if (!synopsis) {
+    logSynopsisFailure({
+      pageSlug: args.pageSlug,
+      sourceId: args.sourceId,
+      chunkIndex: args.chunkIndex,
+      kind: 'empty',
+      detail: `length=${result.text.length}`,
+      pageLevelFallback: true,
+    });
+    return { kind: 'empty', detail: `length=${result.text.length}`, usage: result.usage };
+  }
+
+  // Content-shape malformed detection stays minimal: synopses are plain
+  // text by prompt contract, so any non-empty text after sanitization
+  // counts as success (truncation is caught structurally via the
+  // stop_reason==='length' check above, #3883). Future extension could
+  // parse a JSON-shaped response with `{synopsis, confidence}`.
+
+  return { kind: 'success', synopsis, usage: result.usage };
+}
+
+export function buildPagePrompt(pageTitle: string, documentText: string): string {
+  // Tail-truncate `documentText` to `SYNOPSIS_DOC_MAX_CHARS` so small local
+  // chat models don't stall on >100KB pages. Head preserved (title block,
+  // frontmatter, intro paragraphs carry the document-level anchor).
+  let trimmedDoc = documentText;
+  if (documentText.length > SYNOPSIS_DOC_MAX_CHARS) {
+    const cut = safeSplitIndex(documentText, SYNOPSIS_DOC_MAX_CHARS);
+    trimmedDoc = documentText.slice(0, cut) +
+      `\n\n[... ${documentText.length - cut} chars truncated for synopsis budget ...]`;
+  }
+  return [
+    `<page_title>${pageTitle}</page_title>`,
+    '',
+    '<full_document>',
+    trimmedDoc,
+    '</full_document>',
+  ].join('\n');
+}
+
+/** Wave B spec 8.6: the share of the page lead (the projected `truth_lead`) a segmented page's synopsis document opens with. */
+export const SEGMENT_SYNOPSIS_LEAD_BYTES = 8 * 1024;
+/** Wave B spec 8.6: the most text of one segment a segmented page's synopsis document carries around a chunk. */
+export const SEGMENT_SYNOPSIS_WINDOW_BYTES = 32 * 1024;
+const SEGMENT_SYNOPSIS_GAP = '\n\n[...]\n\n';
+
+export interface SegmentSynopsisWindow<C> { document: string; chunks: C[] }
+
+/**
+ * The synopsis documents of one segment of a segmented page (wave-b spec 8.6): the segment's chunks, in order, packed
+ * greedily into windows of at most SEGMENT_SYNOPSIS_WINDOW_BYTES (and, with the lead, at most SYNOPSIS_DOC_MAX_CHARS,
+ * so buildPagePrompt never cuts a window), each document the lead, a gap marker and the window. Every chunk sits in the
+ * one window that holds it; a chunk larger than a window is a window alone. A document depends only on the lead and
+ * this segment's chunks, so an append or edit elsewhere on the page leaves it, and the vectors built from it, as they
+ * are; the chunks of one window share one document, so the prompt cache serves all but the first call.
+ */
+export function segmentSynopsisWindows<C extends { chunk_text: string; chunk_source?: string | null }>(chunks: readonly C[], lead: string): SegmentSynopsisWindow<C>[] {
+  const prefix = lead ? lead + SEGMENT_SYNOPSIS_GAP : '';
+  const maxChars = Math.min(SEGMENT_SYNOPSIS_WINDOW_BYTES, SYNOPSIS_DOC_MAX_CHARS - prefix.length);
+  const windows: SegmentSynopsisWindow<C>[] = [];
+  let open: { chunks: C[]; texts: string[]; chars: number; bytes: number } | null = null;
+  const close = () => { if (open) windows.push({ document: prefix + open.texts.join('\n\n'), chunks: open.chunks }); };
+  for (const chunk of chunks) {
+    if (chunk.chunk_source === 'image_asset') continue;
+    const chars = chunk.chunk_text.length + 2;
+    const bytes = Buffer.byteLength(chunk.chunk_text, 'utf8') + 2;
+    if (open && open.chars + chars <= maxChars && open.bytes + bytes <= SEGMENT_SYNOPSIS_WINDOW_BYTES) {
+      open.chunks.push(chunk); open.texts.push(chunk.chunk_text); open.chars += chars; open.bytes += bytes;
+      continue;
+    }
+    close();
+    open = { chunks: [chunk], texts: [chunk.chunk_text], chars, bytes };
+  }
+  close();
+  return windows;
+}
+
+/** Input chars of a synopsis call outside its document and chunk: the system prompt and the prompt's tags. */
+const SYNOPSIS_PROMPT_OVERHEAD_CHARS = SYNOPSIS_SYSTEM_PROMPT.length + 256;
+/** The rate (USD per million tokens) an unpriced synopsis model reserves at. */
+const UNPRICED_SYNOPSIS_RATE = { input: 15, output: 75 };
+
+/** What one synopsis call over `documentText` and `chunkText` may cost at most: the uncached prompt plus the full output ceiling. */
+export function estimateSynopsisCallUsd(model: string, documentText: string, chunkText: string, maxTokens: number = SYNOPSIS_MAX_TOKENS): number {
+  const input = Math.ceil((Math.min(documentText.length, SYNOPSIS_DOC_MAX_CHARS) + chunkText.length + SYNOPSIS_PROMPT_OVERHEAD_CHARS) / 4);
+  return reservationCostUsd(model, 'chat', input, maxTokens)
+    ?? (input * UNPRICED_SYNOPSIS_RATE.input + maxTokens * UNPRICED_SYNOPSIS_RATE.output) / 1_000_000;
+}
+
+export function buildChunkPrompt(chunkText: string): string {
+  return [
+    '',
+    '<chunk>',
+    chunkText,
+    '</chunk>',
+    '',
+    'Write the one-sentence synopsis for <chunk>:',
+  ].join('\n');
+}
+
+const TIMEOUT_ERROR_NAMES = new Set(['AbortError', 'TimeoutError']);
+const NETWORK_ERROR_CODES = new Set(['ENOTFOUND', 'ECONNREFUSED', 'ECONNRESET']);
+// `adapter aborted` is the claude-cli adapter's plain Error when the call's
+// signal fires (the gateway's chat timeout or a cancel); it has no abort name.
+const TIMEOUT_MESSAGE_RE = /timeout|timed out|adapter aborted/i;
+
+/**
+ * Map a thrown error from `gateway.chat()` into the D27 P1-2 failure envelope.
+ *
+ * chat() throws the gateway's normalized error, so the status, name and code
+ * that decide the class can sit on any wrapped layer (#5964): the claude-cli
+ * status as `apiErrorStatus`, an AI SDK `statusCode` on `cause` or on
+ * RetryError's `lastError`, a `TimeoutError` name on `cause`. Only an error
+ * that matches none of the transient classes is `malformed`, which makes the
+ * service re-embed the whole page at the title tier.
+ */
+function classifyChatError(err: unknown): {
+  kind: SynopsisFailureKind;
+  detail: string;
+} {
+  if (err == null) {
+    return { kind: 'malformed', detail: 'null error' };
+  }
+  const outer = err as { message?: unknown; code?: unknown };
+  const msg = (typeof outer.message === 'string' ? outer.message : String(err)).slice(0, 200);
+  const { status, names, codes } = readProviderFailureSignals(err);
+
+  if (status !== undefined) {
+    const byStatus: SynopsisFailureKind | null =
+      status === 401 || status === 403 ? 'auth_failure'
+        : status === 429 ? 'rate_limit'
+          : status >= 500 && status < 600 ? 'provider_5xx'
+            : null;
+    if (byStatus) return { kind: byStatus, detail: `status=${status} msg=${msg}` };
+  }
+  if (names.some(name => TIMEOUT_ERROR_NAMES.has(name)) || codes.includes('ETIMEDOUT') || TIMEOUT_MESSAGE_RE.test(msg)) {
+    return { kind: 'timeout', detail: msg };
+  }
+  const networkCode = codes.find(code => NETWORK_ERROR_CODES.has(code));
+  if (networkCode !== undefined || /network|fetch/i.test(msg)) {
+    return { kind: 'network', detail: `code=${networkCode ?? outer.code ?? '?'} msg=${msg}` };
+  }
+
+  // Unknown error shape — treat as malformed so the service routes it
+  // through the title-only fall-back path rather than retrying forever.
+  return { kind: 'malformed', detail: msg };
+}
+
+/**
+ * D27 P1-4 cache key composition. Used by the service layer's LRU. Exposed
+ * here so the key shape stays the single source of truth.
+ *
+ *   (content_hash, chunk_index, corpus_generation, source_text_hash)
+ */
+export function buildSynopsisCacheKey(args: {
+  contentHash: string;
+  chunkIndex: number;
+  corpusGeneration: string;
+  sourceTextHash: string;
+}): string {
+  return [
+    args.contentHash,
+    args.chunkIndex.toString(),
+    args.corpusGeneration,
+    args.sourceTextHash,
+  ].join('|');
+}

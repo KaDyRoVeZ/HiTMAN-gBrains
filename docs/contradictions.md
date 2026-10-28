@@ -1,0 +1,206 @@
+# gbrain eval suspected-contradictions
+
+The contradiction probe samples retrieval results, asks an LLM judge whether
+any pair contradicts on a factual claim relevant to the user's query, and
+aggregates into a calibrated report. The output is data — the operator
+decides what to act on. This doc covers the architecture, severity rubric,
+how to interpret the headline number, and when to act.
+
+## Why this exists
+
+gbrain handles contradictions for *curated* pages via compiled-truth-plus-
+timeline and source-boost: when `companies/acme.md` says MRR is $2M and a
+chat transcript from 2024 says MRR was $50K, the curated page outranks the
+chat. `takes.active` filtering hides explicitly-superseded takes. Recency
+decay biases ranking toward fresher content per source-tier.
+
+What none of those mechanisms measure: how often do unmarked semantic
+contradictions actually surface in retrieval? Without a probe, every
+"should we build the bigger swing (chunk-level `revises` field + ranking
+change)" decision is vibes. The probe produces evidence.
+
+## Architecture
+
+```
+        ┌──────────────────────────────────────┐
+        │ gbrain eval suspected-contradictions │
+        └──────────────────┬───────────────────┘
+                           │
+        ┌──────────────────▼───────────────────┐
+        │ For each query: hybridSearch top-K   │
+        │ → cross_slug_chunks + intra_page     │
+        │   chunk-vs-take pairs                │
+        └──────────────────┬───────────────────┘
+                           │
+        ┌──────────────────▼───────────────────┐
+        │ Date pre-filter: skip pairs whose    │
+        │ dates are >30d apart (Codex fix:     │
+        │ same-paragraph-dual-date overrides)  │
+        └──────────────────┬───────────────────┘
+                           │
+        ┌──────────────────▼───────────────────┐
+        │ Persistent cache lookup              │
+        │ (chunk_a_hash, chunk_b_hash, model,  │
+        │  prompt_version, truncation_policy)  │
+        └────────┬─────────┬────────────────────┘
+              hit│         │miss
+                 │         ▼
+                 │   ┌─────────────────────────┐
+                 │   │ LLM judge call          │
+                 │   │ → JudgeVerdict          │
+                 │   │ confidence floor ≥ 0.7  │
+                 │   └─────────┬───────────────┘
+                 │             │
+                 ▼             ▼
+        ┌──────────────────────────────────────┐
+        │ Aggregate per-query + global stats   │
+        │ Wilson 95% CI on headline %          │
+        │ source-tier breakdown                │
+        │ hot pages + resolution proposals     │
+        └──────────────────┬───────────────────┘
+                           │
+                           ▼
+                  ProbeReport JSON
+                           │
+        ┌──────────────────┼──────────────────────┬───────────────┐
+        ▼                  ▼                      ▼               ▼
+   doctor (M1)       local read (M3)        synthesize (M2)   trend (M5)
+   surfaces           find_contradictions    informational     persistent
+   findings           unscoped callers       block in prompt   tracking
+```
+
+## Severity rubric
+
+The judge assigns severity per finding:
+
+| Level | Rubric | Example |
+|---|---|---|
+| `low` | naming/format differences | "Alice Smith" vs "A. Smith" |
+| `medium` | factual values that may be stale | revenue figure, headcount, valuation |
+| `high` | identity / structural claims | founder/CEO/CFO role, company status |
+
+Doctor sorts findings by severity DESC. Trusted local callers without a source
+filter can use the operation's severity filter to fetch high-priority items.
+
+## How to interpret the headline number
+
+The probe outputs `queries_with_contradiction / queries_evaluated` with a
+Wilson 95% confidence interval:
+
+```
+Queries with >=1 contradiction: 12 / 50 (24%)  Wilson CI 95%: 14–37%
+```
+
+What this says: with 95% confidence, the true rate is between 14% and 37%.
+The 24% point estimate is the most-likely-value but bounded by sampling
+noise. **`small_sample_note` fires when n < 30** — at that scale the CI is
+too wide to act on.
+
+Decision criteria for the bigger swing (chunk-level `revises` field):
+
+| Wilson CI lower bound | What it says | Action |
+|---|---|---|
+| < 5% | Source-boost + recency-decay + curated pages handle the load | Stop here; this is the right scope |
+| 5–15% | Real but bounded | Operator decides whether the cost justifies the swing |
+| > 15% | Real and substantial | Plan the bigger swing |
+
+## When to act on findings
+
+Each finding ships with a `resolution_command` field — addressable and
+honest about what needs operator judgment:
+
+- `gbrain takes supersede <slug> --row N --claim '<replacement>'` — newer
+  take should replace the older one (intra_page kind). `--row` is the
+  per-page row number and `--claim` is required; when the winning side has
+  an unambiguous claim (temporal supersession where the newer side is
+  itself a take) the command is fully paste-ready, otherwise it carries an
+  explicit `<replacement claim>` placeholder for you to fill from the
+  report — the classifier picks an action, not a winner, and will not
+  fabricate a take from arbitrary chunk prose.
+- `gbrain dream --phase synthesize  # re-synthesize; contradiction on <slug>`
+  — compiled_truth for the curated entity needs an update (cross_slug
+  curated-vs-bulk). The synthesize phase has no per-slug flag, so the
+  comment names the page to check after the run.
+- `# manual review: ...` — intentional-disagreement (debate) findings and
+  judge-unsure findings render as a manual-review comment; a
+  mark-as-debate subcommand does not exist yet, so nothing is minted that
+  would fail when pasted.
+
+Run `gbrain eval suspected-contradictions review --severity high` to
+inspect findings without re-running the probe.
+
+## Cost model
+
+The judge resolves `--judge` > `models.eval.contradictions_judge` > the utility
+model tier > `GBRAIN_CONTRADICTIONS_JUDGE_MODEL`; the figures below assume a
+small model such as `claude-haiku-4-5` at ~$1/Mtok in, $5/Mtok out. With
+the default truncation at 1500 chars per pair (`--max-pair-chars`), ~500 input + 80 output
+tokens per judge call. Budget cap defaults to $5 in TTY / $1 non-TTY.
+
+- ~$0.0006 per judge call
+- ~$0.005 per query (after date pre-filter + cache hits)
+- ~$0.50 per 100 queries
+
+The persistent cache means nightly runs against the same query set
+pay near-zero on re-runs (until you bump PROMPT_VERSION).
+
+## Trust posture
+
+- Probe never mutates the brain. Runs only read pages/takes/chunks.
+  Writes go only to `eval_contradictions_runs` and `eval_contradictions_cache`.
+- `find_contradictions` is read-scope and is not in the subagent allowlist.
+  The bare local `gbrain find-contradictions` reads the latest run as stored:
+  a source the CLI resolved by default (no `--source`, `GBRAIN_SOURCE` or
+  `.gbrain-source`) is not a filter.
+- A stored report has no source column and copies both sides' text, private
+  takes included. So a remote, source-scoped or `min_trust` caller never gets
+  stored text: each side is re-read live by its chunk or take id under the
+  caller's policy (source scope, page visibility, live page and source,
+  quarantine, current text, safe chunks for remote callers, the takes holder
+  allow-list and the trust floor). A finding is returned only when both sides
+  are readable and still read exactly as judged, so its axis never describes
+  text the caller cannot see. Each side carries `source_id`, `trust_tier` and
+  `origin`, the resolution command is rebuilt from the live rows, and the
+  response carries `total_visible` instead of the run total. A supersede
+  proposal that would let a lower-trust side replace a higher-trust take is
+  returned as a manual review with `supersede_withheld: "higher_trust_target"`.
+- Build-fixture script is local-only. The redactor + `isCleanForCommit`
+  gate makes accidental private-data commits hard, but the operator MUST
+  inspect every redaction before commit.
+
+## Temporal axis
+
+The judge distinguishes real contradictions from legitimate change-over-time.
+The verdict enum has six members (`no_contradiction | contradiction |
+temporal_supersession | temporal_regression | temporal_evolution |
+negation_artifact`), and `pages.effective_date` is threaded into the judge
+prompt so the probe doesn't cry wolf on facts that simply changed. Only
+content dates (frontmatter or filename) count; a page whose date is the
+recorded-time `fallback` reaches the judge as `(date unknown)` and leaves
+the text-date pre-filter in charge. A temporal verdict needs two different
+times: same-date or undated value conflicts are contradictions. Claims about
+two entities whose names merely look alike are never contradictions.
+
+Prompt v4 asks two questions before any verdict: do both statements give a
+value for the same attribute of the same entity (if not, nothing conflicts),
+and is there evidence of two different times? It tells the judge never to
+order two values by their size, the kind of document, or which statement is
+listed first, and that a negative claim about one party ("Fund A is not
+leading") and a positive claim about another ("Fund B is leading") agree.
+
+The trajectory substrate builds on the same signal:
+`gbrain eval trajectory <entity>` shows the chronological typed-claim
+history with regressions flagged inline; `gbrain founder scorecard
+<entity>` rolls up four signals (accuracy, consistency, growth
+direction, red flags) into a stable JSON contract. MCP op
+`find_trajectory` (read scope, visibility-filtered for remote callers)
+exposes the same data to agents. The probe's `temporal_supersession`
+verdict and the consolidate phase's `valid_until` writeback both
+preserve the `auto-supersession.ts` "NEVER auto-applies" invariant
+— the probe only emits paste-ready commands; only `consolidate`
+writes `valid_until` (a grep guard pins this).
+
+## See also
+
+- Cost discipline: `docs/eval-bench.md` for the recommended nightly cadence
+  + trend-tracking workflow.

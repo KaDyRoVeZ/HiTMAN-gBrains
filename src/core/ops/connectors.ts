@@ -1,0 +1,117 @@
+/**
+ * ops/connectors.ts — the connectors op family (contract-first).
+ *
+ * Both ops are `localOnly: true`: connector credentials reach the operator's
+ * filesystem and provider accounts, so they dispatch only on the local stdio
+ * pipe (HTTP/remote callers get the unknown-tool envelope) AND fail-closed at
+ * runtime via `ctx.remote`. `connectors_status` never returns a raw secret —
+ * only provenance/expiry. Auth itself is CLI-only (interactive/loopback), so it
+ * is not an op.
+ *
+ * Module-private consts; only `connectorsOperations` is exported and spread into
+ * `../operations.ts` (never import from operations.ts here — cycle).
+ */
+
+import type { Operation } from './contract.ts';
+import { hostOnlyError, invalidParam } from './op-fix.ts';
+import { connectorProviders } from '../connectors/registry.ts';
+import { credentialMode, resolveCredential } from '../connectors/credentials.ts';
+import {
+  authErrorAtKey,
+  autoSyncKey,
+  isTruthy,
+  readConnectorState,
+  sourceIdKey,
+} from '../connectors/config-keys.ts';
+import { isConnectorProviderName } from '../connectors/registry.ts';
+
+const connectors_status: Operation = {
+  name: 'connectors_status',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Per-provider chat-connector status: strategies, whether a credential is ' +
+    'present and from where (env/file — never the value), token expiry, ' +
+    'last_sync_at, auth_error_at, auto_sync, and the incremental watermark. ' +
+    'Local-only; credentials never cross the wire.',
+  scope: 'read',
+  localOnly: true, cliOnly: { argv: ['gbrain', 'connectors', 'status'] },
+  params: {
+    provider: {
+      type: 'string',
+      description: "Restrict to one provider ('chatgpt'|'claude'). Omit for all.",
+    },
+  },
+  handler: async (ctx, p) => {
+    if (ctx.remote === true) {
+      throw hostOnlyError(ctx, 'permission_denied', 'connectors_status is local-only — call via the gbrain CLI.',
+        ['gbrain', 'connectors', 'status', ...(p.provider === 'chatgpt' || p.provider === 'claude' ? [p.provider] : [])],
+        'Connector credentials live on the brain host, so only its CLI reads their status.');
+    }
+    const only = typeof p.provider === 'string' ? p.provider : undefined;
+    const providers = connectorProviders.filter((prov) => !only || prov.name === only);
+    const out = [];
+    const sourceId = (await ctx.engine.getConfig(sourceIdKey())) || 'default';
+    for (const prov of providers) {
+      const resolved = resolveCredential(prov.name);
+      out.push({
+        provider: prov.name,
+        strategies: prov.strategies,
+        spec_target: { id: prov.specTarget.id, status: prov.specTarget.status, verified_at: prov.specTarget.verifiedAt },
+        credential: resolved ? { present: true, source: resolved.source, expires_at: resolved.cred.expiresAt ?? null } : { present: false },
+        credential_file_mode: credentialMode(prov.name), // 0o600 expected; null if absent
+        auto_sync: isTruthy(await ctx.engine.getConfig(autoSyncKey(prov.name))),
+        source_id: sourceId,
+        last_sync_at: await readConnectorState(ctx.engine, prov.name, sourceId, 'last_sync_at'),
+        auth_error_at: (await ctx.engine.getConfig(authErrorAtKey(prov.name))) || null,
+        watermark_iso: await readConnectorState(ctx.engine, prov.name, sourceId, 'watermark_iso'),
+      });
+    }
+    return { providers: out };
+  },
+  cliHints: { name: 'connectors_status', hidden: true },
+};
+
+const connector_sync: Operation = {
+  name: 'connector_sync',
+  idempotent: false,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Sync a chat provider\'s conversation history into the brain: list new ' +
+    'conversations since the watermark, fetch them, and ingest as pages under ' +
+    'conversations/<provider>/. Incremental by default; `full: true` re-scans. ' +
+    'Local-only (uses on-disk credentials).',
+  scope: 'write',
+  mutating: true,
+  localOnly: true, cliOnly: { argv: ['gbrain', 'connectors', 'sync', '<provider>'] },
+  params: {
+    provider: { type: 'string', required: true, description: "'chatgpt' or 'claude'." },
+    full: { type: 'boolean', description: 'Ignore the watermark and re-scan everything.' },
+    dry_run: { type: 'boolean', description: 'List-only preview; no fetches, no writes.' },
+    limit: { type: 'number', description: 'Max conversations fetched this run.' },
+  },
+  handler: async (ctx, p) => {
+    if (ctx.remote === true) {
+      throw hostOnlyError(ctx, 'permission_denied', 'connector_sync is local-only — call via the gbrain CLI.',
+        ['gbrain', 'connectors', 'sync', ...(p.provider === 'chatgpt' || p.provider === 'claude' ? [p.provider] : []), '--dry-run'],
+        'Connector syncs use credentials stored on the brain host; the dry run previews how many conversations would import.');
+    }
+    const provider = typeof p.provider === 'string' ? p.provider : '';
+    if (!isConnectorProviderName(provider)) {
+      throw invalidParam(ctx, 'connector_sync', 'provider', 'unknown connector provider (expected chatgpt|claude)', { choices: ['chatgpt', 'claude'] });
+    }
+    // The sync engine (transcript ingest and its persistence graph) loads only when a sync runs.
+    const { runConnectorSync } = await import('../connectors/sync.ts');
+    return runConnectorSync(ctx.engine, {
+      provider,
+      sourceId: ctx.sourceId,
+      full: p.full === true,
+      dryRun: p.dry_run === true,
+      limit: typeof p.limit === 'number' ? p.limit : undefined,
+    });
+  },
+  cliHints: { name: 'connector_sync', hidden: true },
+};
+
+export const connectorsOperations: Operation[] = [connectors_status, connector_sync];

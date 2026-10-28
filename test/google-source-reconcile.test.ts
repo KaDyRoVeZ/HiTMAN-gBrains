@@ -1,0 +1,1869 @@
+/**
+ * google-source reconcile + resilience sweeps — sibling of
+ * test/google-source-materialize.test.ts (same real-PGLite + mutable
+ * fake-Google + in-memory-vault harness), covering the paths that file does
+ * not: `--full` reconcile deletes (incl. the >200 mass-delete guard and its
+ * GBRAIN_ALLOW_MASS_RECONCILE escape hatch), the backfill floor freeze on a
+ * mid-backfill failure, 404-vanished threads in both lanes, calendar +
+ * contacts syncToken 410 recovery, and the loops_extract enqueue cap.
+ *
+ * NOTE on funnel/heartbeat rows (coverage item 1e): runGoogleSync writes NO
+ * heartbeat.jsonl rows — the funnel (`appendGoogleHeartbeat`) belongs to the
+ * COMMANDS layer (gbrain google connect), asserted in
+ * test/google-connect-cmd.serial.test.ts. The sweep-side observable here is
+ * the enqueue-cap drop log on stderr, asserted below.
+ *
+ * Synthetic data only: example.com addresses, hex message/thread ids.
+ */
+import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { withEnv } from './helpers/with-env.ts';
+import type { SyncOpts } from '../src/commands/sync.ts';
+import type {
+  CredentialEntry,
+  CredentialMeta,
+  CredentialVault,
+  ProviderClientRecord,
+} from '../src/core/creds/vault.ts';
+import type { FetchImpl } from '../src/core/google/google-clients.ts';
+import { __clearSuppressionCacheForTests } from '../src/core/google/loop-detect.ts';
+import { __setChatTransportForTests, configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
+import {
+  LOOPS_EXTRACT_ENQUEUE_CEILING,
+  LOOPS_EXTRACT_MAX_PER_SWEEP,
+} from '../src/core/google/loops-extract.ts';
+import {
+  googleStateFile,
+  parseGoogleSourceConfig,
+  readGoogleState,
+  runGoogleSync,
+} from '../src/core/google/google-source.ts';
+
+let engine: PGLiteEngine;
+let schemaVersion: string;
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+  schemaVersion = (await engine.getConfig('version')) ?? '7';
+});
+
+afterAll(async () => {
+  await engine.disconnect();
+});
+
+beforeEach(async () => {
+  await resetPgliteState(engine);
+  // MinionQueue.ensureSchema gates on the 'version' config row (same re-seed
+  // as the sibling materialize suite).
+  await engine.setConfig('version', schemaVersion);
+  __clearSuppressionCacheForTests();
+});
+
+// ── Time helpers (exact-second timestamps so backfill floors are stable) ────
+
+const NOW_MS = Math.floor(Date.now() / 1000) * 1000;
+const daysAgoMs = (n: number): number => NOW_MS - n * 86_400_000;
+const hoursAgoMs = (n: number): number => NOW_MS - n * 3_600_000;
+
+// ── Thread / message id constants (hex only) ────────────────────────────────
+
+const T_A = '17aa00000000a001';
+const T_B = '17aa00000000b002';
+const T_V = '17aa00000000e005'; // the vanished (404) thread
+
+// ── Fake Google API behind fetchImpl ─────────────────────────────────────────
+
+interface FakeMessage {
+  id: string;
+  threadId: string;
+  internalDateMs: number;
+  headers: Record<string, string>;
+  labelIds: string[];
+  body: string;
+}
+
+interface FakeGoogle {
+  profileHistoryId: string;
+  messages: FakeMessage[];
+  messagesPageSize: number;
+  history: string[][];
+  historyResponseId: string;
+  failThreads: Set<string>;
+  /** getThread → 404 for these ids (deleted between listing and fetch). */
+  vanishedThreads: Set<string>;
+  contacts: unknown[];
+  contactsDelta: unknown[];
+  contactsExpireSyncToken: boolean;
+  contactsExpireSyncStatus?: number;
+  calendarEvents: unknown[];
+  calendarDelta: unknown[];
+  calendarExpireSyncToken: boolean;
+  /**
+   * Sees every timeMin/timeMax (non-delta) calendar list before it is served;
+   * returning 'fail' answers that list with HTTP 400.
+   */
+  calendarRangeHook?: (query: URLSearchParams) => 'fail' | void;
+  /** Counters so each windowed/full re-list mints a DISTINCT sync token. */
+  calendarWindowedLists: number;
+  contactsFullLists: number;
+  calls: string[];
+  threadFetches: number;
+  /** #5445: the account's label catalog (`users/me/labels`); `'fail'` answers the list with HTTP 500. */
+  labels: Array<{ id: string; name: string; type: string }> | 'fail';
+}
+
+function emptyFx(): FakeGoogle {
+  return {
+    profileHistoryId: '1000',
+    messages: [],
+    messagesPageSize: 100,
+    history: [],
+    historyResponseId: '1000',
+    failThreads: new Set(),
+    vanishedThreads: new Set(),
+    contacts: [],
+    contactsDelta: [],
+    contactsExpireSyncToken: false,
+    calendarEvents: [],
+    calendarDelta: [],
+    calendarExpireSyncToken: false,
+    calendarWindowedLists: 0,
+    contactsFullLists: 0,
+    calls: [],
+    threadFetches: 0,
+    labels: [],
+  };
+}
+
+function b64url(s: string): string {
+  return Buffer.from(s, 'utf-8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function buildFetch(fx: FakeGoogle): FetchImpl {
+  const json = (body: unknown, status = 200): Response =>
+    new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+
+  return async (url: string): Promise<Response> => {
+    const u = new URL(url);
+    fx.calls.push(u.pathname + (u.search ? u.search : ''));
+
+    if (u.hostname === 'oauth2.googleapis.com') {
+      return json({ access_token: 't2', expires_in: 3600 });
+    }
+
+    if (u.pathname.endsWith('/users/me/profile')) {
+      return json({ emailAddress: 'a@example.com', historyId: fx.profileHistoryId });
+    }
+
+    if (u.pathname.endsWith('/users/me/messages')) {
+      const q = u.searchParams.get('q') ?? '';
+      const after = /after:(\d+)/.exec(q);
+      const before = /before:(\d+)/.exec(q);
+      let msgs = [...fx.messages];
+      if (after) msgs = msgs.filter((m) => Math.floor(m.internalDateMs / 1000) >= Number(after[1]));
+      if (before) msgs = msgs.filter((m) => Math.floor(m.internalDateMs / 1000) < Number(before[1]));
+      msgs.sort((a, b) => b.internalDateMs - a.internalDateMs); // newest first
+      const start = Number(u.searchParams.get('pageToken') ?? '0');
+      const page = msgs.slice(start, start + fx.messagesPageSize);
+      const next = start + fx.messagesPageSize < msgs.length ? String(start + fx.messagesPageSize) : undefined;
+      return json({
+        messages: page.map((m) => ({ id: m.id, threadId: m.threadId })),
+        ...(next ? { nextPageToken: next } : {}),
+      });
+    }
+
+    if (u.pathname.endsWith('/users/me/labels')) {
+      if (fx.labels === 'fail') return json({ error: { code: 500, message: 'backend error' } }, 500);
+      return json({ labels: fx.labels });
+    }
+
+    if (u.pathname.endsWith('/users/me/history')) {
+      return json({
+        historyId: fx.historyResponseId,
+        history: fx.history.map((tids) => ({ messages: tids.map((tid) => ({ threadId: tid })) })),
+      });
+    }
+
+    const threadMatch = u.pathname.match(/\/users\/me\/threads\/([^/]+)$/);
+    if (threadMatch) {
+      const tid = threadMatch[1];
+      fx.threadFetches++;
+      if (fx.vanishedThreads.has(tid)) return json({ error: { code: 404, message: 'Not Found' } }, 404);
+      if (fx.failThreads.has(tid)) return json({ error: { code: 500, message: 'backend error' } }, 500);
+      const msgs = fx.messages
+        .filter((m) => m.threadId === tid)
+        .sort((a, b) => b.internalDateMs - a.internalDateMs);
+      return json({
+        id: tid,
+        messages: msgs.map((m) => ({
+          id: m.id,
+          threadId: tid,
+          labelIds: m.labelIds,
+          internalDate: String(m.internalDateMs),
+          payload: {
+            mimeType: 'multipart/alternative',
+            headers: Object.entries(m.headers).map(([name, value]) => ({ name, value })),
+            parts: [{ mimeType: 'text/plain', body: { data: b64url(m.body) } }],
+          },
+        })),
+      });
+    }
+
+    if (/\/calendars\/[^/]+\/events$/.test(u.pathname)) {
+      if (u.searchParams.get('syncToken')) {
+        if (fx.calendarExpireSyncToken) return json({ error: { code: 410, message: 'Sync token expired' } }, 410);
+        return json({ items: fx.calendarDelta, nextSyncToken: 'cal-sync-delta' });
+      }
+      if (fx.calendarRangeHook?.(u.searchParams) === 'fail') return json({ error: { code: 400, message: 'Bad Request' } }, 400);
+      fx.calendarWindowedLists++;
+      return json({ items: fx.calendarEvents, nextSyncToken: `cal-sync-w${fx.calendarWindowedLists}` });
+    }
+
+    if (u.pathname.includes('/people/me/connections')) {
+      if (u.searchParams.get('syncToken')) {
+        if (fx.contactsExpireSyncToken) {
+          const status = fx.contactsExpireSyncStatus ?? 410;
+          return json({ error: { code: status, message: 'Sync token expired' } }, status);
+        }
+        return json({ connections: fx.contactsDelta, nextSyncToken: 'ppl-sync-delta' });
+      }
+      fx.contactsFullLists++;
+      return json({ connections: fx.contacts, nextSyncToken: `ppl-sync-w${fx.contactsFullLists}` });
+    }
+
+    return json({ error: { message: `unhandled ${u.pathname}` } }, 400);
+  };
+}
+
+// ── In-memory vault ──────────────────────────────────────────────────────────
+
+class FakeVault implements CredentialVault {
+  entries = new Map<string, CredentialEntry>();
+  clients = new Map<string, ProviderClientRecord>();
+  async get(id: string): Promise<CredentialEntry | null> {
+    return this.entries.get(id) ?? null;
+  }
+  async put(entry: CredentialEntry): Promise<void> {
+    this.entries.set(entry.id, entry);
+  }
+  async list(): Promise<CredentialMeta[]> {
+    return [];
+  }
+  async delete(id: string): Promise<boolean> {
+    return this.entries.delete(id);
+  }
+  async getClient(provider: string): Promise<ProviderClientRecord | null> {
+    return this.clients.get(provider) ?? null;
+  }
+  async putClient(rec: ProviderClientRecord): Promise<void> {
+    this.clients.set(rec.provider, rec);
+  }
+  async deleteClient(provider: string): Promise<boolean> {
+    return this.clients.delete(provider);
+  }
+}
+
+const CLIENT_ID = '123-abc.apps.googleusercontent.com';
+
+function makeVault(): FakeVault {
+  const v = new FakeVault();
+  v.entries.set('google:a@example.com', {
+    id: 'google:a@example.com',
+    provider: 'google',
+    kind: 'oauth2',
+    client_ref: 'byo',
+    secret: {
+      access_token: 't',
+      refresh_token: 'r',
+      expiry: new Date(Date.now() + 3_600_000).toISOString(),
+    },
+    meta: {
+      account: 'a@example.com',
+      connected_at: new Date().toISOString(),
+      client_id: CLIENT_ID,
+    },
+  });
+  v.clients.set('google', {
+    provider: 'google',
+    client_id: CLIENT_ID,
+    client_secret: 'GOCSPX-test-secret-0000',
+    created_at: new Date().toISOString(),
+  });
+  return v;
+}
+
+// ── Shared setup helpers ─────────────────────────────────────────────────────
+
+async function insertGoogleSource(dir: string): Promise<void> {
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name, local_path, config) VALUES ($1, $2, $3, $4::text::jsonb)`,
+    [
+      'gsrc',
+      'google',
+      dir,
+      JSON.stringify({
+        kind: 'google',
+        g_account: 'a@example.com',
+        g_services: 'gmail,calendar,contacts',
+        g_history_days: 90,
+        g_dir: dir,
+      }),
+    ],
+  );
+}
+
+async function sweep(
+  dir: string,
+  fx: FakeGoogle,
+  vault: FakeVault,
+  opts: Partial<SyncOpts> = {},
+  services = 'gmail',
+  extra: { cfg?: Record<string, unknown>; engine?: PGLiteEngine } = {},
+) {
+  const cfg = parseGoogleSourceConfig(
+    { kind: 'google', g_account: 'a@example.com', g_services: services, g_history_days: 90, g_dir: dir, ...extra.cfg },
+    dir,
+  );
+  return runGoogleSync(
+    extra.engine ?? engine,
+    'gsrc',
+    cfg,
+    { sourceId: 'gsrc', noEmbed: true, noExtract: true, ...opts },
+    buildFetch(fx),
+    vault,
+  );
+}
+
+async function emailSlugs(): Promise<string[]> {
+  const rows = await engine.executeRaw<{ slug: string }>(
+    `SELECT slug FROM pages WHERE source_id = 'gsrc' AND deleted_at IS NULL AND slug LIKE 'emails/%' ORDER BY slug`,
+  );
+  return rows.map((r) => r.slug);
+}
+
+function gmsg(id: string, threadId: string, ms: number, over: Partial<FakeMessage> = {}): FakeMessage {
+  return {
+    id,
+    threadId,
+    internalDateMs: ms,
+    headers: { From: 'Charlie Example <charlie@example.com>', To: 'a@example.com', Subject: 'Quarterly zephyr roadmap' },
+    labelIds: [],
+    body: 'Sharing the zephyr roadmap draft for review.',
+    ...over,
+  };
+}
+
+async function withHome<T>(fn: () => Promise<T>): Promise<T> {
+  return withEnv({ GBRAIN_HOME: mkdtempSync(join(tmpdir(), 'gbrain-home-')) }, fn);
+}
+
+/** Capture stderr for the duration of `fn` (progress + sweep logs land there). */
+async function capturedStderr<T>(fn: () => Promise<T>): Promise<{ result: T; err: string }> {
+  const errOrig = process.stderr.write.bind(process.stderr);
+  const chunks: string[] = [];
+  process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+    chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf-8'));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    const result = await fn();
+    return { result, err: chunks.join('') };
+  } finally {
+    process.stderr.write = errOrig;
+  }
+}
+
+/** Pre-mark the gmail backfill as complete so a sweep goes straight to delta. */
+function writeBackfilledState(dir: string): void {
+  writeFileSync(
+    googleStateFile(dir),
+    JSON.stringify({
+      gmail_history_id: '1000',
+      gmail_backfill_floor_ms: null,
+      gmail_backfill_done: true,
+      gmail_newest_ms: daysAgoMs(1),
+      calendar_sync_token: null,
+      contacts_sync_token: null,
+      last_full_at: null,
+    }),
+    'utf-8',
+  );
+}
+
+/** Seed N pending loops_extract jobs carrying the real payload shape for one source. */
+async function seedWaitingLoopsJobs(
+  sourceId: string,
+  n: number,
+  keyPrefix: string,
+  status: 'waiting' | 'delayed' | 'active' = 'waiting',
+): Promise<void> {
+  await engine.executeRaw(
+    `INSERT INTO minion_jobs (submission_authority, name, queue, status, data, idempotency_key, delay_until)
+     SELECT '{"version":1,"kind":"application"}'::jsonb, 'loops_extract', 'default', $4::text, jsonb_build_object('sourceId', $2::text), $3::text || '-' || i,
+            CASE WHEN $4::text = 'delayed' THEN now() + interval '10 minutes' END
+       FROM generate_series(1, $1) AS i`,
+    [n, sourceId, keyPrefix, status],
+  );
+}
+
+// ── --full reconcile ─────────────────────────────────────────────────────────
+
+describe('gmail --full reconcile', () => {
+  test('a thread missing from the live listing loses its page + file; out-of-window pages survive', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-reconcile-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    fx.messages.push(
+      gmsg('18c2f4a9b3d21e01', T_A, daysAgoMs(2)),
+      gmsg('18c2f4a9b3d21e03', T_B, daysAgoMs(3), {
+        headers: { From: 'Dana Example <dana@example.com>', To: 'a@example.com', Subject: 'Contract question' },
+        body: 'Could you confirm the contract terms?',
+      }),
+    );
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        const res1 = await sweep(dir, fx, vault);
+        expect(res1.added).toBe(2);
+        const before = await emailSlugs();
+        expect(before).toHaveLength(2);
+        const bSlug = before.find((s) => s.includes('contract-question'))!;
+        const aSlug = before.find((s) => s.includes('quarterly-zephyr-roadmap'))!;
+        expect(existsSync(join(dir, `${bSlug}.md`))).toBe(true);
+
+        // A page whose first_message_date PREDATES the enumeration window is
+        // out of reconcile scope and must survive even though its thread id
+        // is not in the live listing.
+        await engine.putPage(
+          'emails/2020/01/2020-01-05-ancient-thread-deadbeef',
+          {
+            type: 'email',
+            title: 'Ancient thread',
+            compiled_truth: 'A thread from before the window.',
+            frontmatter: {
+              thread_id: '17aa00000000ffff',
+              first_message_date: new Date(daysAgoMs(100)).toISOString(),
+            },
+          },
+          { sourceId: 'gsrc' },
+        );
+
+        // Thread B vanishes upstream (deleted/trash); the live window now
+        // only lists thread A.
+        fx.messages = fx.messages.filter((m) => m.threadId !== T_B);
+        const res2 = await sweep(dir, fx, vault, { full: true });
+        expect(res2.status).toBe('synced');
+        expect(res2.deleted).toBe(1);
+
+        const after = await emailSlugs();
+        expect(after).toContain(aSlug);
+        expect(after).toContain('emails/2020/01/2020-01-05-ancient-thread-deadbeef'); // survives
+        expect(after).not.toContain(bSlug);
+        expect(existsSync(join(dir, `${bSlug}.md`))).toBe(false); // file removed too
+        expect(existsSync(join(dir, `${aSlug}.md`))).toBe(true);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('>200 stale threads: the mass-delete guard refuses; GBRAIN_ALLOW_MASS_RECONCILE=1 proceeds', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-massguard-'));
+    const fx = emptyFx(); // live listing is EMPTY → every seeded page is stale
+    const vault = makeVault();
+    try {
+      await insertGoogleSource(dir);
+      writeBackfilledState(dir); // skip the backfill; go straight to delta + reconcile
+      // 201 email pages inside the window, thread ids the live listing lacks.
+      for (let i = 0; i < 201; i++) {
+        const tid = `17dd0000${i.toString(16).padStart(8, '0')}`;
+        await engine.putPage(
+          `emails/2026/bulk/thread-${String(i).padStart(3, '0')}`,
+          {
+            type: 'email',
+            title: `Bulk thread ${i}`,
+            compiled_truth: 'Bulk body.',
+            frontmatter: {
+              thread_id: tid,
+              first_message_date: new Date(daysAgoMs(5)).toISOString(),
+            },
+          },
+          { sourceId: 'gsrc' },
+        );
+      }
+      await withHome(async () => {
+        // Without the escape hatch: zero deletions + the guard log.
+        const { result: res1, err } = await capturedStderr(() => sweep(dir, fx, vault, { full: true }));
+        expect(res1.deleted).toBe(0);
+        expect(err).toContain('mass-delete guard refused 201 deletes');
+        expect(await emailSlugs()).toHaveLength(201);
+
+        // With it: the deletions proceed.
+        await withEnv({ GBRAIN_ALLOW_MASS_RECONCILE: '1' }, async () => {
+          const res2 = await sweep(dir, fx, vault, { full: true });
+          expect(res2.deleted).toBe(201);
+        });
+        expect(await emailSlugs()).toHaveLength(0);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── Backfill floor freeze ────────────────────────────────────────────────────
+
+describe('backfill floor freeze on failure', () => {
+  test('a failed thread freezes the floor at the last good batch; the retry completes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-freeze-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    // 26 single-message threads, days 40..65 ago: batch 1 = the 25 newest
+    // (days 40..64), batch 2 = the day-65 thread alone (BACKFILL_BATCH=25).
+    const tids: string[] = [];
+    for (let i = 0; i < 26; i++) {
+      const tid = `17cc00000000${(0xa00 + i).toString(16)}`;
+      tids.push(tid);
+      fx.messages.push(
+        gmsg(`18dd00000000${(0xb00 + i).toString(16)}`, tid, daysAgoMs(40 + i), {
+          headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: `Archive topic ${i}` },
+          body: `Archive body ${i}.`,
+        }),
+      );
+    }
+    const failedTid = tids[25]; // the day-65 thread — batch 2
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        fx.failThreads.add(failedTid);
+        const res1 = await sweep(dir, fx, vault);
+        expect(res1.status).toBe('partial');
+        expect(res1.failedFiles).toBe(1);
+        expect(res1.added).toBe(25);
+
+        let state = readGoogleState(dir);
+        expect(state.gmail_backfill_done).toBe(false);
+        // The floor froze at batch 1's oldest thread (day 64) — it did NOT
+        // advance past the failed thread's batch. A floor below day 65 would
+        // orphan the failed thread outside every future resume window.
+        expect(state.gmail_backfill_floor_ms).toBe(daysAgoMs(64));
+        expect(state.gmail_history_id).toBe('1000'); // delta anchor intact
+
+        // Failure clears → the resume window (before:floor) retries the
+        // failed thread and the backfill completes.
+        fx.failThreads.clear();
+        const res2 = await sweep(dir, fx, vault);
+        expect(res2.status).toBe('synced');
+        expect(res2.added).toBe(1); // just the previously-failed thread
+        state = readGoogleState(dir);
+        expect(state.gmail_backfill_done).toBe(true);
+        expect(state.gmail_backfill_floor_ms).toBeNull();
+        const slugs = await emailSlugs();
+        expect(slugs).toHaveLength(26);
+        expect(slugs.some((s) => s.includes('archive-topic-25'))).toBe(true); // the failed thread's page
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── 404-vanished threads ─────────────────────────────────────────────────────
+
+describe('404-vanished threads', () => {
+  test('delta lane: a 404 thread is skipped, the sync is NOT partial, and the cursor advances', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-vanish-delta-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    fx.messages.push(gmsg('18c2f4a9b3d21e01', T_A, daysAgoMs(2)));
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        await sweep(dir, fx, vault);
+        expect(readGoogleState(dir).gmail_history_id).toBe('1000');
+
+        // History flags a thread that was deleted before we could fetch it.
+        fx.history = [[T_V]];
+        fx.historyResponseId = '1010';
+        fx.vanishedThreads.add(T_V);
+        const res = await sweep(dir, fx, vault);
+        expect(res.status).toBe('up_to_date'); // skipped ≠ partial
+        expect(res.failedFiles).toBeUndefined();
+        expect(readGoogleState(dir).gmail_history_id).toBe('1010'); // cursor advanced
+        // No page ever materialized for the vanished thread.
+        expect((await emailSlugs())).toHaveLength(1);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('backfill lane: a 404 thread is skipped and the backfill still completes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-vanish-backfill-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    // One good thread (day 40) + one whose listing entry survives but whose
+    // getThread 404s (day 41).
+    fx.messages.push(
+      gmsg('18c2f4a9b3d21f01', '17cc00000000f001', daysAgoMs(40), {
+        headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: 'Good archive thread' },
+        body: 'Archive body.',
+      }),
+      gmsg('18c2f4a9b3d21f02', T_V, daysAgoMs(41), {
+        headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: 'Vanished archive thread' },
+        body: 'Gone before fetch.',
+      }),
+    );
+    fx.vanishedThreads.add(T_V);
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        const res = await sweep(dir, fx, vault);
+        expect(res.status).toBe('first_sync'); // NOT partial
+        expect(res.added).toBe(1);
+        expect(res.failedFiles).toBeUndefined();
+        const state = readGoogleState(dir);
+        expect(state.gmail_backfill_done).toBe(true);
+        expect(state.gmail_backfill_floor_ms).toBeNull();
+        const slugs = await emailSlugs();
+        expect(slugs).toHaveLength(1);
+        expect(slugs[0]).toContain('good-archive-thread');
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── syncToken 410 recovery (calendar + contacts) ─────────────────────────────
+
+describe('syncToken 410 recovery', () => {
+  test('calendar: an expired syncToken re-lists windowed and stores the fresh token', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-cal410-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    fx.calendarEvents = [
+      {
+        id: 'evt00000000000001',
+        status: 'confirmed',
+        summary: 'Zephyr planning sync',
+        start: { dateTime: new Date(daysAgoMs(1)).toISOString() },
+        end: { dateTime: new Date(daysAgoMs(1) + 3_600_000).toISOString() },
+        organizer: { email: 'a@example.com' },
+        attendees: [{ email: 'a@example.com', self: true, responseStatus: 'accepted' }],
+      },
+    ];
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        const res1 = await sweep(dir, fx, vault, {}, 'calendar');
+        expect(res1.added).toBe(1);
+        expect(readGoogleState(dir).calendar_sync_token).toBe('cal-sync-w1');
+
+        // The stored token expires upstream: 410 → windowed re-list.
+        fx.calendarExpireSyncToken = true;
+        const res2 = await sweep(dir, fx, vault, {}, 'calendar');
+        expect(res2.status).not.toBe('partial'); // recovery, not failure
+        const state = readGoogleState(dir);
+        expect(state.calendar_sync_token).toBe('cal-sync-w2'); // fresh token banked
+        // The windowed re-list actually ran (second windowed call).
+        expect(fx.calendarWindowedLists).toBe(2);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('calendar: a 410 re-list stays on the SECONDARY calendar the source is bound to', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-cal410sec-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    const secondary = 'family0123456789@group.calendar.google.com';
+    fx.calendarEvents = [
+      {
+        id: 'evt00000000000002',
+        status: 'confirmed',
+        summary: 'Family dinner',
+        start: { dateTime: new Date(daysAgoMs(1)).toISOString() },
+        end: { dateTime: new Date(daysAgoMs(1) + 3_600_000).toISOString() },
+        organizer: { email: 'a@example.com' },
+        attendees: [{ email: 'a@example.com', self: true, responseStatus: 'accepted' }],
+      },
+    ];
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        const cfg = { g_calendar_id: secondary };
+        const res1 = await sweep(dir, fx, vault, {}, 'calendar', { cfg });
+        expect(res1.added).toBe(1);
+        expect(readGoogleState(dir).calendar_sync_token).toBe('cal-sync-w1');
+
+        fx.calendarExpireSyncToken = true;
+        const res2 = await sweep(dir, fx, vault, {}, 'calendar', { cfg });
+        expect(res2.status).not.toBe('partial');
+        expect(readGoogleState(dir).calendar_sync_token).toBe('cal-sync-w2');
+        expect(fx.calendarWindowedLists).toBe(2);
+
+        // Every calendar call — initial window, the 410'd syncToken attempt,
+        // and the windowed re-list — addressed the secondary; none fell back
+        // to primary.
+        const calendarCalls = fx.calls.filter((c) => c.includes('/calendars/'));
+        expect(calendarCalls.length).toBe(3);
+        for (const c of calendarCalls) {
+          expect(c).toContain(`/calendars/${encodeURIComponent(secondary)}/events`);
+          expect(c).not.toContain('/calendars/primary/');
+        }
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('calendar: the stored sync token is bound to its calendar id — re-pointing g_calendar_id discards it and re-lists windowed', async () => {
+    // Ship-review fix: the persisted token was not bound to the calendar it
+    // was minted for, so changing g_calendar_id paired the NEW calendar with
+    // the OLD token (a foreign delta cursor) instead of a fresh window.
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-calrebind-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    const secondary = 'family0123456789@group.calendar.google.com';
+    fx.calendarEvents = [
+      {
+        id: 'evt00000000000003',
+        status: 'confirmed',
+        summary: 'Family dinner',
+        start: { dateTime: new Date(daysAgoMs(1)).toISOString() },
+        end: { dateTime: new Date(daysAgoMs(1) + 3_600_000).toISOString() },
+        organizer: { email: 'a@example.com' },
+        attendees: [{ email: 'a@example.com', self: true, responseStatus: 'accepted' }],
+      },
+    ];
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        // State minted against PRIMARY, then the source is re-pointed.
+        writeFileSync(
+          googleStateFile(dir),
+          JSON.stringify({
+            gmail_history_id: null,
+            gmail_backfill_floor_ms: null,
+            gmail_backfill_done: false,
+            gmail_newest_ms: null,
+            calendar_sync_token: 'cal-sync-stale-primary',
+            calendar_id: 'primary',
+            contacts_sync_token: null,
+            last_full_at: null,
+          }),
+          'utf-8',
+        );
+        const { result: res, err } = await capturedStderr(() =>
+          sweep(dir, fx, vault, {}, 'calendar', { cfg: { g_calendar_id: secondary } }),
+        );
+        expect(res.status).not.toBe('partial');
+        expect(res.added).toBe(1);
+        // Fresh window: no syncToken on the wire, exactly one windowed list.
+        const calendarCalls = fx.calls.filter((c) => c.includes('/calendars/'));
+        expect(calendarCalls.length).toBe(1);
+        expect(calendarCalls[0]).not.toContain('syncToken=');
+        expect(fx.calendarWindowedLists).toBe(1);
+        // Token rebound to the calendar it now belongs to; the switch is logged.
+        const state = readGoogleState(dir);
+        expect(state.calendar_sync_token).toBe('cal-sync-w1');
+        expect(state.calendar_id).toBe(secondary);
+        expect(err).toContain('[google] calendar changed');
+        expect(err).toContain(secondary);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("calendar: a legacy token with no calendar_id is primary's — primary keeps its delta, a secondary re-lists windowed", async () => {
+    const legacyState = {
+      gmail_history_id: null,
+      gmail_backfill_floor_ms: null,
+      gmail_backfill_done: false,
+      gmail_newest_ms: null,
+      calendar_sync_token: 'cal-sync-legacy',
+      contacts_sync_token: null,
+      last_full_at: null,
+    };
+    const dirA = mkdtempSync(join(tmpdir(), 'gsrc-callegacy-a-'));
+    const dirB = mkdtempSync(join(tmpdir(), 'gsrc-callegacy-b-'));
+    try {
+      await withHome(async () => {
+        // A: still primary → the legacy token is used as a delta cursor and
+        // gets bound to primary on the way out.
+        const fxA = emptyFx();
+        await insertGoogleSource(dirA);
+        writeFileSync(googleStateFile(dirA), JSON.stringify(legacyState), 'utf-8');
+        await sweep(dirA, fxA, makeVault(), {}, 'calendar');
+        expect(fxA.calls.filter((c) => c.includes('/calendars/'))[0]).toContain('syncToken=cal-sync-legacy');
+        // Legacy state has no calendar horizon either: one bounded [now, now + 60d] coverage list, never the window floor.
+        expect(fxA.calendarWindowedLists).toBe(1);
+        const coverageMin = Date.parse(calendarQueries(fxA)[1].get('timeMin')!);
+        expect(Math.abs(coverageMin - Date.now())).toBeLessThan(60_000);
+        const stateA = readGoogleState(dirA);
+        expect(stateA.calendar_sync_token).toBe('cal-sync-delta');
+        expect(stateA.calendar_id).toBe('primary');
+
+        // B: re-pointed at a secondary → the primary token is discarded.
+        const fxB = emptyFx();
+        await engine.executeRaw(`DELETE FROM sources WHERE id = 'gsrc'`);
+        await insertGoogleSource(dirB);
+        writeFileSync(googleStateFile(dirB), JSON.stringify(legacyState), 'utf-8');
+        const secondary = 'family0123456789@group.calendar.google.com';
+        await sweep(dirB, fxB, makeVault(), {}, 'calendar', { cfg: { g_calendar_id: secondary } });
+        expect(fxB.calendarWindowedLists).toBe(1);
+        expect(fxB.calls.filter((c) => c.includes('/calendars/'))[0]).not.toContain('syncToken=');
+        expect(readGoogleState(dirB).calendar_id).toBe(secondary);
+      });
+    } finally {
+      rmSync(dirA, { recursive: true, force: true });
+      rmSync(dirB, { recursive: true, force: true });
+    }
+  });
+
+  test('contacts: an expired syncToken re-lists in full and stores the fresh token', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-ppl410-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    fx.contacts = [
+      {
+        resourceName: 'people/c000000001',
+        names: [{ displayName: 'Alice Example', metadata: { primary: true } }],
+        emailAddresses: [{ value: 'alice@example.com' }],
+      },
+    ];
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        const res1 = await sweep(dir, fx, vault, {}, 'contacts');
+        expect(res1.added).toBe(1);
+        expect(readGoogleState(dir).contacts_sync_token).toBe('ppl-sync-w1');
+
+        fx.contactsExpireSyncToken = true;
+        const res2 = await sweep(dir, fx, vault, {}, 'contacts');
+        expect(res2.status).not.toBe('partial');
+        expect(readGoogleState(dir).contacts_sync_token).toBe('ppl-sync-w2');
+        expect(fx.contactsFullLists).toBe(2);
+        // The re-listed contact page is still there (idempotent re-import).
+        const people = await engine.executeRaw<{ slug: string }>(
+          `SELECT slug FROM pages WHERE source_id = 'gsrc' AND deleted_at IS NULL AND slug = 'people/alice-example'`,
+        );
+        expect(people).toHaveLength(1);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('contacts (#4845): g_contacts_dir moves contact pages; a page the contact owned under the old dir is retired by contact id', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-ppldir-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    fx.contacts = [{
+      resourceName: 'people/c000000001',
+      names: [{ displayName: 'Alice Example', metadata: { primary: true } }],
+      emailAddresses: [{ value: 'alice@example.com' }],
+    }];
+    const slugs = async () => (await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM pages WHERE source_id = 'gsrc' AND deleted_at IS NULL AND type = 'person' ORDER BY slug`)).map((r) => r.slug);
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        await sweep(dir, fx, vault, {}, 'contacts');
+        expect(await slugs()).toEqual(['people/alice-example']);
+        // The same source now renders contacts under contacts/: the old page goes, the new one lands, one page per contact.
+        const moved = await sweep(dir, fx, vault, { full: true }, 'contacts', { cfg: { g_contacts_dir: 'contacts' } });
+        expect(moved.added).toBe(1);
+        expect(moved.deleted).toBe(1);
+        expect(await slugs()).toEqual(['contacts/alice-example']);
+        expect(existsSync(join(dir, 'people/alice-example.md'))).toBe(false);
+        expect(existsSync(join(dir, 'contacts/alice-example.md'))).toBe(true);
+        // A deletion tombstone (resourceName only) still finds the page under the new dir by contact id.
+        fx.contactsDelta = [{ resourceName: 'people/c000000001', metadata: { deleted: true } }];
+        const gone = await sweep(dir, fx, vault, {}, 'contacts', { cfg: { g_contacts_dir: 'contacts' } });
+        expect(gone.deleted).toBe(1);
+        expect(await slugs()).toEqual([]);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('contacts: HTTP 400 expiry recovers without restarting Gmail or losing the contact', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-ppl400-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    fx.contacts = [{
+      resourceName: 'people/c000000001',
+      names: [{ displayName: 'Alice Example', metadata: { primary: true } }],
+      emailAddresses: [{ value: 'alice@example.com' }],
+    }];
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        await sweep(dir, fx, vault, {}, 'contacts');
+        expect(readGoogleState(dir).contacts_sync_token).toBe('ppl-sync-w1');
+        fx.contactsExpireSyncToken = true;
+        fx.contactsExpireSyncStatus = 400;
+        const result = await sweep(dir, fx, vault, {}, 'contacts');
+        expect(result.status).not.toBe('partial');
+        expect(readGoogleState(dir).contacts_sync_token).toBe('ppl-sync-w2');
+        expect(fx.contactsFullLists).toBe(2);
+        expect(fx.calls.some(call => call.includes('/people/me/connections?') && call.includes('syncToken=ppl-sync-w1'))).toBe(true);
+        expect(fx.calls.some(call => call.includes('/gmail/'))).toBe(false);
+        const rows = await engine.executeRaw<{ slug: string }>(
+          `SELECT slug FROM pages WHERE source_id = 'gsrc' AND deleted_at IS NULL AND slug = 'people/alice-example'`,
+        );
+        expect(rows).toHaveLength(1);
+        fx.contactsExpireSyncToken = false;
+        await sweep(dir, fx, vault, {}, 'contacts');
+        expect(fx.contactsFullLists).toBe(2);
+        expect(readGoogleState(dir).contacts_sync_token).toBe('ppl-sync-delta');
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('contacts: HTTP 400 recovery preserves incremental Gmail in an all-services sync', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-ppl400-all-'));
+    const fx = emptyFx();
+    fx.contactsExpireSyncToken = true;
+    fx.contactsExpireSyncStatus = 400;
+    fx.historyResponseId = '2000';
+    try {
+      await insertGoogleSource(dir);
+      writeBackfilledState(dir);
+      const before = readGoogleState(dir);
+      writeFileSync(googleStateFile(dir), JSON.stringify({ ...before, contacts_sync_token: 'expired' }));
+      await withHome(async () => {
+        const result = await sweep(dir, fx, makeVault(), {}, 'gmail,calendar,contacts');
+        expect(result.status).not.toBe('partial');
+        expect(fx.contactsFullLists).toBe(1);
+        const after = readGoogleState(dir);
+        expect(after.contacts_sync_token).toBe('ppl-sync-w1');
+        expect(after.gmail_backfill_done).toBe(true);
+        expect(after.gmail_backfill_floor_ms).toBe(before.gmail_backfill_floor_ms);
+        expect(after.gmail_history_id).toBe('2000');
+        expect(fx.calls.filter(call => call.includes('/users/me/history'))).toEqual([
+          expect.stringContaining('startHistoryId=1000'),
+        ]);
+        expect(fx.calls.some(call => call.includes('/users/me/messages') || call.includes('/users/me/profile'))).toBe(false);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── Calendar window (#5442) ──────────────────────────────────────────────────
+// The source keeps pages for events from historyDays back to 60 days ahead.
+// Google applies that range only to windowed lists: a syncToken delta has no
+// timeMin/timeMax, and with singleEvents=true a touched recurring series comes
+// back as every expanded instance. These cases pin the sweep's own filter on
+// every path, the catch-up list for instances crossing the leading edge, and
+// the --full reconcile scope.
+//
+// The fake serves fx.calendarEvents for every timeMin/timeMax list and
+// fx.calendarDelta for every delta, without filtering, exactly like the
+// unfiltered delta Google returns.
+
+const DAY = 86_400_000;
+
+/** A confirmed one-hour meeting `startOffsetDays` from NOW_MS. */
+function meeting(id: string, startOffsetDays: number, opts: { title?: string; lengthMs?: number; status?: string } = {}) {
+  const startMs = NOW_MS + startOffsetDays * DAY;
+  return {
+    id,
+    status: opts.status ?? 'confirmed',
+    summary: opts.title ?? `Zephyr meeting ${id}`,
+    start: { dateTime: new Date(startMs).toISOString() },
+    end: { dateTime: new Date(startMs + (opts.lengthMs ?? 3_600_000)).toISOString() },
+    organizer: { email: 'a@example.com' },
+    attendees: [{ email: 'a@example.com', self: true, responseStatus: 'accepted' }],
+  };
+}
+
+/** Live calendar pages keyed by event id (pages without one keyed by slug). */
+async function calendarPages(): Promise<Map<string, { slug: string; title: string }>> {
+  const rows = await engine.executeRaw<{ slug: string; title: string; event_id: string | null }>(
+    `SELECT slug, title, frontmatter->>'event_id' AS event_id FROM pages
+      WHERE source_id = 'gsrc' AND deleted_at IS NULL AND slug LIKE 'calendar/%'`,
+  );
+  return new Map(rows.map((r) => [r.event_id ?? r.slug, { slug: r.slug, title: r.title }]));
+}
+
+/** Query strings of the calendar list calls the sweep made, in order. */
+function calendarQueries(fx: FakeGoogle): URLSearchParams[] {
+  return fx.calls.filter((c) => c.includes('/calendars/')).map((c) => new URL(c, 'https://www.googleapis.com').searchParams);
+}
+
+function storeHorizon(dir: string, horizonMs: number | null): void {
+  writeFileSync(googleStateFile(dir), JSON.stringify({ ...readGoogleState(dir), calendar_horizon_ms: horizonMs }), 'utf-8');
+}
+
+const near = (actualMs: number, expectedMs: number, toleranceMs = 120_000): boolean => Math.abs(actualMs - expectedMs) < toleranceMs;
+
+/** A page the sweep would have written for `eventId` (or a hand-made one when null), at slug.md. */
+async function seedMeetingPage(slug: string, eventId: string | null, startOffsetDays: number): Promise<void> {
+  const startMs = NOW_MS + startOffsetDays * DAY;
+  await engine.putPage(
+    slug,
+    {
+      type: 'meeting',
+      title: `Seeded ${slug.split('/').pop()}`,
+      compiled_truth: 'Seeded for the calendar window tests.',
+      frontmatter: {
+        ...(eventId === null ? {} : { event_id: eventId }),
+        start: new Date(startMs).toISOString(),
+        end: new Date(startMs + 3_600_000).toISOString(),
+      },
+    },
+    { sourceId: 'gsrc' },
+  );
+  await engine.executeRaw(`UPDATE pages SET source_path = slug || '.md' WHERE source_id = 'gsrc' AND slug = $1`, [slug]);
+}
+
+/** Runs `body` against a fresh google source directory with an isolated GBRAIN_HOME. */
+async function withCalendarSource(body: (h: { dir: string; fx: FakeGoogle; vault: FakeVault }) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'gsrc-calwindow-'));
+  try {
+    await insertGoogleSource(dir);
+    await withHome(() => body({ dir, fx: emptyFx(), vault: makeVault() }));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('calendar window (#5442)', () => {
+  test('a delta full of series instances materializes only those inside the window', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      fx.calendarEvents = [meeting('seed_tomorrow', 1)];
+      await sweep(dir, fx, vault, {}, 'calendar');
+
+      fx.calendarDelta = [
+        meeting('inst_4y_ago', -4 * 365),
+        meeting('inst_ended_before_floor', -91),
+        // Starts before the 90-day floor but ends after it: inside, as Google's timeMin compares the end.
+        meeting('inst_spans_floor', -95, { lengthMs: 10 * DAY }),
+        meeting('inst_next_week', 7),
+        meeting('inst_day_59', 59),
+        meeting('inst_day_61', 61),
+        meeting('inst_8y_ahead', 8 * 365),
+      ];
+      const { result, err } = await capturedStderr(() => sweep(dir, fx, vault, {}, 'calendar'));
+
+      expect(result.status).not.toBe('partial');
+      expect(result.added).toBe(3);
+      expect([...(await calendarPages()).keys()].sort()).toEqual(['inst_day_59', 'inst_next_week', 'inst_spans_floor', 'seed_tomorrow']);
+      expect(err).toContain('[google] calendar: 4 listed event(s) outside the sync window (90 days back, 60 ahead) were not imported');
+      expect(readGoogleState(dir).calendar_sync_token).toBe('cal-sync-delta');
+    });
+  });
+
+  test('negative control: a delta with only in-window changes logs no skips and imports them all', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      await sweep(dir, fx, vault, {}, 'calendar');
+      fx.calendarDelta = [meeting('only_soon', 2), meeting('only_recent', -2)];
+      const { result, err } = await capturedStderr(() => sweep(dir, fx, vault, {}, 'calendar'));
+      expect(result.added).toBe(2);
+      expect(err).not.toContain('outside the sync window');
+    });
+  });
+
+  test('a move past the horizon removes the page; a change to aged-out history leaves its page as it was; a cancellation always removes', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      fx.calendarEvents = [meeting('old_offsite', -150, { title: 'Old offsite' }), meeting('old_cancelled', -160), meeting('next_review', 12)];
+      expect((await sweep(dir, fx, vault, {}, 'calendar', { cfg: { g_history_days: 365 } })).added).toBe(3);
+      const before = await calendarPages();
+
+      fx.calendarDelta = [
+        meeting('old_offsite', -150, { title: 'Old offsite (renamed)' }),
+        meeting('old_cancelled', -160, { status: 'cancelled' }),
+        meeting('next_review', 120),
+      ];
+      const result = await sweep(dir, fx, vault, {}, 'calendar');
+
+      expect(result.added).toBe(0);
+      expect(result.deleted).toBe(2);
+      const after = await calendarPages();
+      expect([...after.keys()]).toEqual(['old_offsite']);
+      expect(after.get('old_offsite')).toEqual(before.get('old_offsite')!);
+      expect(existsSync(join(dir, `${before.get('next_review')!.slug}.md`))).toBe(false);
+    });
+  });
+
+  test('a cancelled skeleton (id and status only) removes its own page and nothing else', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      fx.calendarEvents = [meeting('keep_me', 3), meeting('drop_me', 4)];
+      await sweep(dir, fx, vault, {}, 'calendar');
+      fx.calendarDelta = [{ id: 'drop_me', status: 'cancelled' }];
+      const result = await sweep(dir, fx, vault, {}, 'calendar');
+      expect(result.deleted).toBe(1);
+      expect([...(await calendarPages()).keys()]).toEqual(['keep_me']);
+    });
+  });
+
+  test('a lagging horizon gets one catch-up list from the horizon to the ceiling; the delta token stays the cursor', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      await sweep(dir, fx, vault, {}, 'calendar');
+      expect(calendarQueries(fx)).toHaveLength(1);
+      expect(near(readGoogleState(dir).calendar_horizon_ms!, Date.now() + 60 * DAY)).toBe(true);
+
+      const lagging = NOW_MS + 48 * DAY;
+      storeHorizon(dir, lagging);
+      fx.calls = [];
+      fx.calendarEvents = [meeting('crossed_edge', 52, { title: 'Crossed the edge' })];
+      const result = await sweep(dir, fx, vault, {}, 'calendar');
+
+      expect(result.added).toBe(1);
+      const [delta, catchUp, ...rest] = calendarQueries(fx);
+      expect(rest).toHaveLength(0);
+      expect(delta.get('syncToken')).toBe('cal-sync-w1');
+      expect(catchUp.get('syncToken')).toBeNull();
+      expect(catchUp.get('timeMin')).toBe(new Date(lagging).toISOString());
+      expect(near(Date.parse(catchUp.get('timeMax')!), Date.now() + 60 * DAY)).toBe(true);
+      const state = readGoogleState(dir);
+      expect(state.calendar_sync_token).toBe('cal-sync-delta');
+      expect(near(state.calendar_horizon_ms!, Date.now() + 60 * DAY)).toBe(true);
+    });
+  });
+
+  test('a horizon less than a day behind is neither listed nor advanced, so short gaps add up to a catch-up list', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      await sweep(dir, fx, vault, {}, 'calendar');
+      const ceiling = NOW_MS + 60 * DAY;
+
+      const hoursBehind = ceiling - 20 * 3_600_000;
+      storeHorizon(dir, hoursBehind);
+      fx.calls = [];
+      await sweep(dir, fx, vault, {}, 'calendar');
+      expect(calendarQueries(fx)).toHaveLength(1);
+      expect(readGoogleState(dir).calendar_horizon_ms).toBe(hoursBehind);
+
+      const dayBehind = ceiling - 26 * 3_600_000;
+      storeHorizon(dir, dayBehind);
+      fx.calls = [];
+      await sweep(dir, fx, vault, {}, 'calendar');
+      const queries = calendarQueries(fx);
+      expect(queries).toHaveLength(2);
+      expect(queries[1].get('timeMin')).toBe(new Date(dayBehind).toISOString());
+      expect(readGoogleState(dir).calendar_horizon_ms!).toBeGreaterThan(ceiling - 60_000);
+    });
+  });
+
+  test('a failed catch-up list marks the sweep partial and keeps the horizon; the next sweep catches up', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      await sweep(dir, fx, vault, {}, 'calendar');
+      const lagging = NOW_MS + 45 * DAY;
+      storeHorizon(dir, lagging);
+      fx.calendarEvents = [meeting('late_arrival', 50)];
+      fx.calendarRangeHook = () => 'fail';
+
+      const failed = await sweep(dir, fx, vault, {}, 'calendar');
+      expect(failed.status).toBe('partial');
+      expect(readGoogleState(dir).calendar_horizon_ms).toBe(lagging);
+      expect((await calendarPages()).size).toBe(0);
+
+      fx.calendarRangeHook = undefined;
+      const retried = await sweep(dir, fx, vault, {}, 'calendar');
+      expect(retried.status).not.toBe('partial');
+      expect([...(await calendarPages()).keys()]).toEqual(['late_arrival']);
+      expect(readGoogleState(dir).calendar_horizon_ms!).toBeGreaterThan(lagging);
+    });
+  });
+
+  test('an abort during the catch-up list keeps the horizon, and an aborted --full deletes nothing', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      await sweep(dir, fx, vault, {}, 'calendar');
+      const lagging = NOW_MS + 45 * DAY;
+      storeHorizon(dir, lagging);
+      fx.calendarEvents = [meeting('never_lands', 50)];
+      const stop = new AbortController();
+      fx.calendarRangeHook = () => { stop.abort(); };
+
+      const aborted = await sweep(dir, fx, vault, { signal: stop.signal }, 'calendar');
+      expect(aborted.status).toBe('partial');
+      expect(readGoogleState(dir).calendar_horizon_ms).toBe(lagging);
+      expect((await calendarPages()).size).toBe(0);
+
+      await seedMeetingPage('calendar/seeded/unlisted-but-aborted', 'unlisted_evt', 6);
+      const stopFull = new AbortController();
+      fx.calendarRangeHook = () => { stopFull.abort(); };
+      const abortedFull = await sweep(dir, fx, vault, { full: true, signal: stopFull.signal }, 'calendar');
+      expect(abortedFull.status).toBe('partial');
+      expect([...(await calendarPages()).keys()]).toEqual(['unlisted_evt']);
+    });
+  });
+
+  test('an expired token re-lists the whole window, which counts as caught up', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      await sweep(dir, fx, vault, {}, 'calendar');
+      const lagging = NOW_MS + 30 * DAY;
+      storeHorizon(dir, lagging);
+      fx.calls = [];
+      fx.calendarExpireSyncToken = true;
+      await sweep(dir, fx, vault, {}, 'calendar');
+      const [expired, relist, ...rest] = calendarQueries(fx);
+      expect(rest).toHaveLength(0);
+      expect(expired.get('syncToken')).toBe('cal-sync-w1');
+      expect(near(Date.parse(relist.get('timeMin')!), Date.now() - 90 * DAY)).toBe(true);
+      expect(readGoogleState(dir).calendar_horizon_ms!).toBeGreaterThan(lagging);
+    });
+  });
+
+  test('the catch-up list reads the secondary calendar the source is bound to', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      const team = 'team5511example@group.calendar.google.com';
+      await sweep(dir, fx, vault, {}, 'calendar', { cfg: { g_calendar_id: team } });
+      storeHorizon(dir, NOW_MS + 40 * DAY);
+      fx.calls = [];
+      await sweep(dir, fx, vault, {}, 'calendar', { cfg: { g_calendar_id: team } });
+      const paths = fx.calls.filter((c) => c.includes('/calendars/')).map((c) => new URL(c, 'https://www.googleapis.com').pathname);
+      expect(paths).toEqual([0, 1].map(() => `/calendar/v3/calendars/${encodeURIComponent(team)}/events`));
+    });
+  });
+
+  test('state saved before horizons existed lists [now, ceiling] once; a failed list leaves it unset for a retry', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      writeFileSync(
+        googleStateFile(dir),
+        JSON.stringify({ ...readGoogleState(dir), calendar_sync_token: 'cal-sync-legacy', calendar_id: 'primary' }),
+        'utf-8',
+      );
+      fx.calendarEvents = [meeting('unchanged_since_legacy', 35)];
+      fx.calendarRangeHook = () => 'fail';
+      expect((await sweep(dir, fx, vault, {}, 'calendar')).status).toBe('partial');
+      expect(readGoogleState(dir).calendar_horizon_ms ?? null).toBeNull();
+
+      fx.calendarRangeHook = undefined;
+      fx.calls = [];
+      const result = await sweep(dir, fx, vault, {}, 'calendar');
+      expect(result.added).toBe(1);
+      const [, coverage] = calendarQueries(fx);
+      expect(near(Date.parse(coverage.get('timeMin')!), Date.now())).toBe(true);
+      expect(near(Date.parse(coverage.get('timeMax')!), Date.now() + 60 * DAY)).toBe(true);
+      expect(near(readGoogleState(dir).calendar_horizon_ms!, Date.now() + 60 * DAY)).toBe(true);
+    });
+  });
+
+  test('--full deletes in-window pages the list no longer names and keeps every page outside that scope', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      fx.calendarEvents = [meeting('still_listed', 2)];
+      await seedMeetingPage('calendar/seeded/upcoming-cancelled', 'gone_upcoming', 8);
+      await seedMeetingPage('calendar/seeded/recent-deleted', 'gone_recent', -20);
+      await seedMeetingPage('calendar/seeded/before-floor', 'history_evt', -180);
+      await seedMeetingPage('calendar/seeded/beyond-horizon', 'far_evt', 9 * 365);
+      await seedMeetingPage('calendar/seeded/hand-written', null, 5);
+
+      const result = await sweep(dir, fx, vault, { full: true }, 'calendar');
+
+      expect(result.status).not.toBe('partial');
+      // P4.2 (#5442, contract change): a sweep page past the horizon is now reconciled too,
+      // so `far_evt` goes with the two unlisted in-window pages; history and hand-written stay.
+      expect(result.deleted).toBe(3);
+      expect([...(await calendarPages()).keys()].sort()).toEqual(
+        ['calendar/seeded/hand-written', 'history_evt', 'still_listed'].sort(),
+      );
+    });
+  });
+
+  test('--full removes sweep pages that start at or past the horizon and keeps pages inside it (#5442)', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      fx.calendarEvents = [meeting('soon', 30), meeting('inside_59', 59)];
+      expect((await sweep(dir, fx, vault, {}, 'calendar')).added).toBe(2);
+      await seedMeetingPage('calendar/seeded/overflow-400', 'overflow_400', 400);
+      await seedMeetingPage('calendar/seeded/overflow-at-ceiling', 'overflow_60', 60);
+      await seedMeetingPage('calendar/seeded/hand-far', null, 400);
+
+      const result = await sweep(dir, fx, vault, { full: true }, 'calendar');
+
+      expect(result.status).not.toBe('partial');
+      expect(result.deleted).toBe(2);
+      expect([...(await calendarPages()).keys()].sort()).toEqual(['calendar/seeded/hand-far', 'inside_59', 'soon'].sort());
+    });
+  });
+
+  test('--full with g_future_days widens the horizon: pages inside the wider window stay (#5442)', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      fx.calendarEvents = [meeting('soon', 30), meeting('day_120', 120)];
+      expect((await sweep(dir, fx, vault, {}, 'calendar', { cfg: { g_future_days: 180 } })).added).toBe(2);
+      await seedMeetingPage('calendar/seeded/day-400', 'day_400', 400);
+
+      const result = await sweep(dir, fx, vault, { full: true }, 'calendar', { cfg: { g_future_days: 180 } });
+
+      expect(result.deleted).toBe(1);
+      expect([...(await calendarPages()).keys()].sort()).toEqual(['day_120', 'soon']);
+      const listed = calendarQueries(fx).find((q) => q.has('timeMax'))!;
+      expect(near(Date.parse(listed.get('timeMax')!), NOW_MS + 180 * DAY)).toBe(true);
+    });
+  });
+
+  test('--full refuses more than 200 past-horizon deletions through the mass-delete guard and reports partial (#5442)', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      for (let i = 0; i < 201; i++) await seedMeetingPage(`calendar/seeded/future-${i}`, `future_${i}`, 365 + i);
+
+      const { result: refused, err } = await capturedStderr(() => sweep(dir, fx, vault, { full: true }, 'calendar'));
+      expect(refused.status).toBe('partial');
+      expect(refused.deleted).toBe(0);
+      expect(err).toContain('mass-delete guard refused 201 deletes for source gsrc');
+      expect((await calendarPages()).size).toBe(201);
+    });
+  });
+
+  test('--full after historyDays shrinks keeps pages from the old, wider window', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      fx.calendarEvents = [meeting('wide_window_only', -250), meeting('both_windows', -40)];
+      expect((await sweep(dir, fx, vault, { full: true }, 'calendar', { cfg: { g_history_days: 365 } })).added).toBe(2);
+      fx.calendarEvents = [meeting('both_windows', -40)];
+      const result = await sweep(dir, fx, vault, { full: true }, 'calendar');
+      expect(result.deleted).toBe(0);
+      expect([...(await calendarPages()).keys()].sort()).toEqual(['both_windows', 'wide_window_only']);
+    });
+  });
+
+  test('--full refuses more than 200 calendar deletions without GBRAIN_ALLOW_MASS_RECONCILE and reports partial', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      for (let i = 0; i < 205; i++) await seedMeetingPage(`calendar/seeded/bulk-${i}`, `bulk_${i}`, 1 + (i % 40));
+
+      const { result: refused, err } = await capturedStderr(() => sweep(dir, fx, vault, { full: true }, 'calendar'));
+      expect(refused.status).toBe('partial');
+      expect(refused.deleted).toBe(0);
+      expect(err).toContain('mass-delete guard refused 205 deletes for source gsrc');
+      expect((await calendarPages()).size).toBe(205);
+
+      const allowed = await withEnv({ GBRAIN_ALLOW_MASS_RECONCILE: '1' }, () => sweep(dir, fx, vault, { full: true }, 'calendar'));
+      expect(allowed.deleted).toBe(205);
+      expect((await calendarPages()).size).toBe(0);
+    });
+  });
+});
+
+// ── loops_extract enqueue completeness ───────────────────────────────────────
+
+describe('loops_extract enqueue completeness', () => {
+  // The sweep only enqueues when a chat provider is available (a job the
+  // handler can never run would complete as a no-work row and consume the
+  // thread's revision slot). The gateway test seam makes chat "available" for
+  // every test here; the dedicated test below clears it again.
+  const chatStub = async () => {
+    throw new Error('chat transport must not be called by the sweep');
+  };
+  beforeEach(() => __setChatTransportForTests(chatStub));
+  afterAll(() => {
+    // Shard hygiene (same as facts-extract-junk-filter.test.ts): a reset
+    // gateway must not leak a dimensionless config into later files.
+    __setChatTransportForTests(null);
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: { ...process.env },
+    });
+  });
+
+  test('chat provider unavailable (keyless install / outage) → 0 jobs enqueued, one stderr line names the reason', async () => {
+    // Ship-review fix: a job enqueued with no chat provider ran to
+    // `llm_unavailable`, completed, and its revision-keyed idempotency row
+    // blocked re-enqueue until the thread changed — every eligible thread
+    // swept during the outage was silently never extracted. Gate at enqueue.
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-nochat-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    for (let i = 0; i < 2; i++) {
+      const tid = `17ee88000000${(0x100 + i).toString(16)}`;
+      fx.messages.push(
+        gmsg(`18ff88000000${(0x200 + i).toString(16)}`, tid, hoursAgoMs(i + 1), {
+          headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: `Nochat topic ${i}` },
+          body: `Nochat body ${i}.`,
+        }),
+      );
+    }
+    try {
+      await insertGoogleSource(dir);
+      resetGateway();
+      __setChatTransportForTests(null); // no transport stub, no config → isAvailable('chat') === false
+      await withHome(async () => {
+        const { result: res, err } = await capturedStderr(() => sweep(dir, fx, vault));
+        expect(res.added).toBe(2); // pages still import — only the LLM lane is skipped
+        const jobs = await engine.executeRaw<{ n: string }>(
+          `SELECT count(*)::text AS n FROM minion_jobs WHERE name = 'loops_extract'`,
+        );
+        expect(Number(jobs[0].n)).toBe(0);
+        expect(err).toContain('loops_extract: chat provider unavailable');
+        expect(err).toContain('2 eligible thread(s)');
+        expect(err).not.toContain('loops_extract: enqueued');
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  describe('label exclusion (#5445)', () => {
+    const seedThreads = (fx: FakeGoogle) => {
+      fx.labels = [{ id: 'INBOX', name: 'INBOX', type: 'system' }, { id: 'Label_7', name: 'Newsletters', type: 'user' }];
+      fx.messages.push(
+        gmsg('18ff55000000a201', '17ee55000000a101', hoursAgoMs(1), {
+          headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: 'Excluded topic' },
+          body: 'Could you look at the attached draft?', labelIds: ['INBOX', 'Label_7'],
+        }),
+        gmsg('18ff55000000a202', '17ee55000000a102', hoursAgoMs(2), {
+          headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: 'Plain topic' },
+          body: 'Could you confirm the plan?', labelIds: ['INBOX'],
+        }),
+      );
+    };
+    const jobCount = async () => Number((await engine.executeRaw<{ n: string }>(`SELECT count(*)::text AS n FROM minion_jobs WHERE name = 'loops_extract'`))[0].n);
+    /** The per-reason counts the sweep logs (`loops_extract eligibility: a=1 b=2`). */
+    const eligibilityCounts = (err: string): Record<string, number> => {
+      const line = /loops_extract eligibility: ([^\n]+)/.exec(err)?.[1] ?? '';
+      return Object.fromEntries(line.trim().split(/\s+/).filter(Boolean).map((kv) => { const [k, v] = kv.split('='); return [k, Number(v)]; }));
+    };
+
+    test('a name resolves once per sweep: one labels call, the labelled thread is excluded_label and not queued, the plain one is queued', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'gsrc-excl-'));
+      const fx = emptyFx();
+      const vault = makeVault();
+      seedThreads(fx);
+      try {
+        await insertGoogleSource(dir);
+        await withHome(async () => {
+          const { result: res, err } = await capturedStderr(() => sweep(dir, fx, vault, {}, 'gmail', { cfg: { g_loops_exclude_labels: 'newsletters' } }));
+          expect(res.added).toBe(2);
+          expect(fx.calls.filter((c) => c.includes('/users/me/labels'))).toHaveLength(1);
+          expect(eligibilityCounts(err)).toEqual({ excluded_label: 1, human_correspondence: 1 });
+          expect(res.loops_enqueue).toMatchObject({ enqueued: 1, skipped_reason: null });
+          expect(await jobCount()).toBe(1);
+          expect(err).not.toContain('excluded_label_unresolved');
+          const stored = await engine.executeRaw<{ s: { ids: string[]; unresolved: string[] } }>(
+            `SELECT completed_keys->0 AS s FROM op_checkpoints WHERE op = 'loops-exclusion'`);
+          expect(stored[0]?.s).toMatchObject({ ids: ['Label_7'], unresolved: [] });
+        });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 120_000);
+
+    test('an unknown name fails closed: every thread counts excluded_label_unresolved, nothing is queued, stderr names the label', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'gsrc-excl-unres-'));
+      const fx = emptyFx();
+      const vault = makeVault();
+      seedThreads(fx);
+      try {
+        await insertGoogleSource(dir);
+        await withHome(async () => {
+          const { result: res, err } = await capturedStderr(() => sweep(dir, fx, vault, {}, 'gmail', { cfg: { g_loops_exclude_labels: 'Newsletters, Vendor-Noise' } }));
+          expect(res.added).toBe(2);
+          expect(eligibilityCounts(err)).toEqual({ excluded_label: 1, excluded_label_unresolved: 1 });
+          expect(res.loops_enqueue).toMatchObject({ enqueued: 0, skipped_reason: 'excluded_label_unresolved' });
+          expect(await jobCount()).toBe(0);
+          expect(err).toContain('"Vendor-Noise" is not a label of a@example.com');
+          expect(err).toContain('excluded_label_unresolved');
+        });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 120_000);
+
+    test('a failed label list resolves ids only: names stay unresolved this sweep and the brain-wide key is the fallback', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'gsrc-excl-fail-'));
+      const fx = emptyFx();
+      const vault = makeVault();
+      seedThreads(fx);
+      fx.labels = 'fail';
+      try {
+        await insertGoogleSource(dir);
+        await engine.setConfig('loops.extraction_exclude_labels', 'Label_7');
+        await withHome(async () => {
+          const { result: byId, err: errById } = await capturedStderr(() => sweep(dir, fx, vault));
+          expect(eligibilityCounts(errById)).toEqual({ excluded_label: 1, human_correspondence: 1 });
+          expect(byId.loops_enqueue).toMatchObject({ enqueued: 1 });
+          await engine.setConfig('loops.extraction_exclude_labels', 'Newsletters');
+          const { result: byName, err } = await capturedStderr(() => sweep(dir, fx, vault, { full: true }));
+          expect(byName.loops_enqueue).toMatchObject({ enqueued: 0, skipped_reason: 'excluded_label_unresolved' });
+          expect(err).toContain("could not read the account's labels");
+          // #7073: a failed list never claims the name is not a label of the account.
+          expect(err).toContain('"Newsletters" could not be checked against the labels of a@example.com (the label list failed');
+          expect(err).not.toContain('is not a label');
+        });
+      } finally {
+        await engine.setConfig('loops.extraction_exclude_labels', '');
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 120_000);
+  });
+
+  test(`>${LOOPS_EXTRACT_MAX_PER_SWEEP} eligible threads → EVERY one is queued exactly once`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-cap-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    const total = LOOPS_EXTRACT_MAX_PER_SWEEP + 3; // 53 recent threads
+    for (let i = 0; i < total; i++) {
+      const tid = `17ee00000000${(0x100 + i).toString(16)}`;
+      fx.messages.push(
+        gmsg(`18ff00000000${(0x200 + i).toString(16)}`, tid, hoursAgoMs(i + 1), {
+          headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: `Recent topic ${i}` },
+          body: `Recent body ${i}.`,
+        }),
+      );
+    }
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        const { result: res, err } = await capturedStderr(() => sweep(dir, fx, vault));
+        expect(res.added).toBe(total);
+        // The old cap kept only the newest 50 and logged the rest as
+        // "deferring … (they re-candidate on next touch)". That was silent
+        // loss: a thread only re-candidates when it CHANGES, so an untouched
+        // overflow thread was never extracted at all.
+        const jobs = await engine.executeRaw<{ data: unknown }>(
+          `SELECT data FROM minion_jobs WHERE name = 'loops_extract'`,
+        );
+        expect(jobs).toHaveLength(total);
+        expect(err).toContain(`loops_extract: enqueued ${total} eligible thread(s)`);
+        const slugs = jobs
+          .map((j) => (typeof j.data === 'string' ? JSON.parse(j.data) : j.data) as { slug: string })
+          .map((p) => p.slug);
+        // The previously-dropped tail is present, and so is the newest.
+        for (const kept of ['recent-topic-50', 'recent-topic-51', 'recent-topic-52', 'recent-topic-0']) {
+          expect(slugs.some((s) => s.includes(kept))).toBe(true);
+        }
+        // Every slug distinct — one job per thread, no duplicates.
+        expect(new Set(slugs).size).toBe(total);
+        // NOTE (item 1e): runGoogleSync writes NO heartbeat.jsonl rows — the
+        // connect funnel is a commands-layer concern; see
+        // test/google-connect-cmd.serial.test.ts for those assertions.
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test('a repeated sweep re-touching unchanged threads adds no duplicate jobs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-dup-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    const total = 5;
+    const threadIds: string[] = [];
+    for (let i = 0; i < total; i++) {
+      const tid = `17ee11000000${(0x100 + i).toString(16)}`;
+      threadIds.push(tid);
+      fx.messages.push(
+        gmsg(`18ff11000000${(0x200 + i).toString(16)}`, tid, hoursAgoMs(i + 1), {
+          headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: `Dup topic ${i}` },
+          body: `Dup body ${i}.`,
+        }),
+      );
+    }
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        await capturedStderr(() => sweep(dir, fx, vault));
+        const after1 = await engine.executeRaw<{ n: string }>(
+          `SELECT count(*)::text AS n FROM minion_jobs WHERE name = 'loops_extract'`,
+        );
+        // Second sweep RE-TOUCHES every thread via the history delta with
+        // unchanged content — the revision-keyed idempotency key is now the
+        // ONLY dedupe in play (no maxWaiting), so it must hold on its own.
+        fx.history.push([...threadIds]);
+        fx.historyResponseId = '2000';
+        await capturedStderr(() => sweep(dir, fx, vault));
+        const after2 = await engine.executeRaw<{ n: string }>(
+          `SELECT count(*)::text AS n FROM minion_jobs WHERE name = 'loops_extract'`,
+        );
+        expect(Number(after1[0].n)).toBe(total);
+        expect(Number(after2[0].n)).toBe(total);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test('a deep waiting backlog shrinks the sweep enqueue budget (defer, not stack)', async () => {
+    // The maxWaiting removal left the per-sweep ceiling as the ONLY bound —
+    // with a stalled worker, repeated pathological sweeps could stack another
+    // 500 waiting jobs each. The sweep now counts already-waiting
+    // loops_extract jobs and shrinks this sweep's budget by that depth;
+    // overflow is a deferral (a deferred thread re-candidates on next touch).
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-depth-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    for (let i = 0; i < 2; i++) {
+      const tid = `17ee33000000${(0x100 + i).toString(16)}`;
+      fx.messages.push(
+        gmsg(`18ff33000000${(0x200 + i).toString(16)}`, tid, hoursAgoMs(i + 1), {
+          headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: `Depth topic ${i}` },
+          body: `Depth body ${i}.`,
+        }),
+      );
+    }
+    try {
+      await insertGoogleSource(dir);
+      // Seed a waiting backlog at the ceiling — the stalled-worker shape.
+      // Real loops_extract payloads carry the enqueuing source's id.
+      await seedWaitingLoopsJobs('gsrc', LOOPS_EXTRACT_ENQUEUE_CEILING, 'depthseed');
+      await withHome(async () => {
+        const { err } = await capturedStderr(() => sweep(dir, fx, vault));
+        const after = await engine.executeRaw<{ n: string }>(
+          `SELECT count(*)::text AS n FROM minion_jobs WHERE name = 'loops_extract' AND status = 'waiting'`,
+        );
+        // Budget exhausted by the backlog: NOTHING new stacks on top.
+        expect(Number(after[0].n)).toBe(LOOPS_EXTRACT_ENQUEUE_CEILING);
+        expect(err).toContain('deferring 2');
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test('a DELAYED (retry-backoff) backlog counts against the budget too — a flapping provider cannot stack past the ceiling', async () => {
+    // Ship-review fix: the depth probe counted status='waiting' only. During a
+    // provider outage every claimed job fails and parks as 'delayed' (backoff),
+    // so the probe read ~0 and each sweep stacked another ceiling's worth of
+    // jobs on top of the backlog. Pending = waiting + delayed + active.
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-delayed-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    for (let i = 0; i < 2; i++) {
+      const tid = `17ee77000000${(0x100 + i).toString(16)}`;
+      fx.messages.push(
+        gmsg(`18ff77000000${(0x200 + i).toString(16)}`, tid, hoursAgoMs(i + 1), {
+          headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: `Delayed topic ${i}` },
+          body: `Delayed body ${i}.`,
+        }),
+      );
+    }
+    try {
+      await insertGoogleSource(dir);
+      await seedWaitingLoopsJobs('gsrc', LOOPS_EXTRACT_ENQUEUE_CEILING, 'delayedseed', 'delayed');
+      await withHome(async () => {
+        const { err } = await capturedStderr(() => sweep(dir, fx, vault));
+        const fresh = await engine.executeRaw<{ n: string }>(
+          `SELECT count(*)::text AS n FROM minion_jobs
+            WHERE name = 'loops_extract' AND idempotency_key NOT LIKE 'delayedseed-%'`,
+        );
+        expect(Number(fresh[0].n)).toBe(0);
+        expect(err).toContain('deferring 2');
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test("another source's waiting backlog does NOT starve this source's budget (per-source depth)", async () => {
+    // Pre-fix the probe counted EVERY waiting loops_extract job brain-wide,
+    // so one Google account's stalled backlog drove every other source's
+    // budget to 0 forever — nothing new was ever enqueued for them.
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-otherdepth-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    for (let i = 0; i < 2; i++) {
+      const tid = `17ee44000000${(0x100 + i).toString(16)}`;
+      fx.messages.push(
+        gmsg(`18ff44000000${(0x200 + i).toString(16)}`, tid, hoursAgoMs(i + 1), {
+          headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: `Other depth topic ${i}` },
+          body: `Other depth body ${i}.`,
+        }),
+      );
+    }
+    try {
+      await insertGoogleSource(dir);
+      await seedWaitingLoopsJobs('google-other-account', LOOPS_EXTRACT_ENQUEUE_CEILING, 'otherseed');
+      await withHome(async () => {
+        const { err } = await capturedStderr(() => sweep(dir, fx, vault));
+        const mine = await engine.executeRaw<{ n: string }>(
+          `SELECT count(*)::text AS n FROM minion_jobs
+            WHERE name = 'loops_extract' AND status = 'waiting' AND data->>'sourceId' = 'gsrc'`,
+        );
+        expect(Number(mine[0].n)).toBe(2);
+        expect(err).toContain('loops_extract: enqueued 2 eligible thread(s)');
+        expect(err).not.toContain('deferring');
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test('partial budget keeps the NEWEST thread and logs the deferral count', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-partial-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    // Three threads, ages 1h/2h/3h — only ONE slot is left in the budget.
+    for (let i = 0; i < 3; i++) {
+      const tid = `17ee55000000${(0x100 + i).toString(16)}`;
+      fx.messages.push(
+        gmsg(`18ff55000000${(0x200 + i).toString(16)}`, tid, hoursAgoMs(i + 1), {
+          headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: `Partial topic ${i}` },
+          body: `Partial body ${i}.`,
+        }),
+      );
+    }
+    try {
+      await insertGoogleSource(dir);
+      await seedWaitingLoopsJobs('gsrc', LOOPS_EXTRACT_ENQUEUE_CEILING - 1, 'partialseed');
+      await withHome(async () => {
+        const { err } = await capturedStderr(() => sweep(dir, fx, vault));
+        expect(err).toContain('deferring 2');
+        expect(err).toContain(`${LOOPS_EXTRACT_ENQUEUE_CEILING - 1} already pending`);
+        const fresh = await engine.executeRaw<{ data: unknown }>(
+          `SELECT data FROM minion_jobs
+            WHERE name = 'loops_extract' AND idempotency_key NOT LIKE 'partialseed-%'`,
+        );
+        expect(fresh).toHaveLength(1);
+        const payload = (typeof fresh[0].data === 'string' ? JSON.parse(fresh[0].data) : fresh[0].data) as { slug: string; sourceId: string };
+        expect(payload.slug).toContain('partial-topic-0'); // the 1h-old thread, not 2h/3h
+        expect(payload.sourceId).toBe('gsrc');
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test('a failing waiting-depth probe fails OPEN — the sweep still enqueues', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-probefail-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    const tid = '17ee66000000a100';
+    fx.messages.push(
+      gmsg('18ff66000000b200', tid, hoursAgoMs(1), {
+        headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: 'Probe topic' },
+        body: 'Probe body.',
+      }),
+    );
+    // Only the depth probe (`… AS n FROM minion_jobs …`) throws; queue.add and
+    // every other query reach the real engine.
+    const probeFailing = new Proxy(engine, {
+      get(target, prop) {
+        if (prop === 'executeRaw') {
+          return (sql: string, params?: unknown[]) => {
+            if (/AS n FROM minion_jobs/.test(sql)) throw new Error('probe unavailable');
+            return target.executeRaw(sql, params);
+          };
+        }
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    }) as PGLiteEngine;
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        const { err } = await capturedStderr(() => sweep(dir, fx, vault, {}, 'gmail', { engine: probeFailing }));
+        expect(err).toContain('loops_extract: enqueued 1 eligible thread(s)');
+        expect(err).not.toContain('enqueue failed');
+        const jobs = await engine.executeRaw<{ n: string }>(
+          `SELECT count(*)::text AS n FROM minion_jobs WHERE name = 'loops_extract' AND data->>'sourceId' = 'gsrc'`,
+        );
+        expect(Number(jobs[0].n)).toBe(1);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test('bulk mail the owner never answered is filtered before the queue', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-elig-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    fx.messages.push(
+      gmsg('18ff220000000001', '17ee220000000001', hoursAgoMs(2), {
+        headers: {
+          From: 'Peer Example <peer@example.com>',
+          To: 'a@example.com',
+          Subject: 'Real question',
+          'List-Unsubscribe': '<https://example.com/u>',
+        },
+        body: 'Newsletter body.',
+      }),
+    );
+    fx.messages.push(
+      gmsg('18ff220000000002', '17ee220000000002', hoursAgoMs(3), {
+        headers: { From: 'Peer Example <peer@example.com>', To: 'a@example.com', Subject: 'Human topic' },
+        body: 'A real message.',
+      }),
+    );
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        const { err } = await capturedStderr(() => sweep(dir, fx, vault));
+        const jobs = await engine.executeRaw<{ data: unknown }>(
+          `SELECT data FROM minion_jobs WHERE name = 'loops_extract'`,
+        );
+        const slugs = jobs
+          .map((j) => (typeof j.data === 'string' ? JSON.parse(j.data) : j.data) as { slug: string })
+          .map((p) => p.slug);
+        expect(slugs.some((s) => s.includes('human-topic'))).toBe(true);
+        expect(slugs.some((s) => s.includes('real-question'))).toBe(false);
+        // Auditable counts, no mail content: one filtered, one queued.
+        expect(err).toContain('loops_extract eligibility:');
+        expect(err).toContain('list_mail=1');
+        expect(err).toContain('human_correspondence=1');
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+});
+
+// ── Sweep progress (#5349) ──────────────────────────────────────────────────
+
+/** Forward-progress notes recorded while `fn` runs (what the progress-aware sync deadline extends on). */
+async function countForwardProgress<T>(fn: () => Promise<T>): Promise<{ result: T; notes: number }> {
+  const { onForwardProgress } = await import('../src/core/forward-progress.ts');
+  let notes = 0;
+  const off = onForwardProgress(() => { notes++; });
+  try {
+    return { result: await fn(), notes };
+  } finally {
+    off();
+  }
+}
+
+function fxContact(n: number): unknown {
+  return {
+    resourceName: `people/c00000000${n}`,
+    names: [{ displayName: `Contact Example ${n}`, metadata: { primary: true } }],
+    emailAddresses: [{ value: `contact${n}@example.com` }],
+  };
+}
+
+describe('sweep progress (#5349)', () => {
+  test('a contacts sweep notes forward progress once per imported contact, so the progress-aware deadline extends', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsrc-pplprog-'));
+    const fx = emptyFx();
+    const vault = makeVault();
+    fx.contacts = [fxContact(1), fxContact(2), fxContact(3)];
+    try {
+      await insertGoogleSource(dir);
+      await withHome(async () => {
+        const { result, notes } = await countForwardProgress(() => sweep(dir, fx, vault, {}, 'contacts'));
+        expect(result.added).toBe(3);
+        expect(notes).toBeGreaterThanOrEqual(3);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a calendar sweep notes forward progress once per listed event, and a list with nothing to import notes none', async () => {
+    await withCalendarSource(async ({ dir, fx, vault }) => {
+      fx.calendarEvents = [1, 2, 3, 4].map((n) => meeting(`evt0000000000000${n}`, n));
+      const first = await countForwardProgress(() => sweep(dir, fx, vault, {}, 'calendar'));
+      expect(first.result.added).toBe(4);
+      expect(first.notes).toBeGreaterThanOrEqual(4);
+      // Heartbeats are not progress: an empty delta must not extend the deadline.
+      fx.calendarDelta = [];
+      const second = await countForwardProgress(() => sweep(dir, fx, vault, {}, 'calendar'));
+      expect(second.result.status).toBe('up_to_date');
+      expect(second.notes).toBe(0);
+    });
+  });
+});

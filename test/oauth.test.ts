@@ -1,0 +1,2017 @@
+import { authorizeAsOwner, pgliteOAuthTransaction, TEST_PKCE_VERIFIER, TEST_PKCE_CHALLENGE } from './helpers/oauth.ts';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { PGlite } from '@electric-sql/pglite';
+import { vector } from '@electric-sql/pglite/vector';
+import { pg_trgm } from '@electric-sql/pglite/contrib/pg_trgm';
+import {
+  GBrainOAuthProvider,
+  coerceTimestamp,
+  ALLOWED_TOKEN_ENDPOINT_AUTH_METHODS,
+  validateTokenEndpointAuthMethod,
+  InvalidTokenEndpointAuthMethodError,
+} from '../src/core/oauth-provider.ts';
+import { hashToken, generateToken } from '../src/core/utils.ts';
+import { PGLITE_SCHEMA_SQL } from '../src/core/pglite-schema.ts';
+import { InvalidTokenError, InvalidClientMetadataError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import type { AuthInfo as CoreAuthInfo } from '../src/core/operations.ts';
+
+// ---------------------------------------------------------------------------
+// Test setup: in-memory PGLite with OAuth tables
+// ---------------------------------------------------------------------------
+
+let db: PGlite;
+let sql: (strings: TemplateStringsArray, ...values: unknown[]) => Promise<any>;
+let provider: GBrainOAuthProvider;
+
+beforeAll(async () => {
+  db = new PGlite({ extensions: { vector, pg_trgm } });
+  await db.exec(PGLITE_SCHEMA_SQL);
+
+  // Create a tagged template wrapper for PGLite
+  sql = async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const query = strings.reduce((acc, str, i) => acc + str + (i < values.length ? `$${i + 1}` : ''), '');
+    const result = await db.query(query, values as any[]);
+    return result.rows;
+  };
+
+  provider = new GBrainOAuthProvider({ transaction: pgliteOAuthTransaction(db), sql, tokenTtl: 60, refreshTtl: 300 });
+}, 30_000); // PGLITE_SCHEMA_SQL execution under full-suite load can exceed default 5s
+
+afterAll(async () => {
+  if (db) await db.close();
+}, 15_000);
+
+// ---------------------------------------------------------------------------
+// hashToken + generateToken utilities
+// ---------------------------------------------------------------------------
+
+describe('hashToken', () => {
+  test('produces consistent SHA-256 hex', () => {
+    const hash = hashToken('test-token');
+    expect(hash).toHaveLength(64);
+    expect(hashToken('test-token')).toBe(hash); // deterministic
+  });
+
+  test('different inputs produce different hashes', () => {
+    expect(hashToken('a')).not.toBe(hashToken('b'));
+  });
+});
+
+describe('generateToken', () => {
+  test('produces prefixed random hex', () => {
+    const token = generateToken('gbrain_cl_');
+    expect(token).toStartWith('gbrain_cl_');
+    expect(token).toHaveLength('gbrain_cl_'.length + 64); // 32 bytes = 64 hex chars
+  });
+
+  test('tokens are unique', () => {
+    const a = generateToken('test_');
+    const b = generateToken('test_');
+    expect(a).not.toBe(b);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// coerceTimestamp — postgres BIGINT-as-string boundary helper
+// ---------------------------------------------------------------------------
+
+describe('coerceTimestamp', () => {
+  test('null returns undefined', () => {
+    expect(coerceTimestamp(null)).toBeUndefined();
+  });
+
+  test('undefined returns undefined', () => {
+    expect(coerceTimestamp(undefined)).toBeUndefined();
+  });
+
+  test('numeric string coerces to number', () => {
+    // The actual production path: postgres-js with prepare:false returns
+    // BIGINT columns as strings.
+    expect(coerceTimestamp('12345')).toBe(12345);
+    expect(coerceTimestamp('1735689600')).toBe(1735689600);
+  });
+
+  test('native number passes through', () => {
+    // Direct-PG users on prepare:true get native numbers.
+    expect(coerceTimestamp(12345)).toBe(12345);
+    expect(coerceTimestamp(0)).toBe(0);
+  });
+
+  test('non-finite input throws (fail-closed contract)', () => {
+    // The load-bearing change vs Number(): corrupt rows fail loud at the
+    // boundary instead of letting NaN flow through to the SDK as a
+    // fake-valid `expiresAt`.
+    expect(() => coerceTimestamp('not-a-number')).toThrow(/non-finite/);
+    expect(() => coerceTimestamp(NaN)).toThrow(/non-finite/);
+    expect(() => coerceTimestamp(Infinity)).toThrow(/non-finite/);
+    expect(() => coerceTimestamp(-Infinity)).toThrow(/non-finite/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Client Registration
+// ---------------------------------------------------------------------------
+
+describe('client registration', () => {
+  test('registerClientManual creates a client', async () => {
+    const { clientId, clientSecret } = await provider.registerClientManual(
+      'test-agent', ['client_credentials'], 'read write',
+    );
+    expect(clientId).toStartWith('gbrain_cl_');
+    expect(clientSecret).toStartWith('gbrain_cs_');
+
+    // Verify client exists in DB
+    const client = await provider.clientsStore.getClient(clientId);
+    expect(client).toBeDefined();
+    expect(client!.client_name).toBe('test-agent');
+  });
+
+  test('getClient returns undefined for unknown client', async () => {
+    const client = await provider.clientsStore.getClient('nonexistent');
+    expect(client).toBeUndefined();
+  });
+
+  test('duplicate client_id is rejected', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'dup-test', ['client_credentials'], 'read',
+    );
+    // Try to insert same client_id directly
+    await expect(
+      sql`INSERT INTO oauth_clients (client_id, client_name, scope) VALUES (${clientId}, ${'dup'}, ${'read'})`,
+    ).rejects.toThrow();
+  });
+
+  test('registerClientManual persists submit_agent bindings when supplied', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'bound-agent', ['client_credentials'], 'read agent', [], 'default', undefined, undefined, {
+        boundTools: ['search', 'get_page'],
+        boundSourceId: 'default',
+        boundSlugPrefixes: ['wiki/agents/bound-agent/'],
+        boundMaxConcurrent: 2,
+        budgetUsdPerDay: '7.50',
+      },
+    );
+
+    const rows = await sql`
+      SELECT bound_tools, bound_source_id, bound_brain_id, bound_slug_prefixes,
+             bound_max_concurrent, budget_usd_per_day::text AS budget
+        FROM oauth_clients WHERE client_id = ${clientId}
+    `;
+    expect(rows[0].bound_tools).toEqual(['search', 'get_page']);
+    expect(rows[0].bound_source_id).toBe('default');
+    expect(rows[0].bound_brain_id).toBeNull();
+    expect(rows[0].bound_slug_prefixes).toEqual(['wiki/agents/bound-agent/']);
+    expect(Number(rows[0].bound_max_concurrent)).toBe(2);
+    expect(rows[0].budget).toBe('7.50');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rescopeClient (#1914) — admin-gated rescope of a DCR-defaulted client
+// ---------------------------------------------------------------------------
+
+describe('rescopeClient', () => {
+  beforeAll(async () => {
+    // oauth_clients.source_id has FK → sources(id); create the targets.
+    for (const id of ['wiki', 'essays', 'alpha', 'beta', 'gamma']) {
+      await sql`INSERT INTO sources (id, name) VALUES (${id}, ${id}) ON CONFLICT (id) DO NOTHING`;
+    }
+  });
+
+  test('DCR client stuck on default gets rescoped; existing tokens pick it up', async () => {
+    // Simulate the DCR path: self-registered client lands with
+    // source_id='default', federated_read=['default']. client_credentials
+    // over DCR needs the explicit --enable-dcr-insecure opt-in, so build a
+    // provider with that flag just for this registration.
+    const dcrProvider = new GBrainOAuthProvider({ transaction: pgliteOAuthTransaction(db), sql, tokenTtl: 60, allowClientCredentialsDcr: true });
+    const dcr = await dcrProvider.clientsStore.registerClient!({
+      client_name: 'dcr-stuck-client',
+      redirect_uris: [],
+      grant_types: ['client_credentials'],
+      scope: 'read',
+      token_endpoint_auth_method: 'client_secret_post',
+    } as any);
+    const clientId = dcr.client_id;
+    const [before] = await sql`SELECT source_id, federated_read FROM oauth_clients WHERE client_id = ${clientId}`;
+    expect(before.source_id).toBe('default');
+    expect(before.federated_read).toEqual(['default']);
+
+    // Issue a token BEFORE the rescope — it must see the new scope after.
+    const tokens = await provider.exchangeClientCredentials(clientId, dcr.client_secret!, 'read');
+
+    const result = await provider.rescopeClient(clientId, {
+      sourceId: 'wiki',
+      federatedRead: ['wiki', 'essays'],
+    });
+    expect(result.sourceId).toBe('wiki');
+    expect(result.federatedRead).toEqual(['wiki', 'essays']);
+
+    const authInfo = await provider.verifyAccessToken(tokens.access_token) as unknown as CoreAuthInfo;
+    expect(authInfo.sourceId).toBe('wiki');
+    expect(authInfo.allowedSources).toEqual(['wiki', 'essays']);
+  });
+
+  test('partial rescope leaves the other axis untouched', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'partial-rescope', ['client_credentials'], 'read', [], 'alpha', ['alpha', 'beta'],
+    );
+    const result = await provider.rescopeClient(clientId, { federatedRead: ['beta'] });
+    expect(result.sourceId).toBe('alpha'); // untouched
+    expect(result.federatedRead).toEqual(['beta']);
+
+    const result2 = await provider.rescopeClient(clientId, { sourceId: 'gamma' });
+    expect(result2.sourceId).toBe('gamma');
+    expect(result2.federatedRead).toEqual(['beta']); // untouched
+  });
+
+  test('rejects invalid source ids, empty federated list, no-op calls, unknown client', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'rescope-validation', ['client_credentials'], 'read',
+    );
+    await expect(provider.rescopeClient(clientId, { sourceId: '../etc' })).rejects.toThrow('Invalid source_id');
+    await expect(provider.rescopeClient(clientId, { federatedRead: ['ok', 'Not Valid!'] })).rejects.toThrow('Invalid source_id');
+    await expect(provider.rescopeClient(clientId, { federatedRead: [] })).rejects.toThrow('cannot be empty');
+    await expect(provider.rescopeClient(clientId, {})).rejects.toThrow('requires --source, --federated-read, --bound-slug-prefixes, and/or --surface');
+    // v0.42.70.0: an explicit empty prefix list is ambiguous (deny-all) — rejected.
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: [] })).rejects.toThrow('cannot be an empty list');
+    // An empty/whitespace ENTRY matches every slug under startsWith — it would
+    // look like a binding while fencing nothing. Rejected at every write surface.
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: [''] })).rejects.toThrow('non-empty');
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: ['ok/', '  '] })).rejects.toThrow('non-empty');
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: [' ok/'] })).rejects.toThrow('whitespace');
+    // A boundary-less entry reads as a character prefix, so it would silently
+    // cover sibling namespaces (emp-alice -> emp-alice-2/...).
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: ['emp-alice'] })).rejects.toThrow('must end with');
+    await expect(provider.rescopeClient(clientId, { boundSlugPrefixes: ['emp-alice/', 'chan-eng'] })).rejects.toThrow('must end with');
+    await expect(provider.registerClientManual(
+      'empty-prefix-reject', ['client_credentials'], 'read write', [], 'default', undefined, undefined,
+      { boundSlugPrefixes: [''] },
+    )).rejects.toThrow('non-empty');
+    await expect(provider.rescopeClient('gbrain_cl_nonexistent', { sourceId: 'wiki' })).rejects.toThrow('No OAuth client found');
+    // FK: write source must exist in sources(id).
+    await expect(provider.rescopeClient(clientId, { sourceId: 'no-such-source' })).rejects.toThrow('does not exist');
+
+    // Validation failures must not have mutated the row.
+    const [row] = await sql`SELECT source_id FROM oauth_clients WHERE client_id = ${clientId}`;
+    expect(row.source_id).toBe('default');
+  });
+
+  // v0.42.70.0: bound_slug_prefixes rescope — roster churn (channel
+  // joins/leaves) updates the write fence in place; 'none' (null) clears it.
+  test('bound_slug_prefixes: replace, leave-untouched, and clear; live tokens pick it up', async () => {
+    const { clientId, clientSecret } = await provider.registerClientManual(
+      'rescope-fence', ['client_credentials'], 'read write', [], 'default', undefined, undefined, {
+        boundSlugPrefixes: ['emp-carol/'],
+      },
+    );
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret!, 'read write');
+
+    // Replace the binding (carol joins chan-eng).
+    const replaced = await provider.rescopeClient(clientId, { boundSlugPrefixes: ['emp-carol/', 'chan-eng/'] });
+    expect(replaced.boundSlugPrefixes).toEqual(['emp-carol/', 'chan-eng/']);
+    expect(replaced.sourceId).toBe('default'); // untouched
+
+    // The already-issued token sees the new binding on next verification.
+    const live = await provider.verifyAccessToken(tokens.access_token) as unknown as CoreAuthInfo;
+    expect(live.boundSlugPrefixes).toEqual(['emp-carol/', 'chan-eng/']);
+
+    // Rescoping another axis leaves the binding untouched — and doesn't even
+    // name the column, so brains predating it can still rescope --source.
+    // `undefined` here means "not read this call", distinct from null = unset.
+    const other = await provider.rescopeClient(clientId, { federatedRead: ['alpha'] });
+    expect(other.boundSlugPrefixes).toBeUndefined();
+    const stillBound = await provider.verifyAccessToken(tokens.access_token) as unknown as CoreAuthInfo;
+    expect(stillBound.boundSlugPrefixes).toEqual(['emp-carol/', 'chan-eng/']);
+
+    // null clears it — client returns to unbound full-source write authority.
+    const cleared = await provider.rescopeClient(clientId, { boundSlugPrefixes: null });
+    expect(cleared.boundSlugPrefixes).toBeNull();
+    const unfenced = await provider.verifyAccessToken(tokens.access_token) as unknown as CoreAuthInfo;
+    expect(unfenced.boundSlugPrefixes).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Client Credentials Exchange
+// ---------------------------------------------------------------------------
+
+describe('client credentials', () => {
+  let clientId: string;
+  let clientSecret: string;
+
+  beforeAll(async () => {
+    const result = await provider.registerClientManual(
+      'cc-test-agent', ['client_credentials'], 'read write',
+    );
+    clientId = result.clientId;
+    if (!result.clientSecret) throw new Error('test bug: expected confidential client to have secret');
+    clientSecret = result.clientSecret;
+  });
+
+  test('valid exchange returns access token', async () => {
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret, 'read');
+    expect(tokens.access_token).toStartWith('gbrain_at_');
+    expect(tokens.token_type).toBe('bearer');
+    expect(tokens.expires_in).toBe(60);
+    expect(tokens.scope).toBe('read');
+  });
+
+  test('no refresh token issued for CC grant', async () => {
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret, 'read');
+    expect(tokens.refresh_token).toBeUndefined();
+  });
+
+  test('wrong secret is rejected', async () => {
+    await expect(
+      provider.exchangeClientCredentials(clientId, 'wrong-secret', 'read'),
+    ).rejects.toThrow('Invalid client secret');
+  });
+
+  test('client without CC grant is rejected', async () => {
+    const { clientId: noCC } = await provider.registerClientManual(
+      'no-cc-agent', ['authorization_code'], 'read',
+    );
+    await expect(
+      provider.exchangeClientCredentials(noCC, 'any-secret', 'read'),
+    ).rejects.toThrow('not authorized');
+  });
+
+  test('scope is filtered to allowed scopes', async () => {
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret, 'read write admin');
+    // Client only has 'read write', admin should be filtered out
+    expect(tokens.scope).not.toContain('admin');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token Verification
+// ---------------------------------------------------------------------------
+
+describe('verifyAccessToken', () => {
+  test('valid token returns auth info', async () => {
+    const { clientId, clientSecret } = await provider.registerClientManual(
+      'verify-test', ['client_credentials'], 'read write',
+    );
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret!, 'read');
+    const authInfo = await provider.verifyAccessToken(tokens.access_token);
+
+    expect(authInfo.clientId).toBe(clientId);
+    expect(authInfo.scopes).toContain('read');
+    expect(authInfo.token).toBe(tokens.access_token);
+  });
+
+  // v0.42.70.0: bound_slug_prefixes threads through token verification on
+  // the same JOIN as source_id/federated_read, so enforceClientSlugFence
+  // can fence direct writes without a per-op DB lookup.
+  test('bound_slug_prefixes threads into AuthInfo; absent binding stays undefined', async () => {
+    const bound = await provider.registerClientManual(
+      'fence-thread-test', ['client_credentials'], 'read write', [], 'default', undefined, undefined, {
+        boundSlugPrefixes: ['chan-eng/', 'wiki/agents/fence-thread-test/'],
+      },
+    );
+    const boundTokens = await provider.exchangeClientCredentials(bound.clientId, bound.clientSecret!, 'read write');
+    const boundInfo = await provider.verifyAccessToken(boundTokens.access_token) as unknown as CoreAuthInfo;
+    expect(boundInfo.boundSlugPrefixes).toEqual(['chan-eng/', 'wiki/agents/fence-thread-test/']);
+
+    const unbound = await provider.registerClientManual(
+      'fence-unbound-test', ['client_credentials'], 'read write',
+    );
+    const unboundTokens = await provider.exchangeClientCredentials(unbound.clientId, unbound.clientSecret!, 'read write');
+    const unboundInfo = await provider.verifyAccessToken(unboundTokens.access_token) as unknown as CoreAuthInfo;
+    expect(unboundInfo.boundSlugPrefixes).toBeUndefined();
+  });
+
+  test('expired token is rejected', async () => {
+    // Insert a token that's already expired
+    const expiredToken = generateToken('gbrain_at_');
+    const hash = hashToken(expiredToken);
+    const firstClient = (await sql`SELECT client_id FROM oauth_clients LIMIT 1`)[0];
+    await sql`
+      INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at)
+      VALUES (${hash}, ${'access'}, ${firstClient.client_id as string}, ${'{read}'}, ${Math.floor(Date.now() / 1000) - 100})
+    `;
+    await expect(provider.verifyAccessToken(expiredToken)).rejects.toThrow('expired');
+  });
+
+  test('unknown token is rejected', async () => {
+    await expect(provider.verifyAccessToken('nonexistent-token')).rejects.toThrow('Invalid token');
+  });
+
+  // v0.36.1.x #935: the SDK's requireBearerAuth middleware only returns 401
+  // on InvalidTokenError; bare Error falls through to 500. Lock in the class.
+  test('verifyAccessToken throws InvalidTokenError (not bare Error) on expired token', async () => {
+    const expiredToken = generateToken('gbrain_at_');
+    const hash = hashToken(expiredToken);
+    const firstClient = (await sql`SELECT client_id FROM oauth_clients LIMIT 1`)[0];
+    await sql`
+      INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at)
+      VALUES (${hash}, ${'access'}, ${firstClient.client_id as string}, ${'{read}'}, ${Math.floor(Date.now() / 1000) - 100})
+    `;
+    let caught: unknown;
+    try {
+      await provider.verifyAccessToken(expiredToken);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(InvalidTokenError);
+  });
+
+  test('verifyAccessToken throws InvalidTokenError (not bare Error) on unknown token', async () => {
+    let caught: unknown;
+    try {
+      await provider.verifyAccessToken('nonexistent-token');
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(InvalidTokenError);
+  });
+
+  test('NULL expires_at is treated as expired (fail-closed)', async () => {
+    // Schema declares oauth_tokens.expires_at as nullable BIGINT (schema.sql:372).
+    // Hand-modified or corrupt rows could land with NULL; verifyAccessToken must
+    // fail-closed, not return an undefined-bearing AuthInfo that the SDK accepts.
+    const nullExpiryToken = generateToken('gbrain_at_');
+    const hash = hashToken(nullExpiryToken);
+    const firstClient = (await sql`SELECT client_id FROM oauth_clients LIMIT 1`)[0];
+    await sql`
+      INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at)
+      VALUES (${hash}, ${'access'}, ${firstClient.client_id as string}, ${'{read}'}, ${null})
+    `;
+    await expect(provider.verifyAccessToken(nullExpiryToken)).rejects.toThrow('expired');
+  });
+
+  test('cascade-deleted client invalidates its tokens (Invalid token, not Expired)', async () => {
+    // revoke-client does DELETE FROM oauth_clients WHERE client_id = ...
+    // The schema-level FK cascade (schema.sql:370) wipes oauth_tokens too.
+    // verifyAccessToken on a previously-minted token from that client must
+    // fail with "Invalid token" (cascade purged the row) — distinct from
+    // "Token expired" so logs distinguish the failure modes.
+    const { clientId, clientSecret } = await provider.registerClientManual(
+      'cascade-test', ['client_credentials'], 'read',
+    );
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret!, 'read');
+    await sql`DELETE FROM oauth_clients WHERE client_id = ${clientId}`;
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow('Invalid token');
+  });
+
+  test('expiresAt is always a number (not string) — SDK bearerAuth compat', async () => {
+    // Regression: postgres driver with prepare:false returns integers as strings.
+    // MCP SDK's bearerAuth middleware checks typeof === 'number' and rejects strings.
+    // verifyAccessToken must cast to Number() before returning.
+    const { clientId, clientSecret } = await provider.registerClientManual(
+      'typeof-test', ['client_credentials'], 'read',
+    );
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret!, 'read');
+    const authInfo = await provider.verifyAccessToken(tokens.access_token);
+
+    expect(typeof authInfo.expiresAt).toBe('number');
+    expect(Number.isNaN(authInfo.expiresAt)).toBe(false);
+    expect(authInfo.expiresAt).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+
+  test('legacy access_tokens fallback works', async () => {
+    // Insert a legacy bearer token
+    const legacyToken = generateToken('gbrain_');
+    const hash = hashToken(legacyToken);
+    await sql`
+      INSERT INTO access_tokens (id, name, token_hash)
+      VALUES (${crypto.randomUUID()}, ${'legacy-agent'}, ${hash})
+    `;
+
+    const authInfo = await provider.verifyAccessToken(legacyToken);
+    expect(authInfo.clientId).toBe('legacy-agent');
+    expect(authInfo.scopes).toEqual(['read', 'write', 'admin']); // grandfathered full access
+  });
+
+  test('legacy access_tokens fallback honors permissions.source_id array grants', async () => {
+    // oauth.test.ts initializes the static PGLite schema blob, not the full
+    // migration stack. Add the v38 permissions column here so the row matches
+    // a modern brain carrying a legacy-token source grant.
+    await sql`
+      ALTER TABLE access_tokens
+        ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{"takes_holders":["world"]}'::jsonb
+    `;
+
+    const legacyToken = generateToken('gbrain_');
+    const hash = hashToken(legacyToken);
+    await sql`
+      INSERT INTO access_tokens (id, name, token_hash, permissions)
+      VALUES (
+        ${crypto.randomUUID()},
+        ${'legacy-federated-agent'},
+        ${hash},
+        ${JSON.stringify({ source_id: ['default', 'src-a', 'src-b'] })}::jsonb
+      )
+    `;
+
+    const authInfo = await provider.verifyAccessToken(legacyToken) as CoreAuthInfo;
+    expect(authInfo.clientId).toBe('legacy-federated-agent');
+    expect(authInfo.sourceId).toBe('default');
+    expect(authInfo.allowedSources).toEqual(['default', 'src-a', 'src-b']);
+  });
+
+  // -------------------------------------------------------------------------
+  // #2529 — legacy access_tokens fallback threads permissions.takes_holders
+  // into AuthInfo.takesHoldersAllowList. Each test adds the v29 permissions
+  // column idempotently and inserts `permissions` EXPLICITLY: the column's
+  // NOT NULL DEFAULT is '{"takes_holders":["world"]}', so relying on the
+  // default would silently turn an "absent key" case into a ['world'] case.
+  // -------------------------------------------------------------------------
+
+  async function insertLegacyTokenWithPermissions(
+    name: string,
+    permissions: Record<string, unknown> | undefined,
+  ): Promise<string> {
+    await sql`
+      ALTER TABLE access_tokens
+        ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{"takes_holders":["world"]}'::jsonb
+    `;
+    const token = generateToken('gbrain_');
+    const hash = hashToken(token);
+    if (permissions === undefined) {
+      await sql`
+        INSERT INTO access_tokens (id, name, token_hash)
+        VALUES (${crypto.randomUUID()}, ${name}, ${hash})
+      `;
+    } else {
+      await sql`
+        INSERT INTO access_tokens (id, name, token_hash, permissions)
+        VALUES (${crypto.randomUUID()}, ${name}, ${hash}, ${JSON.stringify(permissions)}::jsonb)
+      `;
+    }
+    return token;
+  }
+
+  test('legacy token with takes_holders grant → takesHoldersAllowList threaded (#2529)', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-grant-agent', { takes_holders: ['world', 'brain'] });
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toEqual(['world', 'brain']);
+  });
+
+  test('legacy token with no takes_holders key → undefined (consumer defaults to world)', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-absent-agent', {});
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toBeUndefined();
+  });
+
+  test('legacy token with non-array takes_holders → undefined (fail-closed at consumer)', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-garbage-agent', { takes_holders: 'world' });
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toBeUndefined();
+  });
+
+  test('legacy token with empty-array takes_holders → [] preserved as explicit deny-all', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-denyall-agent', { takes_holders: [] });
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toBeDefined();
+    expect(authInfo.takesHoldersAllowList).toEqual([]);
+  });
+
+  test('legacy token with mixed-type takes_holders → non-string entries filtered', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-mixed-agent', { takes_holders: ['world', 42, null] });
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toEqual(['world']);
+  });
+
+  test('OAuth-client token → takesHoldersAllowList undefined (no per-client storage; fail-closed)', async () => {
+    const { clientId, clientSecret } = await provider.registerClientManual(
+      'takes-oauth-client', ['client_credentials'], 'read',
+    );
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret!, 'read');
+    const authInfo = await provider.verifyAccessToken(tokens.access_token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toBeUndefined();
+  });
+
+  test('legacy token relying on the v29 column default → ["world"] (fix invisible to unrestricted tokens)', async () => {
+    const token = await insertLegacyTokenWithPermissions('takes-default-agent', undefined);
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.takesHoldersAllowList).toEqual(['world']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #4043 — legacy access_tokens honor the scopes TEXT[] column (least
+// privilege). NULL (every pre-feature token) grandfathers to full access —
+// pinned above by 'legacy access_tokens fallback works'.
+// ---------------------------------------------------------------------------
+
+describe('#4043 legacy token scopes column', () => {
+  async function insertLegacyTokenWithScopes(name: string, scopesLiteral: string | null): Promise<string> {
+    const token = generateToken('gbrain_');
+    const hash = hashToken(token);
+    await sql`
+      INSERT INTO access_tokens (id, name, token_hash, scopes)
+      VALUES (${crypto.randomUUID()}, ${name}, ${hash}, ${scopesLiteral}::text[])
+    `;
+    return token;
+  }
+
+  test("scopes ['read','write'] verifies with exactly those scopes (no admin)", async () => {
+    const token = await insertLegacyTokenWithScopes('scoped-harness-agent', '{read,write}');
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual(['read', 'write']);
+  });
+
+  test('explicit empty scopes array is preserved as deny-all', async () => {
+    const token = await insertLegacyTokenWithScopes('deny-all-agent', '{}');
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual([]);
+  });
+
+  test('unknown scope strings are filtered; all-unknown collapses to deny, not grandfather', async () => {
+    const token = await insertLegacyTokenWithScopes('typo-agent', '{reed,write}');
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual(['write']);
+    const token2 = await insertLegacyTokenWithScopes('all-typo-agent', '{reed,wright}');
+    const authInfo2 = await provider.verifyAccessToken(token2) as CoreAuthInfo;
+    expect(authInfo2.scopes).toEqual([]);
+  });
+
+  test('NULL scopes keeps the grandfathered full-access grant (byte-identical legacy behavior)', async () => {
+    const token = await insertLegacyTokenWithScopes('null-scopes-agent', null);
+    const authInfo = await provider.verifyAccessToken(token) as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual(['read', 'write', 'admin']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token Revocation
+// ---------------------------------------------------------------------------
+
+describe('revokeToken', () => {
+  test('revoked token no longer verifies', async () => {
+    const { clientId, clientSecret } = await provider.registerClientManual(
+      'revoke-test', ['client_credentials'], 'read',
+    );
+    const tokens = await provider.exchangeClientCredentials(clientId, clientSecret!, 'read');
+
+    // Verify token works
+    const authInfo = await provider.verifyAccessToken(tokens.access_token);
+    expect(authInfo.clientId).toBe(clientId);
+
+    // Revoke it
+    const client = (await provider.clientsStore.getClient(clientId))!;
+    await provider.revokeToken!(client, { token: tokens.access_token });
+
+    // Should no longer verify
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow();
+  });
+
+  test('revoking already-revoked token is a no-op', async () => {
+    // This should not throw
+    const client = (await provider.clientsStore.getClient(
+      (await sql`SELECT client_id FROM oauth_clients LIMIT 1`)[0].client_id as string,
+    ))!;
+    await provider.revokeToken!(client, { token: 'already-gone' });
+    // No error = pass
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Authorization Code Flow
+// ---------------------------------------------------------------------------
+
+describe('authorization code flow', () => {
+  test('code issuance and exchange', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'authcode-test', ['authorization_code'], 'read write',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    // Mock Express response for authorize
+    let redirectUrl = '';
+    const mockRes = {
+      redirect: (url: string) => { redirectUrl = url; },
+    } as any;
+
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read', 'write'],
+      state: 'test-state',
+    }, mockRes);
+
+    expect(redirectUrl).toContain('code=gbrain_code_');
+    expect(redirectUrl).toContain('state=test-state');
+
+    // Extract code from redirect URL
+    const url = new URL(redirectUrl);
+    const code = url.searchParams.get('code')!;
+
+    // Exchange code for tokens
+    const tokens = await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+    expect(tokens.access_token).toStartWith('gbrain_at_');
+    expect(tokens.refresh_token).toBeDefined(); // Auth code flow includes refresh
+  });
+
+  test('code is single-use', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'single-use-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+
+    // First exchange works
+    await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+
+    // Second exchange fails (code consumed)
+    await expect(provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0])).rejects.toThrow();
+  });
+
+  test('expired code is rejected', async () => {
+    // Insert an already-expired code
+    const expiredCode = generateToken('gbrain_code_');
+    const hash = hashToken(expiredCode);
+    const firstClient = (await sql`SELECT client_id FROM oauth_clients LIMIT 1`)[0];
+
+    await sql`
+      INSERT INTO oauth_codes (code_hash, client_id, scopes, code_challenge,
+                                redirect_uri, expires_at)
+      VALUES (${hash}, ${firstClient.client_id as string}, ${'{read}'},
+              ${'challenge'}, ${'http://localhost/cb'}, ${Math.floor(Date.now() / 1000) - 100})
+    `;
+
+    const client = (await provider.clientsStore.getClient(firstClient.client_id as string))!;
+    await expect(provider.exchangeAuthorizationCode(client, expiredCode, TEST_PKCE_VERIFIER, client.redirect_uris![0])).rejects.toThrow();
+  });
+
+  // F-AUTHZ regression. The MCP SDK's authorize handler splits `?scope=...`
+  // verbatim and forwards the raw list to the provider, so the provider must
+  // clamp against the client's registered grant. Pre-fix the INSERT into
+  // oauth_codes used `params.scopes || []` raw, so a `read`-registered client
+  // requesting `?scope=admin` got an admin access token at /token exchange.
+  // This pins the parallel posture to client_credentials' filter pattern
+  // (line 513-515) and refresh's F3 subset enforcement (RFC 6749 §6).
+  test('authorize clamps requested scopes against client.scope (RFC 6749 §3.3)', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'authz-clamp-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+
+    // Read-only client requests admin via the SDK's parsed scopes array.
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read', 'write', 'admin'],
+    }, mockRes);
+
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+
+    // The token's stored scopes must equal the clamped subset.
+    const auth = await provider.verifyAccessToken(tokens.access_token);
+    expect(auth.scopes).toEqual(['read']);
+    expect(auth.scopes).not.toContain('write');
+    expect(auth.scopes).not.toContain('admin');
+  });
+
+  test('authorize subset request returns subset', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'authz-subset-test', ['authorization_code'], 'read write',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+    const auth = await provider.verifyAccessToken(tokens.access_token);
+    expect(auth.scopes).toEqual(['read']);
+  });
+
+  // CSO finding #2 regression. The pre-fix SELECT-then-DELETE pattern let two
+  // concurrent token requests with the same code both pass the SELECT, both
+  // running DELETE (no-op on second) and both calling issueTokens. The fix is
+  // DELETE...RETURNING in one statement; this test fires N=10 concurrent
+  // exchanges and asserts exactly one succeeds.
+  test('concurrent exchange requests: only one succeeds (TOCTOU race)', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'toctou-code-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+
+    const N = 10;
+    const results = await Promise.allSettled(
+      Array.from({ length: N }, () => provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0])),
+    );
+    const successes = results.filter(r => r.status === 'fulfilled');
+    const failures = results.filter(r => r.status === 'rejected');
+    expect(successes.length).toBe(1);
+    expect(failures.length).toBe(N - 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Refresh Token
+// ---------------------------------------------------------------------------
+
+describe('refresh token', () => {
+  test('valid refresh rotates tokens', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'refresh-test', ['authorization_code'], 'read write',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read', 'write'],
+    }, mockRes);
+
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+
+    // Refresh
+    const newTokens = await provider.exchangeRefreshToken(client, tokens.refresh_token!, ['read']);
+    expect(newTokens.access_token).not.toBe(tokens.access_token);
+    expect(newTokens.refresh_token).toBeDefined();
+    expect(newTokens.refresh_token).not.toBe(tokens.refresh_token); // rotated
+
+    // Old refresh token should no longer work
+    await expect(provider.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow();
+  });
+
+  // CSO finding #3 regression. Same TOCTOU pattern as auth code; the fix is
+  // DELETE...RETURNING. Detection of stolen refresh tokens (RFC 6749 §10.4)
+  // depends on second-use failure, so two concurrent succeed = no detection.
+  test('concurrent refresh requests: only one succeeds (TOCTOU race)', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'toctou-refresh-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+
+    const N = 10;
+    const results = await Promise.allSettled(
+      Array.from({ length: N }, () => provider.exchangeRefreshToken(client, tokens.refresh_token!)),
+    );
+    const successes = results.filter(r => r.status === 'fulfilled');
+    expect(successes.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token Sweep
+// ---------------------------------------------------------------------------
+
+describe('sweepExpiredTokens', () => {
+  test('removes expired tokens', async () => {
+    // Insert some expired tokens
+    const firstClient = (await sql`SELECT client_id FROM oauth_clients LIMIT 1`)[0];
+    const expired1 = hashToken(generateToken('sweep_'));
+    const expired2 = hashToken(generateToken('sweep_'));
+
+    await sql`INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at)
+              VALUES (${expired1}, ${'access'}, ${firstClient.client_id as string}, ${'{read}'}, ${1})`;
+    await sql`INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at)
+              VALUES (${expired2}, ${'access'}, ${firstClient.client_id as string}, ${'{read}'}, ${2})`;
+
+    await provider.sweepExpiredTokens();
+
+    // Verify they're gone
+    const remaining = await sql`SELECT count(*)::int as count FROM oauth_tokens WHERE expires_at < 100`;
+    expect(remaining[0].count).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scope Annotations
+// ---------------------------------------------------------------------------
+
+describe('operation scope annotations', () => {
+  test('all operations have a scope', () => {
+    const { operations } = require('../src/core/operations.ts');
+    for (const op of operations) {
+      expect(op.scope, `${op.name} missing scope`).toBeDefined();
+      // v0.28 added sources_admin and users_admin to the union.
+      // v0.38 added 'agent' for submit_agent (D13).
+      expect([
+        'read', 'write', 'admin', 'sources_admin', 'users_admin', 'agent',
+      ]).toContain(op.scope);
+    }
+  });
+
+  test('mutating operations are write/admin/sources_admin/users_admin/agent scoped unless remote-gated', () => {
+    const { operations } = require('../src/core/operations.ts');
+    // #2598, same allowlist as test/operations-trust-boundary.test.ts: think
+    // is read-scoped for OAuth/MCP because its handler forces save/take off
+    // for remote callers before persistence (pinned by
+    // test/takes-mcp-allowlist.test.ts); local CLI can still persist.
+    // WP4/D9: request_tools is read-scoped + mutating — its only write (the
+    // {surface} persist branch) self-enforces the D2 ceiling, the operator
+    // lock, and a per-client rate limit; the read scope keeps discovery
+    // available to every token class (agent scope via the FOV-4 carve-out).
+    const remoteReadOnlyMutatingOps = new Set(['think', 'request_tools']);
+    for (const op of operations) {
+      if (op.mutating) {
+        if (['join_brain', 'sync_brain_skills', 'leave_brain'].includes(op.name)) {
+          const { operationScopesAllowed } = require('../src/core/scope.ts');
+          expect(op.scope).toBe('read');
+          expect(op.requiredScopes).toEqual(['skills_member_self']);
+          expect(operationScopesAllowed(['read'], op)).toBe(false);
+          expect(operationScopesAllowed(['admin'], op)).toBe(false);
+          expect(operationScopesAllowed(['read', 'skills_member_self'], op)).toBe(true);
+          continue;
+        }
+        if (remoteReadOnlyMutatingOps.has(op.name)) {
+          expect(op.scope, `${op.name} remote-gated mutating op should be read-scoped`).toBe('read');
+          continue;
+        }
+        // v0.28: sources_admin permits sources_add / sources_remove (mutating
+        // sources, not pages); read scope is the only thing too narrow for
+        // a mutating op unless its remote path forces persistence off before
+        // the handler writes. v0.38: 'agent' is a mutating-axis scope for
+        // submit_agent (creates jobs, spends money, but contained by bindings).
+        expect(
+          ['write', 'admin', 'sources_admin', 'users_admin', 'agent'],
+          `${op.name} is mutating but not a write-axis scope`,
+        ).toContain(op.scope);
+      }
+    }
+  });
+
+  test('sync_brain and file_upload are localOnly', () => {
+    const { operationsByName } = require('../src/core/operations.ts');
+    expect(operationsByName.sync_brain.localOnly).toBe(true);
+    expect(operationsByName.file_upload.localOnly).toBe(true);
+  });
+
+  test('file_list and file_url are localOnly', () => {
+    const { operationsByName } = require('../src/core/operations.ts');
+    expect(operationsByName.file_list.localOnly).toBe(true);
+    expect(operationsByName.file_url.localOnly).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CSO finding #5 — pgArray escape + DCR redirect_uri validation
+// ---------------------------------------------------------------------------
+
+describe('redirect_uri validation (DCR)', () => {
+  test('http://localhost is allowed (loopback exception)', async () => {
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'localhost-ok',
+      redirect_uris: ['http://localhost:3000/callback'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'client_secret_post',
+    });
+    expect(result.client_id).toStartWith('gbrain_cl_');
+  });
+
+  test('https:// is allowed', async () => {
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'https-ok',
+      redirect_uris: ['https://example.com/callback'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'client_secret_post',
+    });
+    expect(result.client_id).toStartWith('gbrain_cl_');
+  });
+
+  test('plaintext http:// (non-loopback) is rejected', async () => {
+    await expect(
+      provider.clientsStore.registerClient!({
+        client_name: 'http-rejected',
+        redirect_uris: ['http://example.com/callback'],
+        grant_types: ['authorization_code'],
+        scope: 'read',
+        token_endpoint_auth_method: 'client_secret_post',
+      }),
+    ).rejects.toThrow(/https|loopback|custom scheme/i);
+  });
+
+  test('non-URL string is rejected', async () => {
+    await expect(
+      provider.clientsStore.registerClient!({
+        client_name: 'garbage',
+        redirect_uris: ['not-a-url'],
+        grant_types: ['authorization_code'],
+        scope: 'read',
+        token_endpoint_auth_method: 'client_secret_post',
+      }),
+    ).rejects.toThrow();
+  });
+
+  test('native-app custom scheme redirect_uri is allowed (RFC 8252 §7.1)', async () => {
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'warp-custom-scheme',
+      redirect_uris: ['warp://oauth/callback'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'none',
+    });
+    expect(result.client_id).toStartWith('gbrain_cl_');
+    const stored = await provider.clientsStore.getClient(result.client_id);
+    expect(stored!.redirect_uris).toEqual(['warp://oauth/callback']);
+  });
+
+  test('browser pseudo-schemes are rejected in the custom-scheme branch', async () => {
+    // javascript:/data:/vbscript:/blob: are not native-app schemes — a
+    // "redirect" to one is script injection. The custom-scheme allow branch
+    // must not let them through.
+    for (const uri of [
+      'javascript://alert(1)',
+      'data://text/html;base64,PGh0bWw+',
+      'vbscript://msgbox',
+      'blob://example.com/uuid',
+    ]) {
+      await expect(
+        provider.clientsStore.registerClient!({
+          client_name: 'pseudo-scheme-client',
+          redirect_uris: [uri],
+          grant_types: ['authorization_code'],
+          scope: 'read',
+          token_endpoint_auth_method: 'none',
+        }),
+      ).rejects.toThrow(/pseudo-scheme/);
+    }
+  });
+
+  test('DCR validation failures throw InvalidClientMetadataError (not plain Error)', async () => {
+    const { InvalidClientMetadataError } = await import(
+      '@modelcontextprotocol/sdk/server/auth/errors.js'
+    );
+    try {
+      await provider.clientsStore.registerClient!({
+        client_name: 'http-rejected-type',
+        redirect_uris: ['http://example.com/callback'],
+        grant_types: ['authorization_code'],
+        scope: 'read',
+        token_endpoint_auth_method: 'client_secret_post',
+      });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(InvalidClientMetadataError);
+    }
+  });
+
+  // pgArray escape regression: an element containing a comma must be stored
+  // as ONE element, not parsed by Postgres as TWO. Without the fix, the
+  // comma would smuggle a second redirect_uri into the registered list.
+  test('redirect_uri with embedded comma stored as single element', async () => {
+    // Use a localhost URI with comma in the path so it passes HTTPS validation.
+    const trickyUri = 'http://localhost:3000/cb,evil';
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'comma-test',
+      redirect_uris: [trickyUri],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'client_secret_post',
+    });
+
+    // Read back from the DB and confirm exactly one element.
+    const stored = await provider.clientsStore.getClient(result.client_id);
+    expect(stored).toBeDefined();
+    expect(stored!.redirect_uris).toHaveLength(1);
+    expect(stored!.redirect_uris[0]).toBe(trickyUri);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1 / F4 — Wrong-client cross-tenant attempts
+// ---------------------------------------------------------------------------
+//
+// The atomic client_id binding lives in the DELETE WHERE clause for auth
+// codes (exchange + challenge), refresh tokens (rotate), and revocations.
+// Without it, any authenticated client that knew/guessed another client's
+// hash could (a) consume the code/refresh on the wrong-client path,
+// burning it for the legitimate client, or (b) revoke another client's
+// tokens. These tests pin the negative invariant — wrong client fails —
+// AND the positive invariant — owner still succeeds atomically afterward.
+
+describe('F1/F4 cross-client isolation', () => {
+  test('wrong client cannot consume another client authorization code', async () => {
+    const { clientId: ownerId } = await provider.registerClientManual(
+      'authcode-owner-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const { clientId: attackerId } = await provider.registerClientManual(
+      'authcode-attacker-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const owner = (await provider.clientsStore.getClient(ownerId))!;
+    const attacker = (await provider.clientsStore.getClient(attackerId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, owner, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+
+    // Attacker holding the same code MUST be rejected.
+    await expect(provider.exchangeAuthorizationCode(attacker, code, TEST_PKCE_VERIFIER, attacker.redirect_uris![0])).rejects.toThrow();
+
+    // The atomic predicate's payoff: the legitimate owner can STILL redeem
+    // the code afterward. Without it, the attacker would have burned the
+    // row in the DELETE and the owner's redemption would 404.
+    const tokens = await provider.exchangeAuthorizationCode(owner, code, TEST_PKCE_VERIFIER, owner.redirect_uris![0]);
+    expect(tokens.access_token).toStartWith('gbrain_at_');
+  });
+
+  test('wrong client cannot read another client PKCE challenge', async () => {
+    const { clientId: ownerId } = await provider.registerClientManual(
+      'challenge-owner-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const { clientId: attackerId } = await provider.registerClientManual(
+      'challenge-attacker-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const owner = (await provider.clientsStore.getClient(ownerId))!;
+    const attacker = (await provider.clientsStore.getClient(attackerId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, owner, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+
+    await expect(provider.challengeForAuthorizationCode!(attacker, code)).rejects.toThrow();
+    await expect(provider.challengeForAuthorizationCode!(owner, code)).resolves.toBe(TEST_PKCE_CHALLENGE);
+  });
+
+  test('wrong client cannot revoke another client token', async () => {
+    const { clientId: ownerId, clientSecret: ownerSecret } = await provider.registerClientManual(
+      'revoke-owner-test', ['client_credentials'], 'read',
+    );
+    const { clientId: attackerId } = await provider.registerClientManual(
+      'revoke-attacker-test', ['client_credentials'], 'read',
+    );
+    const tokens = await provider.exchangeClientCredentials(ownerId, ownerSecret!, 'read');
+    const attacker = (await provider.clientsStore.getClient(attackerId))!;
+
+    // Attacker tries to revoke owner's token. revokeToken returns void
+    // (silent on no-op), so we assert the token still verifies after.
+    await provider.revokeToken!(attacker, { token: tokens.access_token });
+    const authInfo = await provider.verifyAccessToken(tokens.access_token);
+    expect(authInfo.clientId).toBe(ownerId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F2 + F3 — Refresh-token cross-client isolation + scope subset
+// ---------------------------------------------------------------------------
+
+describe('F2/F3 refresh hardening', () => {
+  test('wrong client cannot burn another client refresh token', async () => {
+    const { clientId: ownerId } = await provider.registerClientManual(
+      'refresh-owner-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const { clientId: attackerId } = await provider.registerClientManual(
+      'refresh-attacker-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const owner = (await provider.clientsStore.getClient(ownerId))!;
+    const attacker = (await provider.clientsStore.getClient(attackerId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, owner, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(owner, code, TEST_PKCE_VERIFIER, owner.redirect_uris![0]);
+
+    // Attacker rejected.
+    await expect(provider.exchangeRefreshToken(attacker, tokens.refresh_token!)).rejects.toThrow();
+
+    // Owner still redeems atomically — the row was not burned by the
+    // attacker's attempt.
+    const rotated = await provider.exchangeRefreshToken(owner, tokens.refresh_token!);
+    expect(rotated.access_token).toStartWith('gbrain_at_');
+    expect(rotated.refresh_token).toBeDefined();
+    expect(rotated.refresh_token).not.toBe(tokens.refresh_token);
+  });
+
+  test('refresh cannot request scopes outside the original grant (F3)', async () => {
+    // Client allowed scopes 'read write', but the user only authorized 'read'.
+    // The refresh token row carries the granted scope, NOT the client's
+    // currently-allowed scopes (codex C9). Requesting 'write' on refresh
+    // must fail even though the client could mint a fresh write-scoped
+    // token via a new authorize round trip.
+    const { clientId } = await provider.registerClientManual(
+      'refresh-scope-test', ['authorization_code'], 'read write',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+
+    // Attempt to escalate to write — must reject.
+    await expect(
+      provider.exchangeRefreshToken(client, tokens.refresh_token!, ['read', 'write']),
+    ).rejects.toThrow(/scope/i);
+  });
+
+  // T1 (eng-review): admin grant must be refreshable down to sources_admin
+  // via hasScope. Pre-v0.28 the F3 check was exact-string-match, so an
+  // admin grant could not refresh down to sources_admin even though admin
+  // implies it. gstack /setup-gbrain Path 4 needs this to work.
+  test('admin grant CAN refresh down to sources_admin (hasScope hierarchy)', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'admin-down-test', ['authorization_code'], 'admin',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['admin'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+
+    // Refresh requesting only sources_admin — admin implies it, so this
+    // must succeed and the new token must carry only the requested subset.
+    const rotated = await provider.exchangeRefreshToken(
+      client, tokens.refresh_token!, ['sources_admin'],
+    );
+    expect(rotated.access_token).toBeDefined();
+    expect(rotated.scope).toBe('sources_admin');
+
+    // The original refresh token must be dead (single-use rotation).
+    await expect(
+      provider.exchangeRefreshToken(client, tokens.refresh_token!),
+    ).rejects.toThrow();
+
+    // Note: rotated.refresh_token's grant is now sources_admin, not admin.
+    // Refreshing it up to users_admin would correctly fail (sibling
+    // non-implication) — that constraint is exercised in the F3 sibling
+    // test below. To prove "admin implies users_admin too" we'd need a
+    // fresh authorize round trip, which the existing F2 hardening tests
+    // already cover. One direction at a time.
+  });
+
+  test('admin grant CAN refresh down to users_admin (different axis)', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'admin-down-users-test', ['authorization_code'], 'admin',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['admin'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+
+    const rotated = await provider.exchangeRefreshToken(
+      client, tokens.refresh_token!, ['users_admin'],
+    );
+    expect(rotated.scope).toBe('users_admin');
+  });
+
+  // T1 sibling: write grant cannot refresh up to sources_admin (different axis)
+  test('write grant CANNOT refresh to sources_admin (sibling non-implication)', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'write-not-sources-admin-test', ['authorization_code'], 'write',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['write'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+
+    await expect(
+      provider.exchangeRefreshToken(client, tokens.refresh_token!, ['sources_admin']),
+    ).rejects.toThrow(/scope/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.28 — ALLOWED_SCOPES allowlist at registration time
+// ---------------------------------------------------------------------------
+
+describe('v0.28 ALLOWED_SCOPES allowlist', () => {
+  test('registerClientManual rejects unknown scope strings', async () => {
+    await expect(
+      provider.registerClientManual('bad-scope', ['client_credentials'], 'read flying-unicorn'),
+    ).rejects.toThrow(/Unknown scope/);
+  });
+
+  test('registerClientManual accepts every canonical scope', async () => {
+    for (const scope of ['read', 'write', 'admin', 'sources_admin', 'users_admin']) {
+      const { clientId } = await provider.registerClientManual(
+        `accept-${scope}`, ['client_credentials'], scope,
+      );
+      const client = await provider.clientsStore.getClient(clientId);
+      expect(client?.scope).toBe(scope);
+    }
+  });
+
+  test('registerClient (DCR) filters unknown scopes and keeps allowed ones', async () => {
+    // DCR is unauthenticated and clients (rmcp / OIDC-flavored stacks) often
+    // append offline_access etc. Filter unknowns instead of 500ing.
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'dcr-filter-scope',
+      redirect_uris: ['https://example.com/cb'],
+      grant_types: ['authorization_code'],
+      scope: 'read write offline_access openid',
+      token_endpoint_auth_method: 'none',
+    } as any);
+    expect(result.scope).toBe('read write');
+    const stored = await provider.clientsStore.getClient(result.client_id);
+    expect(stored!.scope).toBe('read write');
+  });
+
+  test('registerClient (DCR) rejects when every requested scope is unknown', async () => {
+    const { InvalidClientMetadataError } = await import(
+      '@modelcontextprotocol/sdk/server/auth/errors.js'
+    );
+    try {
+      await provider.clientsStore.registerClient!({
+        client_name: 'dcr-all-unknown-scope',
+        redirect_uris: ['https://example.com/cb'],
+        grant_types: ['authorization_code'],
+        scope: 'openid offline_access',
+        token_endpoint_auth_method: 'none',
+      } as any);
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(InvalidClientMetadataError);
+      expect((e as Error).message).toMatch(/No recognized scopes/);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F5 — fail-loud column probes (was: bare catch{})
+// ---------------------------------------------------------------------------
+
+describe('F5 verifyAccessToken / client_credentials column probes', () => {
+  test('non-schema SQL failures are not swallowed by client credentials soft-delete probe', async () => {
+    // Synthesize a non-schema error (SQLSTATE 57P01 = admin_shutdown) and
+    // make sure the catch block re-throws instead of silently treating
+    // the client as not-revoked. Without the predicate this throw used to
+    // disappear into the void.
+    const sqlFailure = Object.assign(new Error('database session failed'), { code: '57P01' });
+    const fakeSql = async (): Promise<Record<string, unknown>[]> => { throw sqlFailure; };
+    const failingProvider = new GBrainOAuthProvider({ sql: fakeSql, transaction: fn => fn(fakeSql) });
+
+    await expect(
+      failingProvider.exchangeClientCredentials('gbrain_cl_fake', 'secret', 'read'),
+    ).rejects.toThrow('database session failed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F6 — sweepExpiredTokens returns a meaningful count across both engines
+// ---------------------------------------------------------------------------
+
+describe('F6 sweepExpiredTokens count', () => {
+  test('returns count > 0 after deleting expired rows', async () => {
+    const firstClient = (await sql`SELECT client_id FROM oauth_clients LIMIT 1`)[0];
+    const t1 = hashToken(generateToken('sweep_count_'));
+    const t2 = hashToken(generateToken('sweep_count_'));
+    await sql`INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at)
+              VALUES (${t1}, ${'access'}, ${firstClient.client_id as string}, ${'{read}'}, ${1})`;
+    await sql`INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at)
+              VALUES (${t2}, ${'access'}, ${firstClient.client_id as string}, ${'{read}'}, ${2})`;
+
+    const swept = await provider.sweepExpiredTokens();
+
+    // Pre-fix: returned 0 on PGLite/postgres.js even when rows were deleted
+    // because (result as any).count was unset on at least one path. With
+    // RETURNING 1 + result.length, the actual row count flows back.
+    expect(swept).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F7c — auth code redirect_uri validated on /token (RFC 6749 §4.1.3)
+// ---------------------------------------------------------------------------
+
+describe('F7c redirect_uri binding on auth code exchange', () => {
+  test('matching redirect_uri succeeds', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'redir-match-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+
+    const tokens = await provider.exchangeAuthorizationCode(
+      client, code, TEST_PKCE_VERIFIER, 'http://localhost:3000/callback',
+    );
+    expect(tokens.access_token).toStartWith('gbrain_at_');
+  });
+
+  test('mismatched redirect_uri rejects', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'redir-mismatch-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+
+    // Attacker submitting the auth code with a different redirect_uri (e.g.,
+    // an attacker-controlled callback URL) MUST be rejected. RFC 6749 §4.1.3.
+    await expect(
+      provider.exchangeAuthorizationCode(
+        client, code, TEST_PKCE_VERIFIER, 'https://attacker.example/cb',
+      ),
+    ).rejects.toThrow();
+  });
+
+  test('empty-string redirect_uri does NOT bypass the binding', async () => {
+    // D15 / adversarial-review fix: `redirectUri ? ...` would treat empty string
+    // as falsy and silently fall through to the no-redirect-uri branch,
+    // letting an attacker submit `redirect_uri=""` to bypass the predicate.
+    // The fix uses `redirectUri !== undefined`. This test asserts the bypass
+    // is closed: an empty-string redirect_uri must reject (zero-row DELETE
+    // since stored value is the original non-empty URI), not slip through.
+    const { clientId } = await provider.registerClientManual(
+      'redir-empty-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+
+    await expect(
+      provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, ''),
+    ).rejects.toThrow();
+  });
+
+  test('omitted redirect_uri cannot bypass code binding', async () => {
+    // The exact redirect selected at authorization remains required at redemption.
+    const { clientId } = await provider.registerClientManual(
+      'redir-omitted-test', ['authorization_code'], 'read',
+      ['http://localhost:3000/callback'],
+    );
+    const client = (await provider.clientsStore.getClient(clientId))!;
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+
+    await expect(provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER)).rejects.toThrow('Redirect URI');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F12 — DCR disable via constructor option (cleanup, not security)
+// ---------------------------------------------------------------------------
+
+describe('F12 dcrDisabled constructor option', () => {
+  test('clientsStore omits registerClient when dcrDisabled=true', () => {
+    const dcrOff = new GBrainOAuthProvider({ transaction: pgliteOAuthTransaction(db), sql, dcrDisabled: true });
+    const store = dcrOff.clientsStore;
+    expect(typeof store.getClient).toBe('function');
+    // SDK's mcpAuthRouter checks for registerClient before wiring up the
+    // /register endpoint. Absence of the method == DCR endpoint not exposed.
+    expect((store as any).registerClient).toBeUndefined();
+  });
+
+  test('clientsStore exposes registerClient when dcrDisabled is false/unset', () => {
+    const dcrOn = new GBrainOAuthProvider({ transaction: pgliteOAuthTransaction(db), sql });
+    expect(typeof dcrOn.clientsStore.registerClient).toBe('function');
+  });
+
+  test('registerClientManual still works on dcrDisabled providers (CLI path)', async () => {
+    // The CLI code path uses registerClientManual, which is independent of
+    // the DCR /register endpoint. dcrDisabled must NOT break it.
+    const dcrOff = new GBrainOAuthProvider({ transaction: pgliteOAuthTransaction(db), sql, dcrDisabled: true });
+    const result = await dcrOff.registerClientManual(
+      'dcr-disabled-cli-test', ['client_credentials'], 'read',
+    );
+    expect(result.clientId).toStartWith('gbrain_cl_');
+    expect(result.clientSecret).toStartWith('gbrain_cs_');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.34.1 (#909) — PKCE public-client DCR (RFC 7591 §3.2.1)
+// ---------------------------------------------------------------------------
+//
+// Per RFC 7591 §3.2.1, when a DCR client declares
+// `token_endpoint_auth_method: "none"` (PKCE-only public clients like Claude
+// Code, Cursor), the authorization server MUST NOT issue a client_secret.
+// Pre-fix, unconditional secret generation made the MCP SDK's clientAuth
+// middleware reject valid public-client flows on /token.
+
+describe('PKCE DCR public-client gate (#909)', () => {
+  test("registerClient with token_endpoint_auth_method='none' omits client_secret", async () => {
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'public-pkce-client',
+      redirect_uris: ['https://example.com/callback'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'none',
+    });
+    expect(result.client_id).toStartWith('gbrain_cl_');
+    // RFC 7591 §3.2.1: public clients get NO client_secret in the response.
+    expect(result.client_secret).toBeUndefined();
+    expect(result.token_endpoint_auth_method).toBe('none');
+  });
+
+  test('default auth_method (omitted) still issues a client_secret', async () => {
+    // Regression guard: confidential clients (the existing default) must
+    // keep their secret-issuing behavior unchanged.
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'confidential-default',
+      redirect_uris: ['https://example.com/callback'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      // token_endpoint_auth_method omitted; falls back to 'client_secret_post'
+    });
+    expect(result.client_id).toStartWith('gbrain_cl_');
+    expect(result.client_secret).toStartWith('gbrain_cs_');
+  });
+
+  test('explicit client_secret_post still issues a client_secret', async () => {
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'confidential-explicit',
+      redirect_uris: ['https://example.com/callback'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'client_secret_post',
+    });
+    expect(result.client_id).toStartWith('gbrain_cl_');
+    expect(result.client_secret).toStartWith('gbrain_cs_');
+  });
+
+  test('getClient on a public client returns client_secret=undefined (NULL normalized)', async () => {
+    // The SDK's clientAuth middleware checks `client.client_secret === undefined`
+    // (not `=== null`) to decide whether to enforce secret comparison on /token.
+    // Without normalization, Postgres NULL would reach the SDK as JS null and
+    // the secret check would mis-fire on every public client.
+    const reg = await provider.clientsStore.registerClient!({
+      client_name: 'public-getclient-norm',
+      redirect_uris: ['https://example.com/callback'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'none',
+    });
+    const stored = await provider.clientsStore.getClient(reg.client_id);
+    expect(stored).toBeDefined();
+    expect(stored!.client_secret).toBeUndefined();
+    expect(stored!.token_endpoint_auth_method).toBe('none');
+  });
+
+  test('PKCE flow end-to-end: public client /authorize then /token, no secret needed', async () => {
+    // Full F7 regression #15: public client completes auth_code → token
+    // exchange without ever presenting a client_secret.
+    const reg = await provider.clientsStore.registerClient!({
+      client_name: 'pkce-roundtrip',
+      redirect_uris: ['http://localhost:3000/callback'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'none',
+    });
+
+    // Re-fetch via getClient to mirror what the SDK middleware sees.
+    const client = (await provider.clientsStore.getClient(reg.client_id))!;
+    expect(client.client_secret).toBeUndefined();
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await authorizeAsOwner(provider, client, {
+      codeChallenge: TEST_PKCE_CHALLENGE,
+      redirectUri: 'http://localhost:3000/callback',
+      scopes: ['read'],
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    expect(code).toMatch(/^gbrain_code_/);
+
+    // Exchange the code — public client; no secret on the wire.
+    const tokens = await provider.exchangeAuthorizationCode(client, code, TEST_PKCE_VERIFIER, client.redirect_uris![0]);
+    expect(tokens.access_token).toStartWith('gbrain_at_');
+    // SDK normalizes token_type per RFC 6750 §6.1.1 (case-insensitive);
+    // implementations may emit "bearer" lowercase.
+    expect(String(tokens.token_type).toLowerCase()).toBe('bearer');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.41.3 — T1: ALLOWED_TOKEN_ENDPOINT_AUTH_METHODS + validator
+// ---------------------------------------------------------------------------
+
+describe('v0.41.3 ALLOWED_TOKEN_ENDPOINT_AUTH_METHODS', () => {
+  test('Set contains exactly the three SDK-advertised methods', () => {
+    expect(ALLOWED_TOKEN_ENDPOINT_AUTH_METHODS.size).toBe(3);
+    expect(ALLOWED_TOKEN_ENDPOINT_AUTH_METHODS.has('client_secret_post')).toBe(true);
+    expect(ALLOWED_TOKEN_ENDPOINT_AUTH_METHODS.has('client_secret_basic')).toBe(true);
+    expect(ALLOWED_TOKEN_ENDPOINT_AUTH_METHODS.has('none')).toBe(true);
+  });
+
+  test('client_secret_basic is included — codex F3 regression', () => {
+    // The codex outside-voice review caught that omitting client_secret_basic
+    // would break operators using HTTP Basic for confidential client auth at
+    // the /token endpoint (server already supports it at serve-http.ts:468).
+    expect(ALLOWED_TOKEN_ENDPOINT_AUTH_METHODS.has('client_secret_basic')).toBe(true);
+  });
+});
+
+describe('v0.41.3 validateTokenEndpointAuthMethod', () => {
+  test('undefined → "client_secret_post" (RFC 7591 default)', () => {
+    expect(validateTokenEndpointAuthMethod(undefined)).toBe('client_secret_post');
+  });
+
+  test('null → "client_secret_post"', () => {
+    expect(validateTokenEndpointAuthMethod(null)).toBe('client_secret_post');
+  });
+
+  test('empty string → "client_secret_post"', () => {
+    expect(validateTokenEndpointAuthMethod('')).toBe('client_secret_post');
+  });
+
+  test('"client_secret_post" → "client_secret_post"', () => {
+    expect(validateTokenEndpointAuthMethod('client_secret_post')).toBe('client_secret_post');
+  });
+
+  test('"client_secret_basic" → "client_secret_basic"', () => {
+    expect(validateTokenEndpointAuthMethod('client_secret_basic')).toBe('client_secret_basic');
+  });
+
+  test('"none" → "none" (public PKCE client)', () => {
+    expect(validateTokenEndpointAuthMethod('none')).toBe('none');
+  });
+
+  test('unknown method throws InvalidTokenEndpointAuthMethodError', () => {
+    expect(() => validateTokenEndpointAuthMethod('frobnicate')).toThrow(InvalidTokenEndpointAuthMethodError);
+  });
+
+  test('error message names the bad value + all allowed methods', () => {
+    try {
+      validateTokenEndpointAuthMethod('frobnicate');
+      throw new Error('should have thrown');
+    } catch (e: any) {
+      expect(e.message).toContain('frobnicate');
+      expect(e.message).toContain('client_secret_post');
+      expect(e.message).toContain('client_secret_basic');
+      expect(e.message).toContain('none');
+    }
+  });
+
+  test('non-string input throws', () => {
+    expect(() => validateTokenEndpointAuthMethod(123 as any)).toThrow(InvalidTokenEndpointAuthMethodError);
+    expect(() => validateTokenEndpointAuthMethod({} as any)).toThrow(InvalidTokenEndpointAuthMethodError);
+    expect(() => validateTokenEndpointAuthMethod([] as any)).toThrow(InvalidTokenEndpointAuthMethodError);
+  });
+
+  test('InvalidTokenEndpointAuthMethodError has stable error code', () => {
+    try {
+      validateTokenEndpointAuthMethod('xyz');
+      throw new Error('should have thrown');
+    } catch (e: any) {
+      expect(e.code).toBe('invalid_token_endpoint_auth_method');
+      expect(e.name).toBe('InvalidTokenEndpointAuthMethodError');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.41.3 — T2: registerClientManual tokenEndpointAuthMethod parameter
+// ---------------------------------------------------------------------------
+
+describe('v0.41.3 registerClientManual tokenEndpointAuthMethod', () => {
+  test('omitted → confidential client with secret (back-compat)', async () => {
+    const result = await provider.registerClientManual(
+      'v413-default-test', ['client_credentials'], 'read',
+    );
+    expect(result.clientId).toStartWith('gbrain_cl_');
+    expect(result.clientSecret).toBeDefined();
+    expect(result.clientSecret!).toStartWith('gbrain_cs_');
+  });
+
+  test('explicit client_secret_post → confidential client with secret', async () => {
+    const result = await provider.registerClientManual(
+      'v413-csp-test', ['client_credentials'], 'read', [], 'default', undefined, 'client_secret_post',
+    );
+    expect(result.clientSecret).toBeDefined();
+  });
+
+  test('explicit client_secret_basic → confidential client with secret', async () => {
+    const result = await provider.registerClientManual(
+      'v413-csb-test', ['client_credentials'], 'read', [], 'default', undefined, 'client_secret_basic',
+    );
+    expect(result.clientSecret).toBeDefined();
+  });
+
+  test('"none" → public client with NO secret (T2 atomic INSERT)', async () => {
+    // The pre-v0.41.3 admin endpoint did INSERT (confidential) → UPDATE
+    // (NULL out secret_hash) for the 'none' case, leaving a confidential
+    // row stranded if the UPDATE failed (codex F4). T2 moves this into
+    // registerClientManual itself as a single atomic INSERT.
+    const result = await provider.registerClientManual(
+      'v413-public-test', ['authorization_code'], 'read',
+      ['https://example.test/cb'], 'default', undefined, 'none',
+    );
+    expect(result.clientId).toStartWith('gbrain_cl_');
+    expect(result.clientSecret).toBeUndefined();
+
+    // Verify the stored row has client_secret_hash = NULL (public client shape)
+    const client = await provider.clientsStore.getClient(result.clientId);
+    expect(client).toBeDefined();
+    expect(client!.client_secret).toBeUndefined();
+    expect(client!.token_endpoint_auth_method).toBe('none');
+  });
+
+  test('unknown auth method throws InvalidTokenEndpointAuthMethodError at registration boundary', async () => {
+    await expect(
+      provider.registerClientManual(
+        'v413-bad-test', ['client_credentials'], 'read', [], 'default', undefined, 'frobnicate',
+      ),
+    ).rejects.toThrow(InvalidTokenEndpointAuthMethodError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.41.3 — T5: DCR /register handler applies the same validator
+// ---------------------------------------------------------------------------
+
+describe('v0.41.3 DCR validator (T5)', () => {
+  test('DCR rejects unknown token_endpoint_auth_method — closes --enable-dcr loose path', async () => {
+    // Pre-v0.41.3 the DCR registration handler defaulted to 'client_secret_post'
+    // for any unknown value, silently swallowing typos. T5 throws so the bad
+    // input fails loud. DCR wraps the inner InvalidTokenEndpointAuthMethodError
+    // as InvalidClientMetadataError so the MCP SDK returns HTTP 400 instead of
+    // opaque 500 (Warp/rmcp regression).
+    await expect(
+      provider.clientsStore.registerClient!({
+        client_name: 'dcr-bad-test',
+        grant_types: ['authorization_code'],
+        scope: 'read',
+        redirect_uris: ['https://example.test/cb'],
+        token_endpoint_auth_method: 'frobnicate',
+      } as any),
+    ).rejects.toThrow(InvalidClientMetadataError);
+  });
+
+  test('DCR accepts "none" → public PKCE client', async () => {
+    const reg = await provider.clientsStore.registerClient!({
+      client_name: 'dcr-public-test',
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      redirect_uris: ['https://example.test/cb'],
+      token_endpoint_auth_method: 'none',
+    } as any);
+    expect(reg.client_id).toStartWith('gbrain_cl_');
+    // RFC 7591 §3.2.1: public clients MUST NOT receive a client_secret
+    expect(reg.client_secret).toBeUndefined();
+  });
+
+  test('DCR accepts "client_secret_basic" — codex F3 regression', async () => {
+    const reg = await provider.clientsStore.registerClient!({
+      client_name: 'dcr-basic-test',
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      redirect_uris: ['https://example.test/cb'],
+      token_endpoint_auth_method: 'client_secret_basic',
+    } as any);
+    expect(reg.client_id).toStartWith('gbrain_cl_');
+    expect(reg.client_secret).toStartWith('gbrain_cs_');
+  });
+});
+
+describe('#1353 DCR default-grant hardening', () => {
+  test('DCR rejects explicit client_credentials by default', async () => {
+    await expect(
+      provider.clientsStore.registerClient!({
+        client_name: 'cc-default-test',
+        grant_types: ['client_credentials'],
+        scope: 'read',
+        redirect_uris: [],
+        token_endpoint_auth_method: 'client_secret_post',
+      } as any),
+    ).rejects.toThrow(InvalidClientMetadataError);
+  });
+
+  test('DCR defaults to authorization_code when grant_types unspecified', async () => {
+    const reg = await provider.clientsStore.registerClient!({
+      client_name: 'no-grant-test',
+      scope: 'read',
+      redirect_uris: ['https://example.test/cb'],
+      token_endpoint_auth_method: 'none',
+    } as any);
+    const stored = await provider.clientsStore.getClient(reg.client_id);
+    expect(stored?.grant_types).toEqual(['authorization_code']);
+  });
+
+  test('--enable-dcr-insecure (allowClientCredentialsDcr) permits client_credentials', async () => {
+    const insecure = new GBrainOAuthProvider({ transaction: pgliteOAuthTransaction(db), sql, allowClientCredentialsDcr: true });
+    const reg = await insecure.clientsStore.registerClient!({
+      client_name: 'cc-allowed-test',
+      grant_types: ['client_credentials'],
+      scope: 'read',
+      redirect_uris: [],
+      token_endpoint_auth_method: 'client_secret_post',
+    } as any);
+    const stored = await insecure.clientsStore.getClient(reg.client_id);
+    expect(stored?.grant_types).toEqual(['client_credentials']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #2833 — legacy last_used_at bookkeeping must not block or fail verification.
+// The legacy branch of verifyAccessToken used to AWAIT an un-debounced
+// `UPDATE access_tokens SET last_used_at = now()` on every verify: a slow or
+// failing UPDATE made every legacy-token request hang or 401, and every
+// verify burned a write. Post-fix it is a debounced (60s) fire-and-forget,
+// mirroring src/mcp/http-transport.ts validateToken.
+// ---------------------------------------------------------------------------
+
+describe('legacy last_used_at debounce (#2833)', () => {
+  async function insertLegacyToken(name: string): Promise<{ token: string; hash: string }> {
+    const token = generateToken('gbrain_');
+    const hash = hashToken(token);
+    await sql`
+      INSERT INTO access_tokens (id, name, token_hash)
+      VALUES (${crypto.randomUUID()}, ${name}, ${hash})
+    `;
+    return { token, hash };
+  }
+
+  async function readLastUsedAt(hash: string): Promise<Date | null> {
+    const rows = await sql`SELECT last_used_at FROM access_tokens WHERE token_hash = ${hash}`;
+    const v = rows[0]?.last_used_at;
+    return v == null ? null : new Date(v as string | Date);
+  }
+
+  /** Poll until cond() or ~timeoutMs elapsed (fire-and-forget writes need a tick). */
+  async function waitFor(cond: () => Promise<boolean>, timeoutMs = 3000): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (await cond()) return true;
+      await new Promise(r => setTimeout(r, 50));
+    }
+    return cond();
+  }
+
+  test('verify still resolves with valid auth when the last_used_at UPDATE rejects', async () => {
+    const { token } = await insertLegacyToken('debounce-reject-agent');
+    const rejectingSql: typeof sql = (strings, ...values) => {
+      const q = strings.join('?');
+      if (/UPDATE\s+access_tokens/i.test(q)) {
+        return Promise.reject(new Error('injected UPDATE failure'));
+      }
+      return sql(strings, ...values);
+    };
+    const p = new GBrainOAuthProvider({ sql: rejectingSql, tokenTtl: 60, refreshTtl: 300 });
+    const authInfo = await p.verifyAccessToken(token);
+    expect(authInfo.clientId).toBe('debounce-reject-agent');
+    expect(authInfo.scopes).toEqual(['read', 'write', 'admin']);
+  });
+
+  test('verify still resolves when the last_used_at UPDATE hangs forever', async () => {
+    const { token } = await insertLegacyToken('debounce-hang-agent');
+    const hangingSql: typeof sql = (strings, ...values) => {
+      const q = strings.join('?');
+      if (/UPDATE\s+access_tokens/i.test(q)) {
+        return new Promise(() => { /* never settles */ });
+      }
+      return sql(strings, ...values);
+    };
+    const p = new GBrainOAuthProvider({ sql: hangingSql, tokenTtl: 60, refreshTtl: 300 });
+    const authInfo = await p.verifyAccessToken(token);
+    expect(authInfo.clientId).toBe('debounce-hang-agent');
+  }, 10_000);
+
+  test('NULL last_used_at is populated on first verify (fire-and-forget)', async () => {
+    const { token, hash } = await insertLegacyToken('debounce-null-agent');
+    expect(await readLastUsedAt(hash)).toBeNull();
+    await provider.verifyAccessToken(token);
+    const populated = await waitFor(async () => (await readLastUsedAt(hash)) !== null);
+    expect(populated).toBe(true);
+  }, 10_000);
+
+  test('fresh last_used_at (<60s old) is NOT rewritten on a second verify', async () => {
+    const { token, hash } = await insertLegacyToken('debounce-fresh-agent');
+    await sql`
+      UPDATE access_tokens SET last_used_at = now() - interval '10 seconds'
+      WHERE token_hash = ${hash}
+    `;
+    const before = await readLastUsedAt(hash);
+    expect(before).not.toBeNull();
+    await provider.verifyAccessToken(token);
+    // Give any (buggy, un-debounced) write time to land.
+    await new Promise(r => setTimeout(r, 300));
+    const after = await readLastUsedAt(hash);
+    expect(after!.getTime()).toBe(before!.getTime());
+  }, 10_000);
+
+  test('stale last_used_at (>60s old) advances after a verify', async () => {
+    const { token, hash } = await insertLegacyToken('debounce-stale-agent');
+    await sql`
+      UPDATE access_tokens SET last_used_at = now() - interval '2 hours'
+      WHERE token_hash = ${hash}
+    `;
+    const before = await readLastUsedAt(hash);
+    await provider.verifyAccessToken(token);
+    const advanced = await waitFor(async () => {
+      const cur = await readLastUsedAt(hash);
+      return cur !== null && cur.getTime() > before!.getTime();
+    });
+    expect(advanced).toBe(true);
+  }, 10_000);
+});

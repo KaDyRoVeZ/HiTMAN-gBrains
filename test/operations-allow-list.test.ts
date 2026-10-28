@@ -1,0 +1,273 @@
+/**
+ * IRON RULE security regression guard for the v0.21 trusted-workspace
+ * allow-list path on put_page.
+ *
+ * Covers:
+ *   - matchesSlugAllowList glob semantics (ALLOW + REJECT + recursive globs)
+ *   - put_page accepts when slug matches allow-list
+ *   - put_page rejects when slug is outside allow-list
+ *   - put_page falls back to legacy `wiki/agents/<id>/...` namespace check
+ *     when allowed_slug_prefixes is unset (regression guard for v0.15
+ *     anti-prompt-injection guarantee)
+ *   - put_page rejects when viaSubagent=true but subagentId is missing
+ *     (regression guard for FAIL-CLOSED behavior)
+ */
+
+import { afterAll, afterEach, beforeAll, describe, test, expect } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { matchesSlugAllowList, operations, OperationError, type OperationContext } from '../src/core/operations.ts';
+
+let engine: PGLiteEngine;
+const home = mkdtempSync(join(tmpdir(), 'gbrain-allow-list-'));
+beforeAll(async () => { engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); }, 60_000);
+afterEach(async () => { expect(await engine.executeRaw('SELECT id FROM pages')).toEqual([]); await disposePersistenceConsumer(engine); });
+afterAll(async () => { await engine.disconnect(); rmSync(home, { recursive: true, force: true }); });
+
+const STUB_LOGGER = {
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+};
+
+const STUB_CONFIG = { engine: 'pglite' as const, embedding_disabled: true };
+
+function findOp(name: string) {
+  const op = operations.find(o => o.name === name);
+  if (!op) throw new Error(`operation ${name} not found`);
+  return { ...op, handler: (ctx: OperationContext, p: Record<string, unknown>) => withEnv({ GBRAIN_HOME: home }, () => op.handler(ctx, p)) };
+}
+
+// Dry-run validation is engine-free. Actual calls exercise registration and
+// the durable authority boundary with a real engine and persist no pages.
+function stubEngine() {
+  return new Proxy({} as never, {
+    get(_target, prop: string) {
+      return () => { throw new Error(`engine.${prop} should not have been called — gate failed`); };
+    },
+  }) as Parameters<typeof operations[number]['handler']>[0]['engine'];
+}
+
+function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
+  return {
+    engine: overrides.dryRun ? stubEngine() : engine,
+    config: STUB_CONFIG,
+    logger: STUB_LOGGER,
+    dryRun: false,
+    remote: true,
+    sourceId: 'default',
+    viaSubagent: true,
+    subagentId: 42,
+    jobId: 100,
+    ...overrides,
+  } as OperationContext;
+}
+
+describe('matchesSlugAllowList — glob semantics', () => {
+  test('exact match (no glob suffix)', () => {
+    expect(matchesSlugAllowList('foo/bar', ['foo/bar'])).toBe(true);
+    expect(matchesSlugAllowList('foo/bar/baz', ['foo/bar'])).toBe(false);
+  });
+
+  test('shallow glob: prefix/* matches any single direct child segment', () => {
+    expect(matchesSlugAllowList('wiki/personal/reflections/2026-04-25-arete-paradox-a3f8c1',
+      ['wiki/personal/reflections/*'])).toBe(true);
+    expect(matchesSlugAllowList('wiki/personal/reflections',
+      ['wiki/personal/reflections/*'])).toBe(false);
+  });
+
+  test('recursive: prefix/* matches deep children too', () => {
+    expect(matchesSlugAllowList('wiki/originals/ideas/2026-04-25-foo',
+      ['wiki/originals/*'])).toBe(true);
+    expect(matchesSlugAllowList('wiki/originals/ideas/foo/bar',
+      ['wiki/originals/*'])).toBe(true);
+  });
+
+  test('rejects slugs outside every prefix', () => {
+    const list = [
+      'wiki/personal/reflections/*',
+      'wiki/originals/*',
+    ];
+    expect(matchesSlugAllowList('wiki/finance/secret', list)).toBe(false);
+    expect(matchesSlugAllowList('wiki/people/alice', list)).toBe(false);
+  });
+
+  test('empty list rejects everything', () => {
+    expect(matchesSlugAllowList('wiki/anything', [])).toBe(false);
+  });
+
+  test('does NOT match prefix without trailing segment', () => {
+    expect(matchesSlugAllowList('wiki/personal/reflections',
+      ['wiki/personal/reflections/*'])).toBe(false);
+  });
+});
+
+describe('put_page — trusted-workspace allow-list', () => {
+  const put_page = findOp('put_page');
+
+  test('REJECTS malformed slugs before they reach the write path', async () => {
+    const ctx = makeCtx({
+      allowedSlugPrefixes: ['wiki/originals/*'],
+    });
+    await expect(put_page.handler(ctx, {
+      slug: 'wiki/originals/ideas/secrets-readonly- trusted-services',
+      content: '---\ntitle: x\n---\nbody',
+    })).rejects.toMatchObject({
+      code: 'invalid_params',
+    });
+  });
+
+  test('accepts a valid slug inside the allow-list in dry-run mode', async () => {
+    const ctx = makeCtx({
+      allowedSlugPrefixes: ['wiki/originals/*'],
+      dryRun: true,
+    });
+    await expect(put_page.handler(ctx, {
+      slug: 'wiki/originals/ideas/secrets-readonly-trusted-services',
+      content: '---\ntitle: x\n---\nbody',
+    })).resolves.toMatchObject({
+      dry_run: true,
+    });
+  });
+
+  test('REJECTS when slug is outside the allow-list', async () => {
+    const ctx = makeCtx({
+      allowedSlugPrefixes: ['wiki/personal/reflections/*', 'wiki/originals/*'],
+    });
+    await expect(put_page.handler(ctx, {
+      slug: 'wiki/finance/secret',
+      content: '---\ntitle: x\n---\nbody',
+    })).rejects.toMatchObject({
+      code: 'permission_denied',
+    });
+  });
+
+  test('REJECTS path-traversal-like slug (slug regex catches it earlier in the import path; allow-list also catches via no-match)', async () => {
+    const ctx = makeCtx({
+      allowedSlugPrefixes: ['wiki/personal/reflections/*'],
+    });
+    // The slug regex in validatePageSlug rejects `..`; here we test the
+    // allow-list layer specifically with a slug that LOOKS legal but isn't on the list.
+    await expect(put_page.handler(ctx, {
+      slug: 'wiki/people/alice-example',
+      content: '---\ntitle: x\n---\nbody',
+    })).rejects.toMatchObject({
+      code: 'permission_denied',
+    });
+  });
+});
+
+describe('put_page — strict slug validation', () => {
+  const put_page = findOp('put_page');
+
+  test('REJECTS malformed slugs for trusted local callers too', async () => {
+    const ctx = makeCtx({
+      remote: false,
+      viaSubagent: false,
+      subagentId: undefined,
+      allowedSlugPrefixes: undefined,
+      dryRun: true,
+    });
+    await expect(put_page.handler(ctx, {
+      slug: 'notes/contains a space',
+      content: '---\ntitle: x\n---\nbody',
+    })).rejects.toMatchObject({
+      code: 'invalid_params',
+    });
+  });
+
+  // #4665 compat: the sync slugifier deliberately preserves '.' and '_'
+  // inside segments (slugifySegment: 'v1.0.0' → 'v1.0.0', 'my_file_name' →
+  // 'my_file_name'), so the op boundary MUST round-trip those slugs or every
+  // synced page with a dot/underscore becomes un-updatable via put_page.
+  const trustedLocalDryRun = () => makeCtx({
+    remote: false,
+    viaSubagent: false,
+    subagentId: undefined,
+    allowedSlugPrefixes: undefined,
+    dryRun: true,
+  });
+
+  test('ACCEPTS sync-slugifier dot slugs (notes/v1.0.0)', async () => {
+    await expect(put_page.handler(trustedLocalDryRun(), {
+      slug: 'notes/v1.0.0',
+      content: '---\ntitle: x\n---\nbody',
+    })).resolves.toMatchObject({ dry_run: true, slug: 'notes/v1.0.0' });
+  });
+
+  test('ACCEPTS sync-slugifier underscore slugs (people/my_file_name)', async () => {
+    await expect(put_page.handler(trustedLocalDryRun(), {
+      slug: 'people/my_file_name',
+      content: '---\ntitle: x\n---\nbody',
+    })).resolves.toMatchObject({ dry_run: true, slug: 'people/my_file_name' });
+  });
+
+  test('ACCEPTS CJK slugs (unicode word-char class survives the #4665 widen)', async () => {
+    await expect(put_page.handler(trustedLocalDryRun(), {
+      slug: 'inbox/品牌圣经',
+      content: '---\ntitle: x\n---\nbody',
+    })).resolves.toMatchObject({ dry_run: true, slug: 'inbox/品牌圣经' });
+  });
+
+  test('still REJECTS dot-LED segments (hidden files)', async () => {
+    await expect(put_page.handler(trustedLocalDryRun(), {
+      slug: 'notes/.hidden',
+      content: '---\ntitle: x\n---\nbody',
+    })).rejects.toMatchObject({ code: 'invalid_params' });
+  });
+
+  test('still REJECTS traversal (dot-dot segments)', async () => {
+    await expect(put_page.handler(trustedLocalDryRun(), {
+      slug: 'notes/../etc/passwd',
+      content: '---\ntitle: x\n---\nbody',
+    })).rejects.toMatchObject({ code: 'invalid_params' });
+  });
+
+  test('still REJECTS control characters', async () => {
+    await expect(put_page.handler(trustedLocalDryRun(), {
+      slug: 'notes/a\u0007b',
+      content: '---\ntitle: x\n---\nbody',
+    })).rejects.toMatchObject({ code: 'invalid_params' });
+  });
+});
+
+describe('put_page — legacy namespace check (regression guard)', () => {
+  const put_page = findOp('put_page');
+
+  test('REJECTS write outside wiki/agents/<id>/ when allow-list is unset', async () => {
+    // The v0.15 anti-prompt-injection guarantee: subagent without explicit
+    // allow-list MUST be confined to its own agent namespace. This test
+    // ensures v0.21 doesn't regress that boundary.
+    const ctx = makeCtx({ allowedSlugPrefixes: undefined });
+    await expect(put_page.handler(ctx, {
+      slug: 'wiki/personal/reflections/2026-04-25-foo',
+      content: '---\ntitle: x\n---\nbody',
+    })).rejects.toMatchObject({
+      code: 'permission_denied',
+    });
+  });
+
+  test('REJECTS write outside wiki/agents/<id>/ when allow-list is empty array', async () => {
+    const ctx = makeCtx({ allowedSlugPrefixes: [] });
+    await expect(put_page.handler(ctx, {
+      slug: 'wiki/personal/reflections/2026-04-25-foo',
+      content: '---\ntitle: x\n---\nbody',
+    })).rejects.toMatchObject({
+      code: 'permission_denied',
+    });
+  });
+
+  test('REJECTS when viaSubagent=true but subagentId is missing (FAIL-CLOSED)', async () => {
+    const ctx = makeCtx({ subagentId: undefined as unknown as number, allowedSlugPrefixes: undefined });
+    await expect(put_page.handler(ctx, {
+      slug: 'wiki/agents/42/foo',
+      content: '---\ntitle: x\n---\nbody',
+    })).rejects.toMatchObject({
+      code: 'permission_denied',
+    });
+  });
+});

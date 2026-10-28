@@ -1,0 +1,606 @@
+/**
+ * Regression tests (a) + (d) for scripts/run-unit-parallel.sh:
+ *   (a) Exit-code propagation: a failing test in any shard MUST cause the
+ *       wrapper to exit non-zero. The hardest contract to silently break
+ *       in a fan-out wrapper (`for ... &; wait` returns the LAST child's
+ *       status, not any failure's).
+ *   (d) Failure-log contract: when any test fails, the wrapper writes
+ *       extracted failure block(s) to .context/test-failures.log with
+ *       `--- shard $i:` prefixes, and prints a loud stderr banner with
+ *       the absolute path. Empty log ⇔ exit 0.
+ *
+ * The wrapper takes ~1.5 minutes against the real test suite. To keep
+ * this regression test fast and hermetic, we point it at a tiny tempdir
+ * containing one passing and one failing test, override the discovery
+ * roots via env-vars, and run with --shards=2.
+ *
+ * NOT covered behaviorally here: the heartbeat and a real hung Bun process
+ * (both timing-sensitive). The timeout escalation wiring is covered as a
+ * source contract below and exercised separately by a process-leak smoke.
+ */
+
+import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
+import { execFileSync, spawn, spawnSync } from 'child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, symlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { dirname, join, resolve } from 'path';
+import { buildSide, loadReceiptDir } from '../../scripts/ci-executed-counts.ts';
+
+const REPO_ROOT = resolve(import.meta.dir, '..', '..');
+const PARALLEL_SH_SRC = resolve(REPO_ROOT, 'scripts/run-unit-parallel.sh');
+const SHARD_SH_SRC = resolve(REPO_ROOT, 'scripts/run-unit-shard.sh');
+const SERIAL_SH_SRC = resolve(REPO_ROOT, 'scripts/run-serial-tests.sh');
+// The runners `source scripts/lib/test-env.sh` — every sandbox copy of a
+// runner must stage the lib too or the source line fails at startup.
+const TESTENV_SH_SRC = resolve(REPO_ROOT, 'scripts/lib/test-env.sh');
+
+let TMPROOT: string;
+
+beforeAll(() => {
+  // Build a tiny repo-shaped tempdir with the wrapper scripts copied in
+  // and 4 fixture test files (3 pass, 1 fail). The wrapper's `find test`
+  // expression will pick them up via cwd.
+  TMPROOT = mkdtempSync(join(tmpdir(), 'gbrain-parallel-test-'));
+  mkdirSync(join(TMPROOT, 'scripts', 'lib'), { recursive: true });
+  mkdirSync(join(TMPROOT, 'test'), { recursive: true });
+  copyFileSync(TESTENV_SH_SRC, join(TMPROOT, 'scripts', 'lib', 'test-env.sh'));
+
+  copyFileSync(PARALLEL_SH_SRC, join(TMPROOT, 'scripts', 'run-unit-parallel.sh'));
+  copyFileSync(SHARD_SH_SRC, join(TMPROOT, 'scripts', 'run-unit-shard.sh'));
+  copyFileSync(resolve(REPO_ROOT, 'scripts/sharding.ts'), join(TMPROOT, 'scripts/sharding.ts'));
+  copyFileSync(SERIAL_SH_SRC, join(TMPROOT, 'scripts', 'run-serial-tests.sh'));
+  chmodSync(join(TMPROOT, 'scripts', 'run-unit-parallel.sh'), 0o755);
+  chmodSync(join(TMPROOT, 'scripts', 'run-unit-shard.sh'), 0o755);
+  chmodSync(join(TMPROOT, 'scripts', 'run-serial-tests.sh'), 0o755);
+
+  // 3 passing + 1 failing test file. Round-robin sharding will land
+  // them across 2 shards so we exercise the multi-shard merge path.
+  const passing = `import { describe, it, expect } from 'bun:test';
+describe('passing', () => {
+  it('arithmetic works', () => { expect(1 + 1).toBe(2); });
+});`;
+  const failing = `import { describe, it, expect } from 'bun:test';
+describe('failing-on-purpose', () => {
+  it('expects 1 to equal 2 (this should fail)', () => { expect(1).toBe(2); });
+});`;
+
+  writeFileSync(join(TMPROOT, 'test', 'a-pass.test.ts'), passing);
+  writeFileSync(join(TMPROOT, 'test', 'b-pass.test.ts'), passing);
+  writeFileSync(join(TMPROOT, 'test', 'c-pass.test.ts'), passing);
+  writeFileSync(join(TMPROOT, 'test', 'd-fail.test.ts'), failing);
+});
+
+afterAll(() => {
+  if (TMPROOT) rmSync(TMPROOT, { recursive: true, force: true });
+});
+
+function runWrapper(extraArgs: string[] = [], env: Record<string, string> = {}): { code: number; stdout: string; stderr: string } {
+  const result = spawnSync(
+    'bash',
+    [join(TMPROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '2', ...extraArgs],
+    // Shard-mechanics tests pin explicit --shards behavior with tiny
+    // synthetic files; disable mem-adaptation so a RAM-limited runner (CI's
+    // ~7GB) can't collapse 2 shards -> 1 and break the shard 1/2 expectations.
+    { cwd: TMPROOT, encoding: 'utf-8', env: { ...process.env, GBRAIN_TEST_NO_MEM_ADAPT: '1', ...env } },
+  );
+  return {
+    code: result.status ?? -1,
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+  };
+}
+
+describe('run-unit-parallel.sh exit-code propagation (a)', () => {
+  it('exits non-zero when any shard contains a failing test', () => {
+    const r = runWrapper();
+    expect(r.code).not.toBe(0);
+  });
+
+  it('exits zero when all shards pass (after removing the failing fixture)', () => {
+    rmSync(join(TMPROOT, 'test', 'd-fail.test.ts'));
+    try {
+      const r = runWrapper();
+      expect(r.code).toBe(0);
+      // #7448: an AI agent's environment switches Bun to failure-only output; the census still counts every passing file.
+      for (const agent of [{ CLAUDECODE: '1' }, { REPL_ID: 'repl-example' }, { AGENT: '1' }] as Record<string, string>[]) {
+        const quiet = runWrapper([], agent);
+        expect(quiet.stdout + quiet.stderr).not.toContain('incomplete');
+        expect(quiet.code).toBe(0);
+      }
+    } finally {
+      // Restore the failing fixture for any downstream tests in the same
+      // describe block (afterAll cleans the whole tempdir; this is belt-
+      // and-suspenders).
+      const failing = `import { describe, it, expect } from 'bun:test';
+describe('failing-on-purpose', () => {
+  it('expects 1 to equal 2', () => { expect(1).toBe(2); });
+});`;
+      writeFileSync(join(TMPROOT, 'test', 'd-fail.test.ts'), failing);
+    }
+  });
+});
+
+describe('run-unit-parallel.sh failure-log contract (d)', () => {
+  it('writes failures to .context/test-failures.log with --- shard prefix on failure', () => {
+    const r = runWrapper();
+    expect(r.code).not.toBe(0);
+
+    const failureLog = join(TMPROOT, '.context/test-failures.log');
+    expect(existsSync(failureLog)).toBe(true);
+    const contents = readFileSync(failureLog, 'utf-8');
+    expect(contents.length).toBeGreaterThan(0);
+    expect(contents).toMatch(/--- shard \d+:/);
+    expect(contents).toContain('failing-on-purpose');
+  });
+
+  it('prints loud stderr banner with absolute failure-log path on failure', () => {
+    const r = runWrapper();
+    expect(r.code).not.toBe(0);
+    expect(r.stderr).toContain('TEST FAILURES');
+    // Banner includes the absolute path so users can `cat` it directly.
+    expect(r.stderr).toContain(join(TMPROOT, '.context', 'test-failures.log'));
+  });
+
+  it('clears .context/test-failures.log to empty when all shards pass', () => {
+    // Pre-seed a stale failure log to prove it gets cleared.
+    mkdirSync(join(TMPROOT, '.context'), { recursive: true });
+    writeFileSync(join(TMPROOT, '.context', 'test-failures.log'), 'STALE\n');
+    rmSync(join(TMPROOT, 'test', 'd-fail.test.ts'));
+    try {
+      const r = runWrapper();
+      expect(r.code).toBe(0);
+      const contents = readFileSync(join(TMPROOT, '.context', 'test-failures.log'), 'utf-8');
+      expect(contents).toBe('');
+    } finally {
+      const failing = `import { describe, it, expect } from 'bun:test';
+describe('failing-on-purpose', () => {
+  it('expects 1 to equal 2', () => { expect(1).toBe(2); });
+});`;
+      writeFileSync(join(TMPROOT, 'test', 'd-fail.test.ts'), failing);
+    }
+  });
+
+  it('writes per-shard summary lines to .context/test-summary.txt', () => {
+    runWrapper();
+    const summary = readFileSync(join(TMPROOT, '.context', 'test-summary.txt'), 'utf-8');
+    // Format: `shard 1/2: pass=N fail=N skip=N rc=N`
+    expect(summary).toMatch(/shard 1\/2: pass=\d+ fail=\d+ skip=\d+ rc=\d+/);
+    expect(summary).toMatch(/shard 2\/2: pass=\d+ fail=\d+ skip=\d+ rc=\d+/);
+  });
+});
+
+describe('run-unit-parallel.sh timeout escalation contract', () => {
+  it('gives a timed-out shard 30 seconds after TERM, then forces KILL', () => {
+    const source = readFileSync(PARALLEL_SH_SRC, 'utf-8');
+    expect(source).toContain('SHARD_KILL_AFTER="${GBRAIN_TEST_SHARD_KILL_AFTER:-30}"');
+    expect(source).toContain('--signal=TERM --kill-after="${SHARD_KILL_AFTER}s"');
+    expect(source).toContain('sleep "$SHARD_KILL_AFTER" && kill -KILL "$pid"');
+  });
+
+  it('marks both ordinary timeout and forced-KILL timeout exits as wedged', () => {
+    const source = readFileSync(PARALLEL_SH_SRC, 'utf-8');
+    expect(source).toContain('[ "$rc" = "124" ] || [ "$rc" = "137" ]');
+  });
+});
+
+describe('run-unit-parallel.sh operator-interrupt cleanup', () => {
+  it('kills an interrupt-resistant shard when its terminal group receives SIGINT', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-parallel-interrupt-'));
+    let child: ReturnType<typeof spawn> | undefined;
+    let bunPid = 0;
+    try {
+      mkdirSync(join(root, 'scripts', 'lib'), { recursive: true });
+      mkdirSync(join(root, 'test'), { recursive: true });
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      for (const s of ['sharding.ts', 'run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh']) {
+        copyFileSync(resolve(REPO_ROOT, 'scripts', s), join(root, 'scripts', s));
+        chmodSync(join(root, 'scripts', s), 0o755);
+      }
+      copyFileSync(TESTENV_SH_SRC, join(root, 'scripts', 'lib', 'test-env.sh'));
+      writeFileSync(join(root, 'test', 'hang.test.ts'), '// discovered by the shard wrapper\n');
+
+      const fakeBun = join(root, 'bin', 'bun');
+      writeFileSync(fakeBun, `#!/usr/bin/env bash
+[ "${'$'}{1:-}" = "scripts/sharding.ts" ] && exec ${JSON.stringify(process.execPath)} "${'$'}@"
+[ "${'$'}{1:-}" = "test" ] || exit 0
+echo "$$" > "${join(root, 'bun.pid')}"
+trap '' INT TERM
+while true; do sleep 1; done
+`);
+      chmodSync(fakeBun, 0o755);
+
+      child = spawn('bash', [join(root, 'scripts', 'run-unit-parallel.sh'), '--shards', '1'], {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: `${join(root, 'bin')}:${process.env.PATH ?? ''}`,
+          GBRAIN_TEST_NO_MEM_ADAPT: '1',
+          GBRAIN_TEST_SHARD_TIMEOUT: '300',
+        },
+        detached: true,
+        stdio: 'ignore',
+      });
+
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(join(root, 'bun.pid')) && Date.now() < deadline) {
+        await Bun.sleep(25);
+      }
+      expect(existsSync(join(root, 'bun.pid'))).toBe(true);
+      bunPid = Number(readFileSync(join(root, 'bun.pid'), 'utf8').trim());
+
+      const proc = child;
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+        proc.once('exit', (code, signal) => resolveExit({ code, signal }));
+        process.kill(-proc.pid!, 'SIGINT');
+      });
+      // handle_interrupt runs cleanup_children then `exit 130` — a raw SIGINT
+      // death would mean the trap never ran (cleanup skipped).
+      expect(exit.code).toBe(130);
+
+      const goneDeadline = Date.now() + 2_000;
+      let liveState = '';
+      do {
+        const probe = spawnSync('ps', ['-o', 'stat=', '-p', String(bunPid)], { encoding: 'utf8' });
+        liveState = (probe.stdout || '').trim();
+        if (!liveState || liveState.startsWith('Z')) break;
+        await Bun.sleep(25);
+      } while (Date.now() < goneDeadline);
+      // A zombie owns no memory and only awaits launchd reaping; any other
+      // state means the cancelled suite is still doing or retaining work.
+      expect(!liveState || liveState.startsWith('Z')).toBe(true);
+    } finally {
+      // Reap the detached tree BEFORE the fixture dir goes: a failed assertion
+      // above must not leave the fake-bun loop (its own process group) alive.
+      if (child?.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } }
+      if (bunPid) { try { process.kill(bunPid, 'SIGKILL'); } catch { /* already gone */ } }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+});
+
+describe('run-unit-parallel.sh no-timeout-binary fallback (rc from shard wait, not watchdog teardown)', () => {
+  // Forces the no-gtimeout/no-timeout branch by running the wrapper under a
+  // curated PATH that has every tool the scripts call EXCEPT timeout
+  // binaries (real `bun` symlinked in), so the fallback executes even on
+  // hosts with coreutils installed.
+  //
+  // Regression pinned here: the shard's sentinel .exit file must record the
+  // exit code read right after `wait $pid` (the shard's own rc). The
+  // watchdog subshell is killed with SIGTERM and reports 143; reading `$?`
+  // after that teardown stamped rc=143 into every shard's sentinel — the
+  // wrapper exited non-zero with rc=143 summaries even when every test
+  // passed.
+  let FROOT: string;
+  let FENV: Record<string, string>;
+
+  beforeAll(() => {
+    FROOT = mkdtempSync(join(tmpdir(), 'gbrain-parallel-fallback-'));
+    mkdirSync(join(FROOT, 'scripts'), { recursive: true });
+    mkdirSync(join(FROOT, 'test'), { recursive: true });
+    for (const s of ['sharding.ts', 'run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh', 'lib/test-env.sh']) {
+      mkdirSync(dirname(join(FROOT, 'scripts', s)), { recursive: true });
+      copyFileSync(resolve(REPO_ROOT, 'scripts', s), join(FROOT, 'scripts', s));
+      chmodSync(join(FROOT, 'scripts', s), 0o755);
+    }
+    const passing = `import { describe, it, expect } from 'bun:test';
+describe('passing', () => {
+  it('arithmetic works', () => { expect(1 + 1).toBe(2); });
+});`;
+    writeFileSync(join(FROOT, 'test', 'a-pass.test.ts'), passing);
+    writeFileSync(join(FROOT, 'test', 'b-pass.test.ts'), passing);
+
+    const bin = join(FROOT, 'bin');
+    mkdirSync(bin);
+    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'tee', 'bun']) {
+      const p = Bun.which(tool);
+      if (p) symlinkSync(p, join(bin, tool));
+    }
+    FENV = {
+      PATH: bin,
+      HOME: process.env.HOME ?? FROOT,
+      TMPDIR: process.env.TMPDIR ?? '/tmp',
+      GBRAIN_TEST_SHARD_TIMEOUT: '300',
+      // Same rationale as runWrapper: explicit-shard mechanics under test.
+      GBRAIN_TEST_NO_MEM_ADAPT: '1',
+    };
+  });
+
+  afterAll(() => {
+    if (FROOT) rmSync(FROOT, { recursive: true, force: true });
+  });
+
+  function runFallbackWrapper(): { code: number; stdout: string; stderr: string } {
+    const result = spawnSync(
+      'bash',
+      [join(FROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '2'],
+      { cwd: FROOT, encoding: 'utf-8', env: FENV },
+    );
+    return {
+      code: result.status ?? -1,
+      stdout: result.stdout || '',
+      stderr: result.stderr || '',
+    };
+  }
+
+  it('exits zero with rc=0 shard sentinels when all shards pass', () => {
+    const r = runFallbackWrapper();
+    const summary = readFileSync(join(FROOT, '.context', 'test-summary.txt'), 'utf-8');
+    expect(summary).toMatch(/shard 1\/2: pass=\d+ fail=0 skip=0 rc=0/);
+    expect(summary).toMatch(/shard 2\/2: pass=\d+ fail=0 skip=0 rc=0/);
+    expect(summary).not.toContain('rc=143');
+    expect(r.code).toBe(0);
+  });
+
+  it('propagates a failing shard rc as the test runner rc (1), not the watchdog 143', () => {
+    const failing = `import { describe, it, expect } from 'bun:test';
+describe('failing-on-purpose', () => {
+  it('expects 1 to equal 2', () => { expect(1).toBe(2); });
+});`;
+    writeFileSync(join(FROOT, 'test', 'z-fail.test.ts'), failing);
+    try {
+      const r = runFallbackWrapper();
+      expect(r.code).not.toBe(0);
+      const summary = readFileSync(join(FROOT, '.context', 'test-summary.txt'), 'utf-8');
+      expect(summary).toMatch(/shard \d\/2: pass=\d+ fail=1 skip=0 rc=1/);
+      expect(summary).not.toContain('rc=143');
+      const failureLog = readFileSync(join(FROOT, '.context', 'test-failures.log'), 'utf-8');
+      expect(failureLog).toContain('failing-on-purpose');
+    } finally {
+      rmSync(join(FROOT, 'test', 'z-fail.test.ts'), { force: true });
+    }
+  });
+});
+
+describe('run-unit-parallel.sh OOM rescue lane', () => {
+  // A fixture that fails WITH the WASM out-of-memory signature on its first
+  // run (no sentinel file yet) and passes once the sentinel exists — exactly
+  // the phantom-failure shape: dies under parallel memory pressure, passes
+  // serially. The runner must (1) detect the signature, (2) re-run the file
+  // at --max-concurrency 1, (3) exit 0 with an oom_rescued note.
+  let OROOT: string;
+
+  beforeAll(() => {
+    OROOT = mkdtempSync(join(tmpdir(), 'gbrain-parallel-oom-'));
+    mkdirSync(join(OROOT, 'scripts'), { recursive: true });
+    mkdirSync(join(OROOT, 'test'), { recursive: true });
+    for (const s of ['sharding.ts', 'run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh', 'lib/test-env.sh']) {
+      mkdirSync(dirname(join(OROOT, 'scripts', s)), { recursive: true });
+      copyFileSync(resolve(REPO_ROOT, 'scripts', s), join(OROOT, 'scripts', s));
+      chmodSync(join(OROOT, 'scripts', s), 0o755);
+    }
+    const passing = `import { describe, it, expect } from 'bun:test';
+describe('passing', () => {
+  it('arithmetic works', () => { expect(1 + 1).toBe(2); });
+});`;
+    const oomOnce = `import { describe, it, expect } from 'bun:test';
+import { existsSync, writeFileSync } from 'fs';
+import { fileURLToPath } from 'node:url';
+describe('oom-once', () => {
+  it('fails with the WASM OOM signature on first run, passes on retry', () => {
+    const sentinel = fileURLToPath(new URL('./oom-sentinel.txt', import.meta.url));
+    if (!existsSync(sentinel)) {
+      writeFileSync(sentinel, 'ran-once');
+      console.error('Original error: Out of memory');
+      throw new Error('Out of memory (simulated PGLite WASM connect failure)');
+    }
+    expect(1).toBe(1);
+  });
+});`;
+    writeFileSync(join(OROOT, 'test', 'a-pass.test.ts'), passing);
+    writeFileSync(join(OROOT, 'test', 'b-oom-once.test.ts'), oomOnce);
+  });
+
+  afterAll(() => {
+    if (OROOT) rmSync(OROOT, { recursive: true, force: true });
+  });
+
+  function runOom(env: Record<string, string> = {}): { code: number; stdout: string; stderr: string } {
+    rmSync(join(OROOT, 'test', 'oom-sentinel.txt'), { force: true });
+    const result = spawnSync(
+      'bash',
+      [join(OROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '2'],
+      { cwd: OROOT, encoding: 'utf-8', env: { ...process.env, GBRAIN_TEST_NO_MEM_ADAPT: '1', ...env } },
+    );
+    return { code: result.status ?? -1, stdout: result.stdout || '', stderr: result.stderr || '' };
+  }
+
+  it('rescues an OOM-signature failure serially and exits 0 with an oom_rescued note', () => {
+    const r = runOom();
+    expect(r.stdout + r.stderr).toContain('OOM rescue pass');
+    expect(r.stderr).toContain('oom_rescued=');
+    expect(r.code).toBe(0);
+  }, 120_000);
+
+  it('writes a receipt per bun invocation; the rescue receipt supersedes the phantom failure (X2)', () => {
+    const r = runOom();
+    expect(r.code).toBe(0);
+    const dir = join(OROOT, '.context', 'test-receipts');
+    const receipts = loadReceiptDir(dir);
+    expect(receipts.filter(x => x.kind === 'rescue').map(x => [x.lane, x.files])).toEqual([['unit', ['test/b-oom-once.test.ts']]]);
+    expect(receipts.filter(x => x.kind === 'primary' && x.lane === 'unit').map(x => x.files[0]).sort()).toEqual(['test/a-pass.test.ts', 'test/b-oom-once.test.ts']);
+    const side = buildSide('local', receipts);
+    expect(side.issues).toEqual([]);
+    expect(side.lanes.get('unit')).toMatchObject({ executed: 2, failed: 0, superseded: 1 });
+  }, 120_000);
+
+  it('GBRAIN_TEST_NO_OOM_FALLBACK=1 disables the rescue lane (stays red)', () => {
+    const r = runOom({ GBRAIN_TEST_NO_OOM_FALLBACK: '1' });
+    expect(r.code).not.toBe(0);
+    expect(r.stdout + r.stderr).not.toContain('OOM rescue pass');
+  }, 120_000);
+
+  it('memory-aware sizing is advertised in the banner (mem-ok or mem-adapted)', () => {
+    // The one test that needs adaptation ON — override the harness-wide
+    // NO_MEM_ADAPT base (which keeps the shard-mechanics tests deterministic
+    // on RAM-limited CI runners).
+    const r = runOom({ GBRAIN_TEST_NO_MEM_ADAPT: '0' });
+    expect(r.stderr).toMatch(/mem-(ok|adapted)/);
+  }, 120_000);
+
+  it('mixed run: a plain assertion failure stays red even when the OOM phantom rescues green', () => {
+    // The NON_OOM_FAIL gate — the branch that stops the rescue lane from
+    // absolving real failures that happened to share a run with phantoms.
+    const realFail = `import { describe, it, expect } from 'bun:test';
+describe('real-failure', () => {
+  it('expects 1 to equal 2', () => { expect(1).toBe(2); });
+});`;
+    writeFileSync(join(OROOT, 'test', 'c-real-fail.test.ts'), realFail);
+    try {
+      const r = runOom();
+      expect(r.code).not.toBe(0);
+    } finally {
+      rmSync(join(OROOT, 'test', 'c-real-fail.test.ts'), { force: true });
+    }
+  }, 120_000);
+
+  it('a deterministic failure carrying the OOM signature re-fails serially and stays red', () => {
+    // The oom_rescue_failed lane: signature match queues the file, but the
+    // serial re-run confirms the failure is real — run must stay red.
+    const alwaysOom = `import { describe, it } from 'bun:test';
+describe('oom-always', () => {
+  it('always fails with the signature', () => {
+    console.error('Original error: Out of memory');
+    throw new Error('Out of memory (deterministic)');
+  });
+});`;
+    writeFileSync(join(OROOT, 'test', 'd-oom-always.test.ts'), alwaysOom);
+    try {
+      const r = runOom();
+      expect(r.code).not.toBe(0);
+      expect(r.stderr).toContain('oom_rescue_failed=');
+      expect(r.stdout + r.stderr).toContain('oom-rescue (serial, confirmed real)');
+    } finally {
+      rmSync(join(OROOT, 'test', 'd-oom-always.test.ts'), { force: true });
+    }
+  }, 120_000);
+});
+
+describe('run-unit-parallel.sh external-kill rescue contract', () => {
+  // An externally-killed shard (sibling workspace pkill, memory jetsam)
+  // presents as rc 143/137 well before the shard timeout. Simulating a
+  // mid-run external kill deterministically in a fixture is flaky, so this
+  // pins the load-bearing structure instead: the early-death detector, the
+  // 80%-of-timeout threshold that separates external kills from real wedges,
+  // and the rescue-queue routing for both the wedged and non-wedged branches.
+  it('detects early SIGTERM/SIGKILL deaths against the 80% timeout threshold', () => {
+    const source = readFileSync(PARALLEL_SH_SRC, 'utf-8');
+    expect(source).toContain('[ "$rc" = "143" ] || [ "$rc" = "137" ]');
+    expect(source).toContain('$((SHARD_TIMEOUT * 80 / 100))');
+    expect(source).toContain('shard_external_kill=1');
+  });
+
+  it('routes externally-killed shards into the serial rescue queue, not the red path', () => {
+    const source = readFileSync(PARALLEL_SH_SRC, 'utf-8');
+    const killBranches = source.split('shard_external_kill" = "1"').length - 1;
+    expect(killBranches).toBeGreaterThanOrEqual(2); // wedged + non-wedged branch
+    expect(source).toContain('KILLED externally after ${s_elapsed}s');
+  });
+
+  it('stamps per-shard start/end epochs so early death is measurable', () => {
+    const source = readFileSync(PARALLEL_SH_SRC, 'utf-8');
+    expect(source).toContain('date +%s > "$LOG_DIR/shard-$i.start"');
+    expect(source).toContain('date +%s > "$LOG_DIR/shard-$i.end"');
+  });
+});
+
+describe('run-unit-parallel.sh mem-adapt shed order (intra before shards)', () => {
+  // `bun test --max-concurrency` only bounds test.concurrent tests (1 file in
+  // the corpus), so intra-shard width is nearly free to shed while every
+  // dropped SHARD removes a whole bun process of real fan-out. The old order
+  // (shards first) collapsed a 16GB box to 1x4 — a serial run behind a 12000s
+  // watchdog, measured 3.25x slower than 4 shards on the same machine.
+  it('sheds intra-shard concurrency to 1 before dropping any shard', () => {
+    // Stub detect_available_mem_mb by appending a redefinition to the
+    // sandbox's test-env.sh copy (last definition wins in bash). --dry-run
+    // prints the banner and exits before spawning anything.
+    const stubEnv = join(TMPROOT, 'scripts', 'lib', 'test-env.sh');
+    const orig = readFileSync(stubEnv, 'utf-8');
+    writeFileSync(stubEnv, orig + '\ndetect_available_mem_mb() { echo "${FAKE_AVAIL_MB:-0}"; }\n');
+    try {
+      const r = spawnSync(
+        'bash',
+        [join(TMPROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '4', '--dry-run'],
+        {
+          cwd: TMPROOT,
+          encoding: 'utf-8',
+          // budget = 8704 - 4096 = 4608MB → MAX_TOTAL 3 at 1536MB/file.
+          // Old policy landed at 1x3; the fix must land at 3x1.
+          env: {
+            ...process.env,
+            GBRAIN_TEST_NO_MEM_ADAPT: '0',
+            GBRAIN_TEST_MAX_CONCURRENCY: '4',
+            FAKE_AVAIL_MB: '8704',
+          },
+        },
+      );
+      expect(r.stderr).toContain('mem-adapted 4x4→3x1');
+      expect(r.stderr).not.toContain('→1x');
+    } finally {
+      writeFileSync(stubEnv, orig);
+    }
+  });
+});
+
+describe('run-unit-parallel.sh no-timeout-binary wedge sentinel (rc 143 at cap → WEDGED)', () => {
+  // Regression pin: the fallback watchdog TERMs a hung shard (rc 143), which
+  // the pinned 124/137 wedge line cannot see. Before the .watchdog sentinel,
+  // that run died as a bare NON_OOM_FAIL with an rc=143 summary — the
+  // EXIT-HANG/WEDGED classifier was unreachable on machines without coreutils
+  // timeout, turning the known exit-hang leak into a false hard-red there.
+  let WROOT: string;
+
+  beforeAll(() => {
+    WROOT = mkdtempSync(join(tmpdir(), 'gbrain-parallel-wedge-'));
+    mkdirSync(join(WROOT, 'scripts'), { recursive: true });
+    mkdirSync(join(WROOT, 'test'), { recursive: true });
+    for (const s of ['sharding.ts', 'run-unit-parallel.sh', 'run-unit-shard.sh', 'run-serial-tests.sh', 'lib/test-env.sh']) {
+      mkdirSync(dirname(join(WROOT, 'scripts', s)), { recursive: true });
+      copyFileSync(resolve(REPO_ROOT, 'scripts', s), join(WROOT, 'scripts', s));
+      chmodSync(join(WROOT, 'scripts', s), 0o755);
+    }
+    // A test still mid-sleep at the shard cap — the fallback watchdog TERMs
+    // the bun process (rc 143). What this pins is the CLASSIFICATION of that
+    // kill (sentinel → WEDGED), not bun's exit-hang leak itself: a plain
+    // module-level ref'd timer no longer holds bun 1.3 open after the run,
+    // so a sleeping test is the reliable way to be alive at the cap.
+    const hanging = `import { describe, it } from 'bun:test';
+describe('hanging', () => { it('sleeps past the shard cap', async () => { await Bun.sleep(30_000); }, 55_000); });`;
+    writeFileSync(join(WROOT, 'test', 'a-hang-at-exit.test.ts'), hanging);
+
+    // Curated PATH with every tool the scripts call EXCEPT timeout binaries,
+    // so the fallback branch executes even on hosts with coreutils.
+    const bin = join(WROOT, 'bin');
+    mkdirSync(bin);
+    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'touch', 'stat', 'tee', 'bun']) {
+      const p = Bun.which(tool);
+      if (p) symlinkSync(p, join(bin, tool));
+    }
+  });
+
+  afterAll(() => {
+    if (WROOT) rmSync(WROOT, { recursive: true, force: true });
+  });
+
+  it('classifies a watchdog-TERMed shard as WEDGED via the sentinel, not a bare rc=143 fail', () => {
+    const r = spawnSync(
+      'bash',
+      [join(WROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '1'],
+      {
+        cwd: WROOT,
+        encoding: 'utf-8',
+        env: {
+          PATH: join(WROOT, 'bin'),
+          HOME: process.env.HOME ?? WROOT,
+          TMPDIR: process.env.TMPDIR ?? '/tmp',
+          GBRAIN_TEST_SHARD_TIMEOUT: '6',
+          GBRAIN_TEST_SHARD_KILL_AFTER: '2',
+          GBRAIN_TEST_NO_MEM_ADAPT: '1',
+        },
+      },
+    );
+    expect(r.status).not.toBe(0);
+    expect(existsSync(join(WROOT, '.context', 'test-shards', 'shard-1.watchdog'))).toBe(true);
+    const summary = readFileSync(join(WROOT, '.context', 'test-summary.txt'), 'utf-8');
+    expect(summary).toContain('WEDGED');
+  }, 120_000);
+});

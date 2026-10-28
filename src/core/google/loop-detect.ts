@@ -1,0 +1,423 @@
+/**
+ * loop-detect — the zero-LLM thread-state machine.
+ *
+ * For every synced Gmail thread, decide deterministically whether someone is
+ * waiting: the last substantive message is inbound and unanswered
+ * (unanswered_inbound — I owe the reply) or outbound and unanswered
+ * (unanswered_outbound — I'm waiting on them). Loops close automatically
+ * when the state stops holding (a reply landed).
+ *
+ * Precision IS the product (plan §Phase 4): the exclusion rules below are
+ * pinned by the labeled fixture corpus in test/google-loop-detect.test.ts —
+ * every new false-positive class gets a fixture before its fix.
+ *  - noise senders never open loops (noreply/notifications/…)
+ *  - Google Calendar system mail (text/calendar part) neither opens nor
+ *    closes loops — it comes FROM a real colleague, so no mute could
+ *    exclude it without silencing that person's genuine email
+ *  - list mail (List-Unsubscribe) never opens loops
+ *  - auto-submitted mail (RFC 3834 Auto-Submitted other than "no": tracker
+ *    notices, auto-replies) neither opens nor closes loops
+ *  - positively automated mail (#5012: `Precedence: bulk|list|junk`, a
+ *    `List-Id`, or a no-reply `Reply-To`) owes no reply; the verdict records
+ *    `withheld: 'automated_mail'`. A Gmail category alone never withholds a
+ *    reply-owed loop; with `loops.updates_require_reciprocity` on, Updates
+ *    mail opens one only when the owner has written to the sender
+ *  - self-threads (all participants are my addresses) never open loops
+ *  - CC-only inbound does not owe a reply (must be in To:)
+ *  - outbound without a question mark is FYI, not an ask; a question mark
+ *    inside a link (?id=42) is not a question
+ *  - my acknowledgement-only reply ("Thanks!", "Got it") to a question is
+ *    not an answer: it neither closes the reply-owed loop nor flips the turn
+ *    ("Will do" is a commitment and still counts as the reply)
+ *  - suppressed senders/threads (gbrain loops mute) never open NEW loops;
+ *    existing loops keep their state
+ *  - grace windows: inbound 24h, outbound 72h — fresh mail is not a loop yet;
+ *    measured from the oldest unanswered message in the trailing run, so a
+ *    nudge or follow-up does not restart the clock
+ *
+ * Pure verdict function + a thin apply step; the apply step is called from
+ * runGoogleSync per touched thread and must never fail the sync.
+ */
+
+import type { BrainEngine } from '../engine.ts';
+import {
+  closeThreadLoops,
+  loadSuppressions,
+  settleMuteRecheck,
+  upsertOpenLoop,
+  type LoopEvidence,
+  type SuppressionSet,
+} from '../loops/loops-store.ts';
+import { resolveCounterparty, type ResolvedCounterparty } from './counterparty.ts';
+import { isCalendarSystemMail, isNoiseSender, isPositivelyAutomated } from './google-render.ts';
+export { isPositivelyAutomated } from './google-render.ts';
+import { hasBulkCategory } from './gmail-categories.ts';
+import { isExcludedByLabels, NO_EXCLUSION, pageLabelIds, type LoopsExclusionPolicy } from './loops-exclusion.ts';
+import { ownerWroteToFor } from './loops-reciprocity.ts';
+import type { GmailMessageMeta, GmailThreadData } from './types.ts';
+
+export const INBOUND_GRACE_HOURS = 24;
+export const OUTBOUND_GRACE_HOURS = 72;
+
+export interface ThreadLoopSpec {
+  loopType: 'unanswered_inbound' | 'unanswered_outbound';
+  counterpartyEmail: string;
+  summary: string;
+  evidence: LoopEvidence[];
+  lastActivityMs: number;
+  /** When the obligation began: the oldest message in the trailing run that carries it. */
+  openedMs: number;
+}
+
+export interface ThreadLoopVerdict {
+  /** Loops that should be open (suppression-filtered). */
+  open: ThreadLoopSpec[];
+  /**
+   * Loops that genuinely stopped holding — a TURN FLIP happened (I replied →
+   * inbound closes; they replied → outbound closes). Everything else is a
+   * HOLD: neither opened nor closed. Grace windows, CC-only delivery, list
+   * mail, and suppressions must never close an existing loop — a fresh
+   * counterparty nudge inside the grace window is NOT a reply (red-team:
+   * closing it as 'reply_detected' hid the loop for 24h exactly while the
+   * counterparty was most impatient).
+   */
+  close: Array<'unanswered_inbound' | 'unanswered_outbound'>;
+  /**
+   * #5868: a grace window withheld this loop. It opens at `untilMs` with
+   * `spec` unless the thread changes first; the sweep records it as a grace
+   * hold because Gmail history never re-lists a quiet thread.
+   */
+  held?: { untilMs: number; spec: ThreadLoopSpec };
+  /**
+   * #5012: a reply-owed loop every other gate would have opened (or held)
+   * was withheld because the mail is positively automated, or because it is
+   * Updates mail from a sender the owner never wrote to (opt-in rule).
+   */
+  withheld?: { reason: LoopWithheldReason; counterpartyEmail: string };
+}
+
+export type LoopWithheldReason = 'automated_mail' | 'updates_without_reciprocity';
+
+/** #5012: opt-in detection policy. `ownerWroteTo` is set only when `loops.updates_require_reciprocity` is on. */
+export interface LoopDetectPolicy {
+  ownerWroteTo?: ReadonlySet<string> | null;
+}
+
+
+function isMine(m: GmailMessageMeta, myAddresses: Set<string>): boolean {
+  return m.labelIds.includes('SENT') || myAddresses.has(m.fromAddress);
+}
+
+function ageHours(ms: number, now: Date): number {
+  return (now.getTime() - ms) / 3_600_000;
+}
+
+const URL_RE = /\b(?:https?:\/\/|www\.)\S+/gi;
+
+/** A question mark outside any link. */
+export function asksQuestion(text: string): boolean {
+  return text.replace(URL_RE, '').includes('?');
+}
+
+const ACK_ONLY_RE =
+  /^(?:(?:thanks|thank you|thx|ty|many thanks|thanks so much|thank you so much|got it|noted|received|ack|ok|okay|sounds good|cheers)[\s!.,]*)+$/i;
+const SIGN_OFF_NAME_RE = /(?:,\s*|\s+[-–—]\s*)\p{Lu}[\p{Ll}.]{0,19}[\s!.]*$/u;
+
+/** A short reply that only acknowledges ("Thanks!", "Got it, thanks.", "Thanks, Bob!"). */
+export function isAcknowledgementOnly(text: string): boolean {
+  const t = text.replace(/\s+/g, ' ').trim();
+  if (t.length === 0 || t.length > 60) return false;
+  return ACK_ONLY_RE.test(t) || ACK_ONLY_RE.test(t.replace(SIGN_OFF_NAME_RE, ''));
+}
+
+function quote(m: GmailMessageMeta): string {
+  const q = m.bodyText.replace(/\s+/g, ' ').trim().slice(0, 200);
+  return q;
+}
+
+/**
+ * Pure detector. `suppressions` filters NEW loops only — closes still apply
+ * so a muted thread that gets a reply still closes its old loop.
+ */
+export function detectThreadLoop(
+  thread: GmailThreadData,
+  myAddresses: Set<string>,
+  now: Date,
+  suppressions?: SuppressionSet,
+  policy: LoopDetectPolicy = {},
+): ThreadLoopVerdict {
+  const messages = thread.messages.filter((m) => m.internalDateMs > 0);
+  if (messages.length === 0) return { open: [], close: [] };
+
+  // Substantive = not from a noise sender, and not Google Calendar system
+  // mail. Noise threads carry no loops — and can't close any either (no turn
+  // flip is observable).
+  //
+  // Calendar notices are excluded HERE, alongside noise, rather than at the
+  // open gates, for two reasons. They must not open a loop: an
+  // `Invitation:`/`Accepted:` notice is machine mail nobody expects a reply
+  // to, and it arrives from the colleague's real address so no sender mute
+  // could exclude it without silencing that person entirely. And they must
+  // not CLOSE one either: a calendar invite is not a reply, so letting it
+  // flip the turn would silently answer a real outbound loop. RFC 3834
+  // auto-submitted mail declares itself machine mail and is excluded the same
+  // way: an out-of-office auto-reply is not the answer to my outbound ask.
+  // My acknowledgement-only reply to their question is not an answer: drop
+  // it so the turn stays theirs and the reply-owed loop neither closes nor
+  // restarts its clock. An acknowledgement of a message that asked nothing
+  // ("Here is the deck" / "Thanks!") still counts as the reply it is.
+  const substantive: GmailMessageMeta[] = [];
+  let theirQuestionPending = false;
+  for (const m of messages) {
+    if (isNoiseSender(m.fromAddress) || isCalendarSystemMail(m) || m.autoSubmitted) continue;
+    if (!isMine(m, myAddresses)) {
+      theirQuestionPending = asksQuestion(m.bodyText);
+    } else if (theirQuestionPending && isAcknowledgementOnly(m.bodyText)) {
+      continue;
+    } else {
+      theirQuestionPending = false;
+    }
+    substantive.push(m);
+  }
+  if (substantive.length === 0) return { open: [], close: [] };
+
+  const last = substantive[substantive.length - 1];
+  const subject = (last.subject || substantive[0].subject || '(no subject)').replace(/^((re|fwd?|aw):\s*)+/i, '');
+  const lastIsMine = isMine(last, myAddresses);
+
+  // The turn flip is the ONLY close signal: my reply answers an inbound
+  // loop; their reply answers an outbound one. Every gate below (grace,
+  // CC-only, list mail, FYI, suppression) can withhold a NEW open but must
+  // never fabricate a 'reply_detected' close.
+  const close: ThreadLoopVerdict['close'] = lastIsMine
+    ? ['unanswered_inbound']
+    : ['unanswered_outbound'];
+
+  // Self-thread: every participant is me (notes-to-self, drafts).
+  const participants = new Set<string>();
+  for (const m of substantive) {
+    if (m.fromAddress) participants.add(m.fromAddress);
+    for (const a of [...m.to, ...m.cc]) participants.add(a);
+  }
+  const external = [...participants].filter((p) => !myAddresses.has(p));
+  if (external.length === 0) return { open: [], close: [] };
+
+  const threadSuppressed = suppressions?.threads.has(thread.threadId) ?? false;
+
+  // The trailing run: substantive messages since the last turn flip, all on
+  // the last speaker's side. Grace windows are measured from the OLDEST
+  // message in the run that carries the obligation (an inbound message with
+  // me in To:, or my outbound ask), so a fresh nudge or follow-up never
+  // restarts the clock on a request that has already waited past the window
+  // — the open-lane twin of the close-lane rule that a nudge is not a reply.
+  let runStart = substantive.length - 1;
+  while (runStart > 0 && isMine(substantive[runStart - 1], myAddresses) === lastIsMine) runStart--;
+  const run = substantive.slice(runStart);
+
+  if (!lastIsMine) {
+    // ── Last word is theirs: do I owe a reply? ──
+    // List mail never owes a reply.
+    if (last.listUnsubscribe) return { open: [], close };
+    // #5103: bulk by Gmail's own classification (promotions, social, forums)
+    // owes no reply either, unless the owner wrote a substantive message in
+    // the thread — the same rule the extraction lane applies. CATEGORY_UPDATES
+    // is not bulk here: invoices and document requests live there.
+    if (hasBulkCategory(messages.flatMap((m) => m.labelIds)) && !substantive.some((m) => isMine(m, myAddresses))) {
+      return { open: [], close };
+    }
+    // CC-only (or bcc/list delivery with no To: match) does not owe a reply.
+    const inTo = last.to.some((a) => myAddresses.has(a));
+    if (!inTo) return { open: [], close };
+    if (threadSuppressed || suppressions?.senders.has(last.fromAddress)) return { open: [], close };
+    if (isPositivelyAutomated(last)) return { open: [], close, withheld: { reason: 'automated_mail', counterpartyEmail: last.fromAddress } };
+    if (policy.ownerWroteTo && last.labelIds.includes('CATEGORY_UPDATES') && !substantive.some((m) => isMine(m, myAddresses))
+      && !policy.ownerWroteTo.has(last.fromAddress)) {
+      return { open: [], close, withheld: { reason: 'updates_without_reciprocity', counterpartyEmail: last.fromAddress } };
+    }
+    const owedSince = run.find((m) => m.to.some((a) => myAddresses.has(a))) ?? last;
+    const spec: ThreadLoopSpec = {
+      loopType: 'unanswered_inbound',
+      // No age in the stored summary — it would freeze at detection time
+      // and lie on the trust-critical surface; readers render age from
+      // last_activity_at.
+      summary: `Reply owed to ${last.fromAddress}: "${subject}"`,
+      counterpartyEmail: last.fromAddress,
+      evidence: [{ message_id: last.id, quote: quote(last) }],
+      lastActivityMs: last.internalDateMs,
+      openedMs: owedSince.internalDateMs,
+    };
+    if (ageHours(owedSince.internalDateMs, now) < INBOUND_GRACE_HOURS) {
+      return { open: [], close, held: { untilMs: owedSince.internalDateMs + INBOUND_GRACE_HOURS * 3_600_000, spec } };
+    }
+    return { open: [spec], close };
+  }
+
+  // ── Last word is mine: am I waiting on them? ──
+  // No question mark outside a link → FYI/forward, not an ask.
+  if (!asksQuestion(last.bodyText)) return { open: [], close };
+  const recipients = last.to.filter((a) => !myAddresses.has(a));
+  if (recipients.length === 0) return { open: [], close };
+  const counterparty = recipients[0];
+  if (threadSuppressed || suppressions?.senders.has(counterparty)) return { open: [], close };
+  const askedSince = run.find((m) => asksQuestion(m.bodyText)) ?? last;
+  const spec: ThreadLoopSpec = {
+    loopType: 'unanswered_outbound',
+    counterpartyEmail: counterparty,
+    summary: `Waiting on ${counterparty}: "${subject}"`,
+    evidence: [{ message_id: last.id, quote: quote(last) }],
+    lastActivityMs: last.internalDateMs,
+    openedMs: askedSince.internalDateMs,
+  };
+  if (ageHours(askedSince.internalDateMs, now) < OUTBOUND_GRACE_HOURS) {
+    return { open: [], close, held: { untilMs: askedSince.internalDateMs + OUTBOUND_GRACE_HOURS * 3_600_000, spec } };
+  }
+  return { open: [spec], close };
+}
+
+// Suppression sets are cheap but per-thread queries add up on a backfill;
+// cache per (engine, source) for one process, refreshed on a 60s TTL. Keyed
+// by engine identity, not sourceId alone — one process serving two brains
+// with a colliding source id must not share mute sets across them.
+const suppressionCache = new WeakMap<
+  BrainEngine,
+  Map<string, { set: SuppressionSet; loadedAt: number; epoch: number }>
+>();
+// A WeakMap can't be cleared wholesale; the epoch exists for the no-arg test
+// seam — a bump makes every cached entry read as expired.
+let suppressionCacheEpoch = 0;
+
+async function suppressionsFor(engine: BrainEngine, sourceId: string): Promise<SuppressionSet> {
+  let perEngine = suppressionCache.get(engine);
+  if (!perEngine) {
+    perEngine = new Map();
+    suppressionCache.set(engine, perEngine);
+  }
+  const hit = perEngine.get(sourceId);
+  if (hit && hit.epoch === suppressionCacheEpoch && Date.now() - hit.loadedAt < 60_000) {
+    return hit.set;
+  }
+  const set = await loadSuppressions(engine, sourceId);
+  perEngine.set(sourceId, { set, loadedAt: Date.now(), epoch: suppressionCacheEpoch });
+  return set;
+}
+
+/** Test seam: drop the cache between cases (per-engine when provided). */
+export function __clearSuppressionCacheForTests(engine?: BrainEngine): void {
+  if (engine) suppressionCache.delete(engine);
+  else suppressionCacheEpoch++;
+}
+
+/** #5012: a mute or unmute in this process takes effect on the next detection, not after the 60s TTL. */
+export function invalidateSuppressionCache(engine: BrainEngine): void {
+  suppressionCache.delete(engine);
+}
+
+/**
+ * Apply the verdict: close thread loops that no longer hold, upsert the ones
+ * that do (dedup key 'thread:<threadId>:<loop_type>' — reopen on conflict).
+ * Counterparty resolution: own source first, then identity-only across
+ * sources (google/counterparty.ts, #5504).
+ */
+export async function applyThreadLoopVerdict(
+  engine: BrainEngine,
+  sourceId: string,
+  thread: GmailThreadData,
+  myAddresses: Set<string>,
+  pageSlug: string | null,
+  now: Date = new Date(),
+  exclusion: LoopsExclusionPolicy = NO_EXCLUSION,
+): Promise<ThreadLoopVerdict> {
+  const suppressions = await suppressionsFor(engine, sourceId);
+  const policy: LoopDetectPolicy = { ownerWroteTo: await ownerWroteToFor(engine, sourceId, myAddresses) };
+  // One verdict, two lanes: `close` is the turn-flip set (suppression- and
+  // grace-independent — only a genuine reply closes, and only the answered
+  // type); `open` is suppression-filtered. A held loop (grace window,
+  // CC-only nudge, muted sender) is neither opened nor closed.
+  const verdict = withLabelExclusion(detectThreadLoop(thread, myAddresses, now, suppressions, policy), exclusion,
+    thread.messages.flatMap((m) => m.labelIds));
+
+  const desired = new Set(verdict.open.map((s) => s.loopType));
+  const toClose = verdict.close.filter((t) => !desired.has(t));
+  if (toClose.length > 0) {
+    await closeThreadLoops(engine, sourceId, thread.threadId, 'reply_detected', toClose);
+  }
+
+  for (const spec of verdict.open) await upsertThreadLoop(engine, sourceId, thread.threadId, spec, pageSlug);
+  // #5012: an unmute's re-check that neither reopened nor answered the queued loop leaves it closed;
+  // a grace hold keeps it queued until the hold settles.
+  if (!verdict.held && suppressions.recheckThreads?.has(thread.threadId)) {
+    await settleMuteRecheck(engine, sourceId, thread.threadId);
+    suppressions.recheckThreads.delete(thread.threadId);
+  }
+  return verdict;
+}
+
+/**
+ * #5445: the label exclusion applied to a verdict. An excluded thread opens
+ * nothing and holds nothing; an unresolved policy withholds the same way
+ * (fail closed) until a sweep resolves it. Closes are never touched: the
+ * exclusion withholds opens, it does not fabricate replies.
+ */
+export function withLabelExclusion(verdict: ThreadLoopVerdict, exclusion: LoopsExclusionPolicy, labelIds: Iterable<string>): ThreadLoopVerdict {
+  if (!isExcludedByLabels(exclusion, labelIds) && exclusion.unresolved.length === 0) return verdict;
+  return { open: [], close: verdict.close };
+}
+
+/**
+ * #5868: opens a grace-held loop whose deadline passed on an unchanged
+ * thread, from the spec its last detection produced. Suppressions and the
+ * label exclusion are re-read so a mute or a label added during the hold
+ * still withholds the open (`'excluded'`); an unresolved exclusion keeps the
+ * hold for the next sweep (`'deferred'`).
+ */
+export async function openDueGraceHold(
+  engine: BrainEngine,
+  sourceId: string,
+  threadId: string,
+  spec: ThreadLoopSpec,
+  pageSlug: string | null,
+  exclusion: LoopsExclusionPolicy = NO_EXCLUSION,
+): Promise<'opened' | 'suppressed' | 'excluded' | 'deferred'> {
+  const suppressions = await suppressionsFor(engine, sourceId);
+  if (suppressions.threads.has(threadId) || suppressions.senders.has(spec.counterpartyEmail)) return 'suppressed';
+  if (exclusion.ids.size > 0 || exclusion.unresolved.length > 0) {
+    const page = pageSlug ? await engine.getPage(pageSlug, { sourceId }) : null;
+    if (isExcludedByLabels(exclusion, pageLabelIds(page?.frontmatter as Record<string, unknown> | undefined))) return 'excluded';
+    if (exclusion.unresolved.length > 0) return 'deferred';
+  }
+  await upsertThreadLoop(engine, sourceId, threadId, spec, pageSlug);
+  return 'opened';
+}
+
+async function upsertThreadLoop(
+  engine: BrainEngine,
+  sourceId: string,
+  threadId: string,
+  spec: ThreadLoopSpec,
+  pageSlug: string | null,
+): Promise<void> {
+  // Own source first, then across sources by identity only (#5504); a
+  // slugify fallback would fabricate a person that doesn't exist, so an
+  // unresolved counterparty stays NULL.
+  let counterparty: ResolvedCounterparty | null = null;
+  try {
+    counterparty = await resolveCounterparty(engine, sourceId, { email: spec.counterpartyEmail });
+  } catch {
+    /* resolution is best-effort */
+  }
+  await upsertOpenLoop(engine, {
+    sourceId,
+    dedupKey: `thread:${threadId}:${spec.loopType}`,
+    loopType: spec.loopType,
+    counterpartySlug: counterparty?.slug ?? null,
+    counterpartySourceId: counterparty?.sourceId ?? null,
+    counterpartyEmail: spec.counterpartyEmail,
+    summary: spec.summary,
+    evidence: spec.evidence.map((e) => ({ ...e, ...(pageSlug ? { page_slug: pageSlug } : {}) })),
+    threadId,
+    pageSlug,
+    detector: 'deterministic_thread',
+    lastActivityAt: new Date(spec.lastActivityMs).toISOString(),
+    openedAt: new Date(spec.openedMs).toISOString(),
+  });
+}

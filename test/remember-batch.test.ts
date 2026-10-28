@@ -1,0 +1,149 @@
+import { describe, expect, test } from 'bun:test';
+import { childRequestId, runRememberBatch, REMEMBER_BATCH_MAX } from '../src/core/remember-batch.ts';
+import { OperationError, verbError } from '../src/core/ops/contract.ts';
+import type { OperationContext } from '../src/core/operations.ts';
+
+const ctx = { remote: false } as unknown as OperationContext;
+const ve = (code: string, message: string, suggestion: string) => verbError(code as never, message, suggestion);
+
+function fakeSingle(opts: { failWrite?: (p: Record<string, unknown>) => boolean } = {}) {
+  const writes: Record<string, unknown>[] = [];
+  const handler = async (c: OperationContext, p: Record<string, unknown>) => {
+    if (typeof p.fact !== 'string' || !p.fact) throw ve('invalid_params', 'fact must be a non-empty string.', 'x');
+    if (typeof p.provenance !== 'string' || !p.provenance) throw ve('provenance_required', 'provenance is required.', 'x');
+    if (c.dryRun) return { dry_run: true };
+    if (opts.failWrite?.(p)) throw ve('internal_error', 'boom', 'x');
+    writes.push(p);
+    return { status: 'saved', id: writes.length };
+  };
+  return { handler, writes };
+}
+
+describe('remember items[] batch', () => {
+  test('child request ids are deterministic UUIDs, distinct per index', () => {
+    const a = childRequestId('11111111-1111-4111-8111-111111111111', 0);
+    expect(a).toBe(childRequestId('11111111-1111-4111-8111-111111111111', 0));
+    expect(a).not.toBe(childRequestId('11111111-1111-4111-8111-111111111111', 1));
+    expect(a).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  test('saves each item with shared provenance and child request ids', async () => {
+    const { handler, writes } = fakeSingle();
+    const rid = '22222222-2222-4222-8222-222222222222';
+    const out = await runRememberBatch(ctx, { request_id: rid, provenance: 'session', items: [{ fact: 'a' }, { fact: 'b', provenance: 'own' }] }, handler, ve);
+    expect(out.saved).toBe(2);
+    expect(out.partial).toBe(false);
+    expect(writes.map(w => w.provenance)).toEqual(['session', 'own']);
+    expect(writes[0].request_id).toBe(childRequestId(rid, 0));
+    expect(writes[1].request_id).toBe(childRequestId(rid, 1));
+  });
+
+  test("a top-level entity reaches validation and admission; an item's own entity wins (#7432)", async () => {
+    const validated: unknown[] = [];
+    const admitted: unknown[] = [];
+    await runRememberBatch(ctx, {
+      entity: 'people/alice-example',
+      provenance: 'session',
+      items: [{ fact: 'Prefers tea' }, 'Ships weekly', { fact: 'Prefers coffee', entity: 'people/bob-example' }, { fact: 'An unscoped note', entity: null }],
+    }, async (c, p) => {
+      (c.dryRun ? validated : admitted).push(p.entity);
+      return { status: 'saved' };
+    }, ve);
+    const expected = ['people/alice-example', 'people/alice-example', 'people/bob-example', null];
+    expect(validated).toEqual(expected);
+    expect(admitted).toEqual(expected);
+  });
+
+  test('an unusable request_id refuses the batch before any write (#6280)', async () => {
+    for (const request_id of ['', 42, null, 'has space', 'x'.repeat(129)]) {
+      const { handler, writes } = fakeSingle();
+      let err: unknown;
+      try { await runRememberBatch(ctx, { request_id, provenance: 'p', items: [{ fact: 'a' }] }, handler, ve); } catch (e) { err = e; }
+      expect(err).toBeInstanceOf(OperationError);
+      expect((err as OperationError).code).toBe('invalid_params');
+      expect((err as Error).message).toContain('request_id must be 1 to 128 printable ASCII characters');
+      expect(writes).toHaveLength(0);
+    }
+  });
+
+  test('a client request_id (F6) is accepted; children derive from the string as sent', async () => {
+    for (const request_id of ['not-a-uuid', 'r1']) {
+      const { handler, writes } = fakeSingle();
+      await runRememberBatch(ctx, { request_id, provenance: 'p', items: [{ fact: 'a' }, { fact: 'b' }] }, handler, ve);
+      expect(writes.map(w => w.request_id)).toEqual([childRequestId(request_id, 0), childRequestId(request_id, 1)]);
+    }
+  });
+
+  test('a UUID in either case or an omitted request_id is accepted; children keep the caller spelling', async () => {
+    const lower = 'abcdefab-cdef-4abc-8def-abcdefabcdef';
+    for (const request_id of [lower, lower.toUpperCase()]) {
+      const { handler, writes } = fakeSingle();
+      await runRememberBatch(ctx, { request_id, provenance: 'p', items: [{ fact: 'a' }] }, handler, ve);
+      expect(writes[0].request_id).toBe(childRequestId(request_id, 0));
+    }
+    const { handler, writes } = fakeSingle();
+    await runRememberBatch(ctx, { provenance: 'p', items: [{ fact: 'a' }] }, handler, ve);
+    expect(writes).toHaveLength(1);
+  });
+
+  test('one invalid item refuses the whole batch before any write', async () => {
+    const { handler, writes } = fakeSingle();
+    let err: unknown;
+    try { await runRememberBatch(ctx, { provenance: 'p', items: [{ fact: 'ok' }, { fact: '' }] }, handler, ve); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(OperationError);
+    expect((err as Error).message).toContain('items[1]');
+    expect(writes).toHaveLength(0);
+  });
+
+  test('per-item publication failure reports partial with the item error', async () => {
+    const { handler, writes } = fakeSingle({ failWrite: p => p.fact === 'bad' });
+    const out = await runRememberBatch(ctx, { provenance: 'p', items: [{ fact: 'ok' }, { fact: 'bad' }] }, handler, ve) as { items: { status: string }[]; partial: boolean; next?: string };
+    expect(writes).toHaveLength(1);
+    expect(out.partial).toBe(true);
+    expect(out.items[1].status).toBe('failed');
+    expect(out.next).toContain('new request_id');
+  });
+
+  test('rejects empty, oversized, unknown-field and fact+items calls', async () => {
+    const { handler } = fakeSingle();
+    const tooMany = Array.from({ length: REMEMBER_BATCH_MAX + 1 }, (_, i) => ({ fact: String(i) }));
+    for (const p of [{ items: [] }, { items: tooMany }, { items: [{ fact: 'a', slug: 'x' }] }, { fact: 'x', items: [{ fact: 'a' }] }]) {
+      await expect(runRememberBatch(ctx, { provenance: 'p', ...p }, handler, ve)).rejects.toBeInstanceOf(OperationError);
+    }
+  });
+});
+
+describe('remember items[] and replaces', () => {
+  test('replaces travels with the item it names', async () => {
+    const { handler, writes } = fakeSingle();
+    await runRememberBatch(ctx, { provenance: 'p', items: [{ fact: 'Moved to Lisbon', replaces: '42' }, { fact: 'Ships Fridays' }] }, handler, ve);
+    expect(writes.map(w => w.replaces)).toEqual(['42', undefined]);
+  });
+
+  test('a batch-level replaces is refused before any write: it names one fact', async () => {
+    const { handler, writes } = fakeSingle();
+    let err: unknown;
+    try { await runRememberBatch(ctx, { provenance: 'p', replaces: '42', items: [{ fact: 'a' }, { fact: 'b' }] }, handler, ve); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(OperationError);
+    expect((err as OperationError).code).toBe('invalid_params');
+    expect((err as Error).message).toContain('replaces');
+    expect(writes).toHaveLength(0);
+  });
+});
+
+describe('remember items[] shorthand and receipts', () => {
+  test('a bare string item is one fact with the shared provenance', async () => {
+    const { handler, writes } = fakeSingle();
+    const out = await runRememberBatch(ctx, { provenance: 'p', items: ['Prefers tea', { fact: 'Ships Fridays' }] }, handler, ve);
+    expect(out.saved).toBe(2);
+    expect(writes.map(w => w.fact)).toEqual(['Prefers tea', 'Ships Fridays']);
+  });
+
+  test('item receipts are compact: status and id, no full single-fact envelope', async () => {
+    const handler = async (c: OperationContext, p: Record<string, unknown>) => (c.dryRun ? { dry_run: true }
+      : { status: 'inserted', id: '7', entity_slug: null, warnings: ['NO_ENTITY'], hint: 'link it', outcome: { big: 'x'.repeat(500) }, state: 'committed', protocol_version: 1, fact: p.fact });
+    const out = await runRememberBatch(ctx, { provenance: 'p', items: [{ fact: 'a' }, { fact: 'b' }] }, handler, ve) as { items: Array<Record<string, unknown>>; hints: string[] };
+    expect(Object.keys(out.items[0]).sort()).toEqual(['entity_slug', 'id', 'index', 'request_id', 'status', 'warnings']);
+    expect(out.hints).toEqual(['link it']);
+  });
+});

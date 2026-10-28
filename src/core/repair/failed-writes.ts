@@ -1,0 +1,571 @@
+/**
+ * `gbrain repair failed-writes` (#5983): resubmits caller writes that the
+ * managed writer guard refused while it misread page children's source
+ * (`writer_coordinator_required`, stored before #5982 as `storage_error`
+ * "Publication failed (P0001)"), and (#6429) caller writes that ended
+ * `conflict` with `source_changed` because the page's file and database
+ * differed, such as the writes refused while a database-only grandfather
+ * stamp made every file look edited. The
+ * terminal receipt keeps its full intent until receipt compaction
+ * (`persistence.receipt_retention_days`), so the write can be submitted again
+ * once the guard or the drift check is fixed.
+ *
+ * Only writes a caller made directly are replayed: `put_page` without an
+ * owner-internal `kind`, `add_timeline_entry` and `remember`. Writes an owner
+ * process produced (sync and file imports, reconcile, relink, maintenance
+ * pages, jobs) are counted as residuals with the command that produces them
+ * again, because re-running the producer uses current content.
+ *
+ * A candidate is kept, never replayed, when:
+ *   - `already_written`: a later committed request carries the same intent, or
+ *     an earlier apply's replay committed;
+ *   - `duplicate`: a later failed or pending request carries the same intent
+ *     (that one is the candidate);
+ *   - `superseded`: a later request wrote or deleted the page (committed or
+ *     still pending; for `put_page`, also a later failed `put_page`, which is
+ *     the newer content), or the page changed after the revision the caller
+ *     read;
+ *   - `unpinned_target`: a `remember` whose original target was inferred as
+ *     unattributed; replaying would infer again and could pick another page;
+ *   - `file_database_drift` (W4.11): its last replay was refused
+ *     `source_changed` because the page's file and database differ, and the
+ *     page has not been written since; the listing names the reconcile
+ *     command, and the write is a candidate again once the page changes.
+ *
+ * Explicit-only and preview-bound: the preview lists every candidate with its
+ * class and saves the replay set, with each target page's revision, under its
+ * hash; `--apply --expect <hash>` replays exactly that set. Each item is
+ * reclassified (`changed_since_preview`) and its original authority re-checked
+ * (`authority_revoked`), then submitted through the operation's normal path on
+ * the original trust lane (a remote caller's write is prepared as a remote
+ * write, with its take-holder and delegated-namespace limits), bound to the
+ * previewed page revision (`force` is dropped), under a request id derived
+ * from the failed request id. The failed receipt stays as history.
+ */
+import { OperationError } from '../ops/contract.ts';
+import { isTimelineSection } from '../persistence/timeline-omission.ts';
+import type { OperationContext } from '../ops/contract.ts';
+import type { BrainEngine } from '../engine.ts';
+import { digest } from '../persistence/digest.ts';
+import { isTerminal, principalKey, type WriteAuthority, type WriteRequest } from '../persistence/model.ts';
+import { authorizeStoredRequest } from '../persistence/authority.ts';
+import { initializeLocalPersistence, requestPrincipalForContext, submitPageMutation } from '../persistence/page-mutations.ts';
+import { submitRememberMutation } from '../persistence/memory-mutations.ts';
+import { getWorktreeBinding } from '../persistence/ownership.ts';
+import { prepareFileTarget } from '../persistence/page-prepare.ts';
+import { PENDING_IMPORT, SYNC_HELD } from '../persistence/pending-import.ts';
+import { FACTS_ENTITY_MOVED_MESSAGES, isEntityMovedRefusal } from '../persistence/verb-errors.ts';
+import { MAX_FILE_REFUSAL_RETRIES } from '../persistence/facts-maintenance.ts';
+import { factsAbsorbWriteKey, factsRetryDeadCommand } from '../facts/dead-absorb-retry.ts';
+import { readFactsBackstopJobPage } from '../persistence/effect-facts.ts';
+import { clearApprovedSet, loadApprovedSet, previewChangedError, previewHash, saveApprovedSet } from '../persistence/preview-approval.ts';
+import { resolveEntitySlugWithSource } from '../entities/resolve.ts';
+import { dispositionOf, PAGE_REMOVAL_OPERATIONS, supersessionOrderSql, supersessionSql } from '../persistence/terminal-classify.ts';
+import { afterCursor, type RepairHandler, type RepairItem, type RepairItemOutcome, type RepairPlan, type RepairScope } from './core.ts';
+
+const REPLAYABLE = ['put_page', 'add_timeline_entry', 'remember'];
+const REMEMBER_PREPARED_KEYS = ['entity_slug', 'fence', 'valid_from', 'valid_until', 'entity_inferred', 'entity_warning', 'visibility_defaulted'];
+const REMOTE_PREPARED_KEYS = ['source_kind', 'source_uri', 'ingested_via'];
+const PAGE_REMOVALS = PAGE_REMOVAL_OPERATIONS;
+const GUARD_REFUSAL = `(r.state='failed' AND (r.error_code='writer_coordinator_required'
+  OR (r.error_code='storage_error' AND r.error_message LIKE 'Publication failed (P0001)%')))`;
+/** #6429: a refusal from prepareFileTarget (page-prepare.ts); the receipt keeps the code, not the refusal's detail. */
+const DRIFT_REFUSAL = `(r.state='conflict' AND r.error_code='source_changed')`;
+/** #7602: a managed fact request refused because its entity page moved; extraction re-admits these since, but older ones stayed refused. */
+const FACTS_MOVED_REFUSAL = `(r.operation='extract_facts' AND r.state='conflict' AND r.error_code='revision_conflict'
+  AND r.error_message IN (${FACTS_ENTITY_MOVED_MESSAGES.map(message => `'${message.replaceAll("'", "''")}'`).join(',')}))`;
+/** #7602: a refused fact request whose retained facts a later request of the same extraction committed on the same page. */
+const FACTS_RECOVERED = `EXISTS (SELECT 1 FROM persistence_requests c WHERE r.operation='extract_facts' AND c.operation='extract_facts'
+  AND c.source_id=r.source_id AND c.slug=r.slug AND c.state='committed' AND c.sequence>r.sequence
+  AND COALESCE(c.intent->>'inputDigest', c.outcome->>'input_digest')=r.intent->>'inputDigest'
+  AND COALESCE(c.intent->>'batchKey', c.outcome->>'batch_key') IS DISTINCT FROM r.intent->>'batchKey')`;
+
+/** One managed fact entity request of an extraction (every request sharing its source and input digest). */
+interface ExtractionRequest { source_id: string; input_digest: string; slug: string; state: string; error_code: string | null; error_message: string | null; batch_key: string | null }
+
+const extractionKey = (sourceId: string, inputDigest: unknown) => `${sourceId}\n${String(inputDigest)}`;
+
+/** Every entity request of the listed fact rows' extractions, read in one query and grouped by extraction. */
+async function factExtractions(engine: BrainEngine, sourceIds: string[], rows: FailedWrite[]): Promise<Map<string, ExtractionRequest[]>> {
+  const extractions = new Map<string, ExtractionRequest[]>();
+  const digests = [...new Set(rows.filter(row => row.operation === 'extract_facts').map(row => String(row.intent.inputDigest)))];
+  if (!digests.length) return extractions;
+  for (const row of await engine.executeRaw<ExtractionRequest>(`SELECT source_id, intent->>'inputDigest' AS input_digest, slug, state, error_code, error_message,
+      intent->>'batchKey' AS batch_key FROM persistence_requests WHERE operation='extract_facts' AND source_id = ANY($1::text[])
+      AND NOT compacted AND intent IS NOT NULL AND intent->>'kind'='managed_facts_entity' AND intent->>'inputDigest' = ANY($2::text[])`, [sourceIds, digests])) {
+    const key = extractionKey(row.source_id, row.input_digest);
+    extractions.set(key, [...(extractions.get(key) ?? []), row]);
+  }
+  return extractions;
+}
+
+interface FailedWrite {
+  id: string; request_id: string; sequence: string; operation: string; source_id: string; slug: string; digest: string; state: string;
+  intent: Record<string, unknown>; authority: WriteAuthority; created_at: string; producer: string | null; error_code: string | null; page_id: string | null;
+  /** #6693: the refusal's recorded origin (`pending_import`, `sync_held`), when the receipt carries one. */
+  origin?: string | null;
+}
+type Disposition = 'replay' | 'already_written' | 'duplicate' | 'superseded' | 'unpinned_target' | 'file_database_drift';
+/** A replay bound to the page revision the preview saw (null: no live page). */
+interface ApprovedWrite extends FailedWrite { revision: string | null; selection: string[] }
+interface FailedWriteItem extends RepairItem { failed: ApprovedWrite; hash: string; last: boolean }
+
+function previewCommand(scope: RepairScope): string {
+  return `gbrain repair failed-writes${scope.source_ids.length === 1 ? ` --source ${scope.source_ids[0]}` : ''}`;
+}
+
+/**
+ * #7602: a refused fact request keeps its extracted facts. A page-triggered one (its job is keyed by the page write) is
+ * recovered by resetting that job once it is dead: its retry re-admits them at the entity page's current revision with
+ * no model call, once the cause clears. Only an extraction whose open entity requests are all moved-entity refusals (the
+ * entity walk) or all held-file refusals (the file walk) is re-admitted by one retry. A mixed extraction, a batch whose
+ * follow-ups were refused too, an entity page replaced since, a job that completed or is gone, a page write the job's
+ * own page check now skips (written again since, or a narrowed writer grant), a writer-guard refusal and a batch with
+ * no page write would replay the refusal or have no job to retry: those are extracted again. While the job still runs (a walk in
+ * progress leaves follow-ups open), an entity page that is still the admitted one is listed `pending:`.
+ */
+async function factsRecovery(engine: BrainEngine, write: FailedWrite, extractions: Map<string, ExtractionRequest[]>): Promise<string> {
+  const origin = (write.intent.origin as { slug?: string } | null | undefined)?.slug;
+  const job = typeof write.intent.originalRequestId === 'string' ? write.intent.originalRequestId : null;
+  const extractAgain = `re-extract: gbrain call extract_facts again on the current text of ${origin ?? 'the source turn'} with a new request_id (one model call)`;
+  if (!job || write.state !== 'conflict') return extractAgain;
+  const [page] = await engine.executeRaw<{ id: string }>('SELECT id::text FROM pages WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL', [write.source_id, write.slug]);
+  if (!page && write.page_id !== null) return `not recoverable: entity page ${write.slug} was deleted after these facts were admitted`;
+  if ((page?.id ?? null) !== write.page_id) return `${extractAgain}; entity page ${write.slug} was replaced after these facts were admitted, so a job retry replays the refusal`;
+  const key = factsAbsorbWriteKey(job);
+  const [run] = await engine.executeRaw<{ status: string; data: Record<string, unknown> }>("SELECT status, data FROM minion_jobs WHERE name='facts-absorb' AND idempotency_key=$1 ORDER BY id DESC LIMIT 1", [key]);
+  if (run && run.status !== 'dead' && run.status !== 'completed' && run.status !== 'cancelled') return `pending: its facts-absorb job (${key}) is ${run.status}; preview again once it ends`;
+  const open = (extractions.get(extractionKey(write.source_id, write.intent.inputDigest)) ?? []).filter(row => row.state !== 'committed');
+  if (!open.every(isEntityMovedRefusal) && !open.every(row => row.error_code === 'source_changed')) {
+    return `${extractAgain}; its extraction also holds refusals one job retry does not re-admit together`;
+  }
+  if (new Set(open.filter(row => row.slug === write.slug).map(row => row.batch_key)).size > MAX_FILE_REFUSAL_RETRIES) {
+    return `${extractAgain}; its follow-up batches were refused as well, so a job retry replays the refusal`;
+  }
+  if (run?.status !== 'dead') return `${extractAgain}; its facts-absorb job ${run ? `is ${run.status}` : 'is gone'}, so gbrain facts retry-dead has no dead job to reset`;
+  const source = await readFactsBackstopJobPage(engine, run.data);
+  if ('skipped' in source) {
+    return source.skipped === 'superseded' || source.skipped === 'page_missing'
+      ? `${extractAgain}; ${origin ?? 'the source page'} changed after the page write its facts-absorb job extracts, so a job retry skips it`
+      : `${extractAgain}; a job retry would skip the page write (${source.skipped}), so gbrain facts retry-dead cannot recover it`;
+  }
+  return `recover: ${factsRetryDeadCommand('--reset', key)} (the next facts_drain pass retries the page's facts-absorb job, which re-admits the retained facts without a model call${write.error_code === 'source_changed' ? ' once the file check passes' : ''})`;
+}
+
+/** The command that produces an owner-internal write again, from current content. */
+function producerCommand(producer: string, sourceId: string): string {
+  const parts = producer.split(':');
+  if (parts.some(part => part.startsWith('managed_sync') || part === 'managed_file_import')) return `gbrain sync --source ${sourceId} --no-pull --json`;
+  if (parts.includes('canonical_reconcile')) return `gbrain sources reconcile ${sourceId} --audit`;
+  if (parts.includes('managed_file_repair')) return `gbrain repair frontmatter --source ${sourceId} (a frontmatter repair) or gbrain repair fences --source ${sourceId} (a fence repair)`;
+  if (parts.includes('relink_facts')) return `gbrain facts relink --source ${sourceId} --dry-run`;
+  if (parts.includes('managed_maintenance_expire_captured_facts')) return `gbrain repair captured-facts --source ${sourceId}`;
+  if (parts.includes('managed_maintenance_restore_extractor_facts')) return `gbrain repair extractor-facts --source ${sourceId}`;
+  if (parts.includes('managed_maintenance_restore_redacted_facts')) return `gbrain repair redacted-facts --source ${sourceId}`;
+  if (parts.includes('managed_maintenance_conversation_facts')) return `gbrain extract-conversation-facts --source-id ${sourceId} --dry-run`;
+  return 'the next `gbrain dream` cycle (or autopilot) produces it again';
+}
+
+/** `facts` (the preview only) adds refused fact requests, without the ones a later request of the same extraction recovered. */
+async function failedWrites(engine: BrainEngine, sourceIds: string[], opts: { id?: string; facts?: boolean } = {}): Promise<FailedWrite[]> {
+  const { id, facts } = opts;
+  const rows = await engine.executeRaw<FailedWrite>(`SELECT r.id::text, r.request_id::text, r.sequence::text, r.operation, r.source_id, r.slug, r.digest, r.state, r.intent, r.authority,
+      to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS created_at, r.error_detail->>'origin' AS origin, r.error_code, r.page_id::text AS page_id,
+      CASE WHEN r.operation = ANY($2::text[]) AND NOT (r.operation='put_page' AND r.intent ? 'kind') THEN NULL
+        ELSE r.operation || COALESCE(':' || (r.intent->>'kind'), '') END AS producer
+    FROM persistence_requests r
+    WHERE r.source_id = ANY($1::text[]) AND NOT r.compacted AND r.intent IS NOT NULL AND (${GUARD_REFUSAL} OR ${DRIFT_REFUSAL}${facts ? ` OR ${FACTS_MOVED_REFUSAL}` : ''})
+      ${facts ? `AND NOT ${FACTS_RECOVERED}` : ''}
+      ${id ? 'AND r.id=$3::uuid' : ''}
+    ORDER BY r.sequence`, id ? [sourceIds, REPLAYABLE, id] : [sourceIds, REPLAYABLE]);
+  if (id) return rows;
+  // #6429: a replay this command submitted that was refused source_changed is itself a conflict row; the original
+  // write stays the candidate (its attempts are read through replayAttempt), so the attempt rows are not listed twice.
+  const replays = new Set<string>();
+  const requestIds = new Set(rows.map(row => row.request_id));
+  for (const row of rows) for (let attempt = 0; requestIds.has(replayId(row.id, attempt)); attempt++) replays.add(replayId(row.id, attempt));
+  return rows.filter(row => !replays.has(row.request_id));
+}
+
+/**
+ * #6429: the caller writes this command would still replay, counted per source, operation and refusal reason for
+ * doctor's `lost_caller_writes`, plus the refused receipts compaction already emptied (unreplayable) and (#6527) the
+ * retained ones the preview keeps for a reason SQL can decide (`not_replayable`). Distinct
+ * intents, so a caller's retry counts its write once; a refused replay attempt is the original write (its rows are
+ * dropped and its attempts walked as `disposition` does); a write whose replay or retry committed or whose page was
+ * later deleted (for put_page: written again) is not lost. Owner-produced writes are not counted: their producer
+ * runs them again. Reads no intents, and every read is one pass over the table, never one probe per candidate:
+ * doctor runs this on every call.
+ */
+export async function lostCallerWrites(engine: BrainEngine, sourceIds: string[]):
+Promise<{ lost: { source_id: string; operation: string; reason: 'source_changed' | 'writer_guard'; count: number }[]; compacted: number;
+  not_replayable: { unpinned_target: number; revision_superseded: number } }> {
+  type Lost = { id: string; request_id: string; source_id: string; slug: string; operation: string; digest: string; sequence: string; reason: 'source_changed' | 'writer_guard';
+    unpinned: boolean; stale_revision: boolean };
+  const caller = `r.operation = ANY($2::text[]) AND NOT (r.operation='put_page' AND r.intent ? 'kind')`;
+  const refused = `(${GUARD_REFUSAL} OR ${DRIFT_REFUSAL})`;
+  const [rows, [compacted]] = await Promise.all([
+    engine.executeRaw<Lost>(
+      `SELECT r.id::text, r.request_id::text, r.source_id, r.slug, r.operation, r.digest, r.sequence::text,
+        CASE WHEN r.state='conflict' THEN 'source_changed' ELSE 'writer_guard' END AS reason,
+        (r.operation='remember' AND jsonb_typeof(r.intent->'entity_slug') IS DISTINCT FROM 'string') AS unpinned,
+        (r.operation='put_page' AND jsonb_typeof(r.intent->'expected_revision')='string' AND r.intent->>'expected_revision' IS DISTINCT FROM
+          (SELECT p.knowledge_revision::text FROM pages p WHERE p.source_id=r.source_id AND p.slug=r.slug AND p.deleted_at IS NULL)) AS stale_revision
+      FROM persistence_requests r
+      WHERE r.source_id = ANY($1::text[]) AND NOT r.compacted AND r.intent IS NOT NULL AND ${refused} AND ${caller}
+      ORDER BY r.sequence`, [sourceIds, REPLAYABLE]),
+    // A compacted receipt keeps no intent, so an owner-produced put_page cannot be told from a caller's; remember and
+    // add_timeline_entry are always caller writes.
+    engine.executeRaw<{ count: number }>(
+      `SELECT count(*)::int AS count FROM persistence_requests r
+      WHERE r.source_id = ANY($1::text[]) AND r.compacted AND (${GUARD_REFUSAL} OR ${DRIFT_REFUSAL}) AND r.operation = ANY($2::text[])`,
+      [sourceIds, REPLAYABLE.filter(operation => operation !== 'put_page')]),
+  ]);
+  if (!rows.length) return { lost: [], compacted: Number(compacted?.count ?? 0), not_replayable: { unpinned_target: 0, revision_superseded: 0 } };
+  // Attempt rows this command submitted belong to their original (walked below), not to the listing.
+  const requestIds = new Set(rows.map(row => row.request_id));
+  const replays = new Set<string>();
+  for (const row of rows) for (let attempt = 0; requestIds.has(replayId(row.id, attempt)); attempt++) replays.add(replayId(row.id, attempt));
+  const originals = rows.filter(row => !replays.has(row.request_id));
+  // Supersession, set-based: per slug the newest committed removal and write, per (slug, digest) the newest committed same intent.
+  const slugs = [...new Set(originals.map(row => row.slug))];
+  const [bySlug, byDigest] = await Promise.all([
+    engine.executeRaw<{ source_id: string; slug: string; removal: string | null; write: string | null }>(
+      `SELECT c.source_id, c.slug, max(c.sequence) FILTER (WHERE c.operation = ANY($3::text[]))::text AS removal, max(c.sequence)::text AS write
+      FROM persistence_requests c WHERE c.source_id = ANY($1::text[]) AND c.slug = ANY($2::text[]) AND c.state='committed' GROUP BY c.source_id, c.slug`,
+      [sourceIds, slugs, PAGE_REMOVALS]),
+    engine.executeRaw<{ source_id: string; slug: string; digest: string; same: string }>(
+      `SELECT c.source_id, c.slug, c.digest, max(c.sequence)::text AS same FROM persistence_requests c
+      WHERE c.source_id = ANY($1::text[]) AND c.slug = ANY($2::text[]) AND c.digest = ANY($3::text[]) AND c.state='committed' GROUP BY c.source_id, c.slug, c.digest`,
+      [sourceIds, slugs, [...new Set(originals.map(row => row.digest))]]),
+  ]);
+  const later = (a: string | null | undefined, b: string) => a != null && BigInt(a) > BigInt(b);
+  const slugKey = (row: { source_id: string; slug: string }) => `${row.source_id}\0${row.slug}`;
+  const removalBy = new Map(bySlug.map(row => [slugKey(row), row.removal]));
+  const writeBy = new Map(bySlug.map(row => [slugKey(row), row.write]));
+  const sameBy = new Map(byDigest.map(row => [`${slugKey(row)}\0${row.digest}`, row.same]));
+  let pending = originals.filter(row => !later(sameBy.get(`${slugKey(row)}\0${row.digest}`), row.sequence)
+    && !later(removalBy.get(slugKey(row)), row.sequence) && !(row.operation === 'put_page' && later(writeBy.get(slugKey(row)), row.sequence)));
+  // Replay attempts whose row is not a refusal (committed, or still live): one read per attempt round, rounds are few.
+  const lost: Lost[] = [];
+  for (let attempt = 0; pending.length; attempt++) {
+    const states = new Map((await engine.executeRaw<{ request_id: string; state: string }>(
+      'SELECT request_id::text, state FROM persistence_requests WHERE request_id = ANY($1::uuid[])', [pending.map(row => replayId(row.id, attempt))])).map(row => [row.request_id, row.state]));
+    const next: Lost[] = [];
+    for (const row of pending) {
+      const state = states.get(replayId(row.id, attempt));
+      if (state === 'committed') continue;
+      if (state && isTerminal({ state: state as WriteRequest['state'] })) next.push(row);
+      else lost.push(row);
+    }
+    pending = next;
+  }
+  // #6527: the two classes the preview keeps out of its replay set that SQL decides (as `disposition` does): a remember
+  // whose subject was inferred (entity_slug absent or not a string) and a put_page whose page moved past the revision
+  // the caller read. The rest (duplicate, still-drifted file) need per-row or filesystem reads; the preview decides.
+  const unpinned = new Set<string>(), stale = new Set<string>();
+  const replayable = lost.filter(row => {
+    if (row.stale_revision) stale.add(`${row.source_id}\0${row.digest}`);
+    else if (row.unpinned) unpinned.add(`${row.source_id}\0${row.digest}`);
+    else return true;
+    return false;
+  });
+  const groups = new Map<string, { source_id: string; operation: string; reason: Lost['reason']; digests: Set<string> }>();
+  for (const row of replayable) {
+    const key = `${row.source_id}\0${row.operation}\0${row.reason}`;
+    const group = groups.get(key) ?? { source_id: row.source_id, operation: row.operation, reason: row.reason, digests: new Set<string>() };
+    group.digests.add(row.digest);
+    groups.set(key, group);
+  }
+  const sorted = [...groups.values()].sort((a, b) => a.source_id.localeCompare(b.source_id) || a.operation.localeCompare(b.operation) || a.reason.localeCompare(b.reason));
+  return { lost: sorted.map(group => ({ source_id: group.source_id, operation: group.operation, reason: group.reason, count: group.digests.size })), compacted: Number(compacted?.count ?? 0),
+    not_replayable: { unpinned_target: unpinned.size, revision_superseded: stale.size } };
+}
+
+async function pageRevision(engine: BrainEngine, sourceId: string, slug: string): Promise<string | null> {
+  const [page] = await engine.executeRaw<{ revision: string | null }>(
+    'SELECT knowledge_revision::text AS revision FROM pages WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL', [sourceId, slug]);
+  return page?.revision ?? null;
+}
+
+function replayId(failedId: string, attempt: number): string {
+  const h = digest(['failed-writes-replay-v1', failedId, attempt]);
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+/**
+ * The replay's request id: one per failed request and attempt, so a rerun after
+ * a crash resumes the same admission and a terminal failure gets a new id.
+ * `prior` is that attempt's request when it was already admitted.
+ */
+async function replayAttempt(engine: BrainEngine, failedId: string): Promise<{ id: string; prior: WriteRequest | null }> {
+  for (let attempt = 0; ; attempt++) {
+    const id = replayId(failedId, attempt);
+    const [prior] = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE request_id=$1::uuid', [id]);
+    if (!prior || prior.state === 'committed' || !isTerminal(prior)) return { id, prior: prior ?? null };
+  }
+}
+
+/** The newest replay attempt that ended without committing, or null. */
+async function lastFailedAttempt(engine: BrainEngine, failedId: string): Promise<WriteRequest | null> {
+  let last: WriteRequest | null = null;
+  for (let attempt = 0; ; attempt++) {
+    const [prior] = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE request_id=$1::uuid', [replayId(failedId, attempt)]);
+    if (!prior || prior.state === 'committed' || !isTerminal(prior)) return last;
+    last = prior;
+  }
+}
+
+/** W4.11: the reconcile step for a page whose file and database differ. */
+function driftDetail(sourceId: string, slug: string): string {
+  return `the page's file and database differ, so the replay was refused (source_changed); reconcile first: gbrain sources reconcile ${sourceId} ${slug} --preview, then run gbrain repair failed-writes again`;
+}
+
+/**
+ * #6429: whether the page's canonical file still differs from its database copy, the same check the replay's
+ * preparation applies. A reconcile that rewrites only the file leaves the page row untouched, so the row's
+ * `updated_at` alone cannot tell that the drift is gone. A page that no longer exists has no file to drift (the
+ * supersession rules below decide); without the owner binding on this host the drift is assumed to remain.
+ */
+async function stillDrifted(engine: BrainEngine, write: FailedWrite): Promise<boolean> {
+  const snapshot = await engine.readPageSnapshot(write.slug, { sourceId: write.source_id });
+  if (!snapshot) return false;
+  const binding = await getWorktreeBinding(engine, write.source_id);
+  if (!binding) return true;
+  try {
+    await prepareFileTarget(engine, { source_id: write.source_id, worktree_id: binding.worktree_id, slug: write.slug }, snapshot, null);
+    return false;
+  } catch (error) {
+    return !(error instanceof OperationError) || error.code === 'source_changed';
+  }
+}
+
+/** Why a caller write must not be replayed now, or `replay`. */
+async function disposition(engine: BrainEngine, write: FailedWrite): Promise<{ class: Disposition; detail?: string }> {
+  if ((await replayAttempt(engine, write.id)).prior?.state === 'committed') return { class: 'already_written', detail: 'replayed by gbrain repair failed-writes' };
+  const drifted = await lastFailedAttempt(engine, write.id);
+  if (drifted?.error_code === 'source_changed') {
+    const [written] = await engine.executeRaw<{ later: boolean }>(
+      'SELECT updated_at > $3::timestamptz AS later FROM pages WHERE source_id=$1 AND slug=$2', [write.source_id, write.slug, drifted.updated_at]);
+    if (!written?.later && await stillDrifted(engine, write)) return { class: 'file_database_drift', detail: driftDetail(write.source_id, write.slug) };
+  }
+  const replace = write.operation === 'put_page';
+  const [later] = await engine.executeRaw<{ state: string; operation: string; same_intent: boolean }>(
+    `SELECT c.state, c.operation, c.digest=r.digest AS same_intent FROM persistence_requests r JOIN persistence_requests c ON ${supersessionSql('r', 'c')}
+      WHERE r.id=$1::uuid ORDER BY ${supersessionOrderSql('r', 'c')} LIMIT 1`, [write.id]);
+  const found = dispositionOf(later);
+  if (found === 'already_written') return { class: 'already_written' };
+  if (found === 'duplicate') return { class: 'duplicate', detail: `a later request with the same intent is ${later!.state}` };
+  if (found === 'superseded') return { class: 'superseded', detail: `a later ${later!.operation} of this page is ${later!.state}` };
+  const read = write.intent.expected_revision;
+  if (replace && typeof read === 'string' && read !== await pageRevision(engine, write.source_id, write.slug)) {
+    return { class: 'superseded', detail: 'the page changed after the revision the caller read' };
+  }
+  if (write.operation === 'remember' && typeof write.intent.entity_slug !== 'string') {
+    return { class: 'unpinned_target', detail: 'the fact was saved unattributed; replaying would infer its subject again' };
+  }
+  return { class: 'replay' };
+}
+
+function item(write: ApprovedWrite, hash: string, last: boolean): FailedWriteItem {
+  return { cursor: { phase: 1, id: Number(write.sequence) }, source_id: write.source_id, slug: write.slug,
+    chars: typeof write.intent.content === 'string' ? write.intent.content.length : 0, action: `replay:${write.operation}`, failed: write, hash, last };
+}
+
+export const failedWritesRepair: RepairHandler = {
+  kind: 'failed-writes',
+  embeds: false,
+  async plan(engine, scope, after, opts): Promise<RepairPlan> {
+    const command = previewCommand(scope);
+    if (!opts?.apply) {
+      const rows = await failedWrites(engine, scope.source_ids, { facts: true });
+      const extractions = await factExtractions(engine, scope.source_ids, rows);
+      const residuals: Record<string, number> = {};
+      const listing: NonNullable<RepairPlan['listing']> = [];
+      const producers = new Map<string, string>();
+      const replay: ApprovedWrite[] = [];
+      for (const write of rows) {
+        const label = `${write.source_id}:${write.slug} ${write.operation} (${write.state} ${write.created_at}, request ${write.id})`;
+        if (write.producer) {
+          residuals[`producer_owned:${write.producer}`] = (residuals[`producer_owned:${write.producer}`] ?? 0) + 1;
+          const facts = write.operation === 'extract_facts';
+          const run = facts ? await factsRecovery(engine, write, extractions) : producerCommand(write.producer, write.source_id);
+          producers.set(`${write.producer} in ${write.source_id}`, facts ? 'each listed request names the command that recovers its facts' : run);
+          listing.push({ item: label, class: 'producer_owned', detail: facts ? run : `re-run: ${run}` });
+          continue;
+        }
+        const verdict = await disposition(engine, write);
+        if (verdict.class === 'replay') replay.push({ ...write, revision: await pageRevision(engine, write.source_id, write.slug), selection: scope.source_ids });
+        else residuals[verdict.class] = (residuals[verdict.class] ?? 0) + 1;
+        listing.push({ item: label, class: verdict.class, ...(verdict.detail ? { detail: verdict.detail } : {}) });
+      }
+      const sources = await engine.executeRaw<{ id: string; incarnation: string }>(
+        'SELECT id, incarnation::text AS incarnation FROM sources WHERE id=ANY($1::text[]) ORDER BY id', [scope.source_ids]);
+      const hash = previewHash({ kind: 'failed-writes-v1', brain_id: scope.brain_id, sources, selection: { source_ids: scope.source_ids },
+        replay: replay.map(write => ({ id: write.id, digest: write.digest, revision: write.revision })) });
+      if (replay.length) await saveApprovedSet<ApprovedWrite>(engine, { command: 'failed-writes', hash }, replay);
+      return { items: replay.map((write, index) => item(write, hash, index === replay.length - 1)), preview_hash: hash, residuals, listing,
+        warnings: [...[...producers].map(([what, run]) => `${what}: produced by gbrain itself, not replayed here; ${run}`),
+          ...(replay.length ? [`This preview recorded an approval checkpoint for its replay set (preview ${hash.slice(0, 12)}), which --apply --expect reads; no page content changed.`] : [])] };
+    }
+    if (!opts.expect) {
+      throw new OperationError('invalid_params', 'gbrain repair failed-writes --apply replays only the set a preview printed.',
+        `Preview first: ${command} — show the user the listing, then run the apply command it prints: ${command} --apply --expect <preview-hash>`,
+        'docs/guides/repair.md#failed-writes');
+    }
+    const approved = await loadApprovedSet<ApprovedWrite>(engine, { command: 'failed-writes', hash: opts.expect, previewCommand: command,
+      emptyHash: async () => previewHash({ kind: 'failed-writes-v1', brain_id: scope.brain_id, sources: (await engine.executeRaw<{ id: string; incarnation: string }>('SELECT id, incarnation::text AS incarnation FROM sources WHERE id=ANY($1::text[]) ORDER BY id', [scope.source_ids])), selection: { source_ids: scope.source_ids }, replay: [] }) });
+    if (approved.items.some(write => JSON.stringify(write.selection) !== JSON.stringify(scope.source_ids))) throw previewChangedError(opts.expect, command);
+    const items = approved.items.map((write, index) => item(write, opts.expect!, index === approved.items.length - 1));
+    return { items: items.filter(entry => afterCursor(entry.cursor, after)), preview_hash: opts.expect, residuals: {} };
+  },
+  async apply(ctx, entry): Promise<RepairItemOutcome> {
+    const { failed, hash, last } = entry as FailedWriteItem;
+    const outcome = await replay(ctx, failed);
+    if (last) await clearApprovedSet(ctx.engine, { command: 'failed-writes', hash });
+    return outcome;
+  },
+};
+
+/** The subagent job a stored restricted authority names: wave 10's delegatedJobId, else a legacy `wiki/agents/<id>/*` namespace. */
+function recordedSubagentId(authority: WriteAuthority): number | undefined {
+  if (authority.delegatedJobId !== undefined) return authority.delegatedJobId;
+  const [only, ...rest] = authority.delegatedPrefixes ?? [];
+  const id = rest.length ? undefined : /^wiki\/agents\/([1-9]\d*)\/\*$/.exec(only ?? '')?.[1];
+  return id && Number.isSafeInteger(Number(id)) ? Number(id) : undefined;
+}
+
+/**
+ * The original caller's trust lane: a remote caller's write is prepared as a
+ * remote write, within its holder and namespace limits, under its stored
+ * authority (#5994: `replayAuthority`, re-authorized live). A restricted
+ * write gets back the subagent identity it recorded; a legacy sandboxed
+ * subagent write (no allow-list) replays on the legacy namespace path.
+ */
+function laneContext(ctx: OperationContext, authority: WriteAuthority): OperationContext {
+  if (!authority.remote) return { ...ctx, remote: false, replayAuthority: authority };
+  const lane: OperationContext = { ...ctx, remote: true, replayAuthority: authority, takesHoldersAllowList: authority.takesHolders ? [...authority.takesHolders] : ['world'] };
+  if (!authority.restrictedNamespace) return lane;
+  const subagentId = recordedSubagentId(authority);
+  if (authority.databaseOnlyReason === 'subagent_sandbox' && subagentId !== undefined) return { ...lane, viaSubagent: true, subagentId };
+  return { ...lane, viaSubagent: true, allowedSlugPrefixes: [...(authority.delegatedPrefixes ?? [])], ...(subagentId === undefined ? {} : { subagentId }) };
+}
+
+/** The caller's params, without what preparation added, bound to the previewed page revision. */
+async function replayParams(ctx: OperationContext, write: ApprovedWrite, requestId: string): Promise<{ params: Record<string, unknown> } | { refused: RepairItemOutcome }> {
+  const params: Record<string, unknown> = { ...write.intent, request_id: requestId };
+  if (write.authority.remote) for (const key of REMOTE_PREPARED_KEYS) delete params[key];
+  if (write.operation === 'remember') {
+    const target = String(write.intent.entity_slug);
+    for (const key of REMEMBER_PREPARED_KEYS) delete params[key];
+    if ((await resolveEntitySlugWithSource(ctx.engine, write.source_id, target))?.slug !== target) {
+      return { refused: { applied: false, outcome: 'changed_since_preview', reason: `the fact's subject ${target} no longer resolves to itself` } };
+    }
+    params.entity = target;
+    // #6693: the fact keeps the dates its first admission gave it (valid_from defaults to the admission time, a ttl to an absolute expiry).
+    if (typeof write.intent.valid_from === 'string') params.valid_from = write.intent.valid_from;
+    if (typeof write.intent.valid_until === 'string') params.ttl = write.intent.valid_until;
+    else delete params.ttl;
+    return { params };
+  }
+  if (write.operation === 'put_page') {
+    delete params.force;
+    delete params.expected_revision;
+    if (write.revision) params.expected_revision = write.revision;
+  }
+  return { params };
+}
+
+async function replay(ctx: OperationContext, failed: ApprovedWrite): Promise<RepairItemOutcome> {
+  const [live] = await failedWrites(ctx.engine, [failed.source_id], { id: failed.id });
+  if (!live || live.digest !== failed.digest) return { applied: false, outcome: 'changed_since_preview', reason: 'the failed request was compacted or changed' };
+  const lane = laneContext(ctx, live.authority);
+  await initializeLocalPersistence(lane);
+  const attempt = await replayAttempt(ctx.engine, failed.id);
+  if (attempt.prior?.state === 'committed') return { applied: false, outcome: 'already_written' };
+  if (attempt.prior && principalKey({ kind: attempt.prior.principal_kind, id: attempt.prior.principal_id }) !== principalKey(await requestPrincipalForContext(lane))) {
+    return { applied: false, outcome: 'pending_elsewhere', reason: `replay request ${attempt.id} is ${attempt.prior.state} under another writer` };
+  }
+  if (!attempt.prior) {
+    const verdict = await disposition(ctx.engine, live);
+    if (verdict.class !== 'replay') return { applied: false, outcome: 'changed_since_preview', reason: verdict.detail ?? verdict.class };
+    if (live.operation === 'put_page' && await pageRevision(ctx.engine, failed.source_id, failed.slug) !== failed.revision) {
+      return { applied: false, outcome: 'changed_since_preview', reason: 'the page changed since the preview' };
+    }
+  }
+  const [stored] = await ctx.engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid', [failed.id]);
+  try { await authorizeStoredRequest(ctx.engine, stored); } catch (error) {
+    if (error instanceof OperationError) return { applied: false, outcome: 'authority_revoked', reason: `${error.code}: ${error.message}` };
+    throw error;
+  }
+  const prepared = await replayParams(lane, failed, attempt.id);
+  if ('refused' in prepared) return prepared.refused;
+  const { params } = prepared;
+  try {
+    // #5969 (D3): the Timeline section the first admission read from the caller's content, before normalization.
+    const { timeline_section: timelineSection, ...replayed } = params;
+    if (live.operation === 'remember') await submitRememberMutation(lane, params);
+    else await submitPageMutation(lane, { operation: live.operation, params: replayed, ...(isTimelineSection(timelineSection) ? { timelineSection } : {}) });
+  } catch (error) {
+    if (error instanceof OperationError && error.code === 'source_changed') {
+      return { applied: false, outcome: 'file_database_drift', reason: driftDetail(failed.source_id, failed.slug) };
+    }
+    if (error instanceof OperationError && !['write_pending', 'owner_unavailable', 'writer_lock_unavailable', 'writer_busy'].includes(error.code)) {
+      return { applied: false, outcome: ['revision_conflict', 'revision_required'].includes(error.code) ? 'conflict' : 'refused', reason: `${error.code}: ${error.message}` };
+    }
+    throw error;
+  }
+  return { applied: true, outcome: 'replayed' };
+}
+
+/** #6693: the most caller remembers one sync run replays, and the time it may spend on them. */
+export const IMPORT_REPLAY_LIMIT = 50;
+export const IMPORT_REPLAY_BUDGET_MS = 30_000;
+
+/** #6693: what one post-sync replay pass did; counts only, never a slug or claim. */
+export interface ImportReplayReport {
+  /** Refused remembers of the source whose page awaited import or was held by sync, not yet written. */
+  examined: number;
+  replayed: number;
+  /** Their page still differs from its file (not imported yet, or still held): kept for a later sync. */
+  waiting: number;
+  /** Not replayed: written or superseded since, unpinned, or the replay was refused (authority, conflict); `gbrain repair failed-writes` lists each. */
+  skipped: number;
+  /** Left for the next sync by the per-run limit or time budget. */
+  remaining: number;
+}
+
+/**
+ * #6693 (D7): after a managed sync, replay once each caller `remember` that was
+ * refused because its page's file held a committed change sync had not imported
+ * (`pending_import`) or was held by sync (`sync_held`), now that the page matches
+ * its file again. Same path as `gbrain repair failed-writes --apply`: the
+ * disposition rules, the original trust lane, a live authority re-check and a
+ * request id derived from the refused request, so two passes (or a pass and a
+ * manual apply) admit one request. A page still drifted is skipped before any
+ * admission, so a pass adds no receipt for it. `put_page` is never replayed here:
+ * its full body would replace the change the sync just imported.
+ */
+export async function replayImportedRemembers(ctx: OperationContext, sourceId: string,
+  opts: { limit?: number; budgetMs?: number; now?: () => number } = {}): Promise<ImportReplayReport> {
+  const now = opts.now ?? Date.now;
+  const deadline = now() + (opts.budgetMs ?? IMPORT_REPLAY_BUDGET_MS);
+  const limit = opts.limit ?? IMPORT_REPLAY_LIMIT;
+  const candidates = (await failedWrites(ctx.engine, [sourceId])).filter(write => write.operation === 'remember' && write.producer === null
+    && (write.origin === PENDING_IMPORT || write.origin === SYNC_HELD));
+  const report: ImportReplayReport = { examined: 0, replayed: 0, waiting: 0, skipped: 0, remaining: 0 };
+  for (const [index, write] of candidates.entries()) {
+    if (report.replayed >= limit || now() >= deadline) { report.remaining = candidates.length - index; break; }
+    const verdict = await disposition(ctx.engine, write);
+    // A replay that committed (or a later write of the same fact) settles the receipt; it stays as history only.
+    if (verdict.class === 'already_written') continue;
+    report.examined++;
+    if (verdict.class !== 'replay') { report.skipped++; continue; }
+    if (await stillDrifted(ctx.engine, write)) { report.waiting++; continue; }
+    const outcome = await replay(ctx, { ...write, revision: await pageRevision(ctx.engine, write.source_id, write.slug), selection: [sourceId] });
+    if (outcome.applied) report.replayed++;
+    else if (outcome.outcome === 'file_database_drift') report.waiting++;
+    else report.skipped++;
+  }
+  return report;
+}

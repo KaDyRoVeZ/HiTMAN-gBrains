@@ -1,0 +1,801 @@
+/**
+ * ai-sdk LanguageModelV2 implementation that dispatches via the `claude --print`
+ * CLI subprocess. Used by the `claude-cli` recipe to route gateway.toolLoop /
+ * gateway.chat calls through Claude Code's OAuth session instead of the
+ * Anthropic SDK + ANTHROPIC_API_KEY.
+ *
+ * Per-call routing is the contract: the gateway resolves the model string
+ * to this recipe based on the `claude-cli:` prefix, instantiates one of
+ * these objects per modelId, and dispatches doGenerate. Sibling subagent
+ * jobs with `litellm:gpt-5.4` continue routing through litellm-proxy in
+ * the same worker; no env-var switch, no global state.
+ *
+ * Tool use is supported via system-prompt-instructed JSON emission:
+ *   The recipe injects a fenced instruction block into the system prompt
+ *   that teaches the model the `<use_tools>[{name,input}, ...]</use_tools>`
+ *   emission format (ids are gbrain-minted, never model-authored — #4155). The adapter parses those blocks back into ai-sdk
+ *   `tool-call` content parts. Parallel tool calls (multiple entries in
+ *   the JSON array) round-trip cleanly — this is the case that breaks
+ *   on the codex-proxy / litellm GPT-5.x bridge today.
+ *
+ * Context isolation:
+ *   The subprocess is spawned from a dedicated tmpdir so claude-cli's
+ *   CLAUDE.md auto-discovery has no local files to find. `--system-prompt`
+ *   replaces the default system prompt; `--disable-slash-commands` skips
+ *   skill resolution. User-level ~/.claude/CLAUDE.md still loads because
+ *   the only way to skip it is `--bare`, which forces ANTHROPIC_API_KEY
+ *   auth and defeats the whole point of this provider. The ~42k cached
+ *   tokens from user-level instructions are accepted as a cost-trivial
+ *   trade-off on the subscription path. #4119: when those user-level
+ *   instructions must NOT leak into a measurement (SkillOpt rollouts),
+ *   set GBRAIN_CLAUDE_CLI_HERMETIC_CONFIG — see resolveHermeticConfigDir.
+ *
+ * doStream is not yet implemented; the model declares no streaming. Callers
+ * (gateway.toolLoop primarily) use doGenerate.
+ */
+import { randomUUIDv7 } from 'bun';
+import { spawn, spawnSync } from '../../spawn.ts';
+import { mkdirSync } from 'node:fs';
+import {
+  claudeCliConfigDir,
+  claudeCliCwdDir,
+  sweepDeadClaudeCliScratchDirs,
+} from './claude-cli-scratch.ts';
+import { continuationUnprovenMetadata, resolveClaudeCliAnswer } from './claude-cli-continuation.ts';
+import type {
+  LanguageModelV2,
+  LanguageModelV2CallOptions,
+  LanguageModelV2Content,
+  LanguageModelV2FunctionTool,
+  LanguageModelV2Prompt,
+  LanguageModelV2Message,
+  LanguageModelV2ProviderDefinedTool,
+  SharedV2ProviderMetadata,
+} from '@ai-sdk/provider';
+
+function claudeBin(): string {
+  return process.env.GBRAIN_CLAUDE_CLI_BIN ?? 'claude';
+}
+// #4472: the per-PID dir names + the transcript-fingerprint predicate live in
+// claude-cli-scratch.ts so transcript discovery can exclude the sessions these
+// subprocess cwds mint under ~/.claude/projects/ without importing this module.
+const CLAUDE_CWD = claudeCliCwdDir();
+let cwdEnsured = false;
+function ensureCleanCwd(): string {
+  if (!cwdEnsured) {
+    // #4472: the per-PID naming leaks one scratch dir per crashed/killed
+    // gbrain process forever — sweep dead-PID leftovers once per process at
+    // provider init. Best-effort: a sweep failure never breaks a chat call.
+    try { sweepDeadClaudeCliScratchDirs(); } catch { /* best-effort */ }
+    mkdirSync(CLAUDE_CWD, { recursive: true });
+    cwdEnsured = true;
+  }
+  return CLAUDE_CWD;
+}
+
+// #4119 — opt-in hermetic config dir for the child. See resolveHermeticConfigDir.
+const CLAUDE_HERMETIC_CONFIG = claudeCliConfigDir();
+let hermeticEnsured = false;
+/**
+ * Resolve the CLAUDE_CONFIG_DIR the child should run with when
+ * GBRAIN_CLAUDE_CLI_HERMETIC_CONFIG is set (#4119). Returns null when the
+ * knob is unset/off — the child then inherits the user's real config dir
+ * (today's behavior). `1`/`true` → a per-process empty tmpdir; any other
+ * non-empty value is used verbatim as the config-dir path.
+ *
+ * Opt-in, NOT default: the config dir also holds the CLI's session
+ * credentials, so the empty-dir form logs the child out wherever the CLI
+ * reads its session from the config dir (observed on macOS with Claude Code
+ * 2.1.x too — #4741; nothing here seeds or looks up credential material).
+ * For hermetic-with-auth use the explicit-path form with a pre-seeded config.
+ * SkillOpt runs that need hermetic measurements (no user-level CLAUDE.md /
+ * settings.json / hooks bleeding into rollouts) flip it deliberately — see
+ * docs/guides/skillopt.md, "Hermetic claude-cli rollouts".
+ */
+export function resolveHermeticConfigDir(
+  raw: string | undefined = process.env.GBRAIN_CLAUDE_CLI_HERMETIC_CONFIG,
+): string | null {
+  const v = raw?.trim();
+  if (!v || v === '0' || v.toLowerCase() === 'false') return null;
+  if (v === '1' || v.toLowerCase() === 'true') {
+    if (!hermeticEnsured) {
+      mkdirSync(CLAUDE_HERMETIC_CONFIG, { recursive: true });
+      hermeticEnsured = true;
+    }
+    return CLAUDE_HERMETIC_CONFIG;
+  }
+  return v;
+}
+
+/** Parsed shape of `claude --print --output-format json`. */
+interface ClaudeJsonResult {
+  type: 'result';
+  subtype: 'success' | string;
+  is_error: boolean;
+  result: string;
+  stop_reason: string | null;
+  session_id: string;
+  num_turns: number;
+  /** HTTP status of the underlying API failure (e.g. 429 on a spend/rate limit). */
+  api_error_status?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
+}
+
+/**
+ * Typed failure for a `claude --print` run that reported an error. Carries the
+ * API HTTP status (`apiErrorStatus`, e.g. 429 on a spend/rate limit) and the
+ * subprocess exit code so callers can branch on the failure class instead of
+ * regexing a raw stderr/stdout blob.
+ */
+export class ClaudeCliProcessError extends Error {
+  readonly apiErrorStatus: number | undefined;
+  readonly exitCode: number | undefined;
+
+  constructor(message: string, opts: { apiErrorStatus?: number; exitCode?: number } = {}) {
+    super(message);
+    this.name = 'ClaudeCliProcessError';
+    this.apiErrorStatus = opts.apiErrorStatus;
+    this.exitCode = opts.exitCode;
+  }
+}
+
+/** The result envelope plus the session's event array when stdout carried one (`--verbose`, #6791). */
+type ClaudeRun = ClaudeJsonResult & { events: readonly unknown[] | null };
+
+type EnvelopeParse =
+  | { ok: true; envelope: ClaudeRun }
+  | { ok: false; reason: 'not-json'; error: unknown }
+  | { ok: false; reason: 'no-result-event' };
+
+/**
+ * Unwrap `--output-format json` stdout into the result envelope and the event
+ * array it came in. `runClaude` passes `--verbose` (#6791), so the CLI emits
+ * [{type:"system",subtype:"init",...}, ..., {type:"result",...}]; the bare
+ * result object (events null) is still accepted. The array shape was verified on
+ * CLI 2.1.145; that it carries every assistant message, in the 2.1.296 bundle.
+ */
+function parseResultEnvelope(stdout: string): EnvelopeParse {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (error) {
+    return { ok: false, reason: 'not-json', error };
+  }
+  const events = Array.isArray(parsed) ? parsed : null;
+  if (Array.isArray(parsed)) {
+    const resultEvent = parsed.find(
+      (ev): ev is ClaudeJsonResult =>
+        !!ev && typeof ev === 'object' && (ev as { type?: unknown }).type === 'result',
+    );
+    if (!resultEvent) {
+      return { ok: false, reason: 'no-result-event' };
+    }
+    parsed = resultEvent;
+  }
+  // JSON.parse accepts bare primitives (null / numbers / strings); none of
+  // them is a result envelope, and letting one through would make the
+  // envelope field reads throw inside the subprocess close callback.
+  if (!parsed || typeof parsed !== 'object') {
+    return { ok: false, reason: 'not-json', error: new Error('top-level JSON value is not an object') };
+  }
+  return { ok: true, envelope: { ...(parsed as ClaudeJsonResult), events } };
+}
+
+/**
+ * Build the ClaudeCliProcessError for an error-reporting result envelope,
+ * surfacing `api_error_status` + the human-readable `result` message instead of
+ * an opaque blob.
+ */
+/**
+ * #6523: Claude Code reports a response that hit CLAUDE_CODE_MAX_OUTPUT_TOKENS
+ * (the cap #6424 forwards, or the CLI's own default) as an error envelope,
+ * not as a success with `stop_reason: 'max_tokens'`:
+ *   "API Error: Claude's response exceeded the 2048 output token maximum. To
+ *    configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS
+ *    environment variable."
+ * Rejecting on it hid the cap from every caller that escalates on `length`
+ * (loops_extract 2048 → 8192, facts/extract 1× → 2×), so the minion queue
+ * retried the same capped call and the job died. The match is the anchored
+ * prefix only: the trailing advice has already changed wording once, the
+ * reported cap may be the default rather than the forwarded one, and the exit
+ * code varies by CLI version. A quoted prefix mid-answer, a success envelope,
+ * a non-string result or an envelope carrying an API status never match.
+ */
+const OUTPUT_CAP_RE = /^API Error: Claude's response exceeded the \d+ output token maximum\b/;
+
+function isOutputCapEnvelope(envelope: ClaudeJsonResult): boolean {
+  return envelope.type === 'result'
+    && envelope.is_error === true
+    && envelope.api_error_status === undefined
+    && typeof envelope.result === 'string'
+    && OUTPUT_CAP_RE.test(envelope.result);
+}
+
+/** The cap envelope as the success the API would have returned: no text, `max_tokens`, usage as reported. */
+function outputCapAsLength<T extends ClaudeJsonResult>(envelope: T): T {
+  return { ...envelope, is_error: false, result: '', stop_reason: 'max_tokens' };
+}
+
+function envelopeError(envelope: ClaudeJsonResult, exitCode: number | undefined): ClaudeCliProcessError {
+  const status = typeof envelope.api_error_status === 'number' ? envelope.api_error_status : undefined;
+  const detail = envelope.result || envelope.subtype;
+  const message = status !== undefined
+    ? `claude-cli API error ${status}: ${detail}`
+    : `claude-cli reported error: ${detail}`;
+  return new ClaudeCliProcessError(message, { apiErrorStatus: status, exitCode });
+}
+
+/**
+ * Build the system-prompt addendum that teaches the model the
+ * `<use_tools>...</use_tools>` emission format. Returns the empty string
+ * when no tools are registered for this turn so the model gets a normal
+ * text-completion prompt without protocol noise.
+ */
+function buildToolUseInstructions(
+  tools: ReadonlyArray<LanguageModelV2FunctionTool | LanguageModelV2ProviderDefinedTool> | undefined,
+): string {
+  if (!tools || tools.length === 0) return '';
+
+  const functionTools = tools.filter((t): t is LanguageModelV2FunctionTool => t.type === 'function');
+  if (functionTools.length === 0) return '';
+
+  const toolSpecs = functionTools.map(t => ({
+    name: t.name,
+    description: t.description ?? '',
+    input_schema: t.inputSchema ?? { type: 'object', properties: {} },
+  }));
+
+  return [
+    '',
+    '## Tool Use Protocol',
+    '',
+    'You have access to these tools:',
+    '',
+    '```json',
+    JSON.stringify(toolSpecs, null, 2),
+    '```',
+    '',
+    'To call one or more tools in this turn, emit EXACTLY ONE block of this form, ' +
+      'with no other text outside the block on its own lines:',
+    '',
+    '<use_tools>',
+    '[',
+    '  {"name": "<tool name>", "input": <input object matching the tool\'s input_schema>}',
+    ']',
+    '</use_tools>',
+    '',
+    'Multiple tool calls go in the array. Tool results are returned to you on the ' +
+      'next turn as [tool_result <text>] entries. You may then call more tools or emit a final response.',
+    '',
+    'When you are ready to give a final answer instead of calling tools, respond with prose text only — ' +
+      'do not include a <use_tools> block in that case.',
+    '',
+  ].join('\n');
+}
+
+/**
+ * Render the ai-sdk message array into a single text prompt for `claude --print`
+ * stdin. System messages are extracted up-front and concatenated into the
+ * `--system-prompt` flag value. Tool calls and tool results are rendered as
+ * placeholders so the model sees the conversation in a coherent shape even
+ * though the adapter does not natively round-trip tool calls through claude-cli.
+ */
+function renderPrompt(prompt: LanguageModelV2Prompt): { systemText: string; userPrompt: string } {
+  const systemParts: string[] = [];
+  const convo: string[] = [];
+
+  for (const msg of prompt as ReadonlyArray<LanguageModelV2Message>) {
+    if (msg.role === 'system') {
+      systemParts.push(msg.content);
+      continue;
+    }
+    if (msg.role === 'user') {
+      const text = msg.content
+        .map(p => {
+          if (p.type === 'text') return p.text;
+          // File parts get a stub — multimodal is not supported via subprocess yet.
+          if (p.type === 'file') return `[file ${p.mediaType ?? 'unknown'}]`;
+          return '';
+        })
+        .filter(s => s.length > 0)
+        .join('\n');
+      if (text) convo.push(`User: ${text}`);
+      continue;
+    }
+    if (msg.role === 'assistant') {
+      const rendered = msg.content
+        .map(p => {
+          if (p.type === 'text') return p.text;
+          if (p.type === 'reasoning') return ''; // dropped on replay
+          if (p.type === 'tool-call') {
+            // #6236: the V2 prompt's input is an object; a template literal rendered it as [object Object].
+            return `[tool_use ${p.toolName}(${typeof p.input === 'string' ? p.input : JSON.stringify(p.input)})]`;
+          }
+          if (p.type === 'tool-result') {
+            const out = typeof p.output === 'string' ? p.output : JSON.stringify(p.output);
+            return `[tool_result ${out}]`;
+          }
+          return '';
+        })
+        .filter(s => s.length > 0)
+        .join('\n');
+      if (rendered) convo.push(`Assistant: ${rendered}`);
+      continue;
+    }
+    if (msg.role === 'tool') {
+      const rendered = msg.content
+        .map(p => {
+          const out = typeof p.output === 'string' ? p.output : JSON.stringify(p.output);
+          return `[tool_result ${out}]`;
+        })
+        .join('\n');
+      if (rendered) convo.push(`User: ${rendered}`);
+      continue;
+    }
+  }
+
+  return { systemText: systemParts.join('\n'), userPrompt: convo.join('\n\n') };
+}
+
+/** Oldest claude CLI that accepts every flag `runClaude` passes (probed:
+ * 2.0.59 rejects `--disable-slash-commands`, 2.0.60 accepts the full argv). */
+export const MIN_CLAUDE_CLI_VERSION = '2.0.60';
+
+/** The CLI's argument parser rejected a flag (`error: unknown option '--x'`). */
+export function isUnknownOptionError(stderr: string): boolean {
+  return /\bunknown option\b/i.test(stderr);
+}
+
+export function oldClaudeCliMessage(version: string | null): string {
+  return `claude CLI ${MIN_CLAUDE_CLI_VERSION} or newer required (found ${version ?? 'an unknown version'}); upgrade Claude Code`;
+}
+
+/** `claude --version`'s version number, or null. Only called after a failed
+ * run, so the extra spawn never sits on the success path. */
+function claudeCliVersion(env: NodeJS.ProcessEnv): string | null {
+  const r = spawnSync(claudeBin(), ['--version'], { encoding: 'utf8', timeout: 5_000, env });
+  return /\d+\.\d+\.\d+/.exec(typeof r.stdout === 'string' ? r.stdout : '')?.[0] ?? null;
+}
+
+/**
+ * #6918: Claude Code thinks by default on Claude 5 models, and the API needs
+ * thinking.budget_tokens of at least 1024 and below max_tokens, so a call
+ * capped at 1024 output tokens or fewer runs with thinking off.
+ */
+export const CLAUDE_THINKING_BUDGET_FLOOR = 1024;
+
+export function thinkingDisabledBelowFloor(maxOutputTokens: number | undefined): boolean {
+  return typeof maxOutputTokens === 'number' && Number.isInteger(maxOutputTokens) && maxOutputTokens > 0
+    && maxOutputTokens <= CLAUDE_THINKING_BUDGET_FLOOR;
+}
+
+/**
+ * Spawn `claude --print` with the contamination-suppression flags and return
+ * the parsed `--output-format json` envelope. Aborts propagate to SIGTERM on
+ * the child.
+ */
+function runClaude(
+  systemPrompt: string,
+  userPrompt: string,
+  model: string,
+  signal?: AbortSignal,
+  maxOutputTokens?: number,
+): Promise<ClaudeRun> {
+  return new Promise((resolve, reject) => {
+    // #6424: forward the call's output cap. The inline --settings env sits
+    // above the user's settings.json env block, so both carry it.
+    const outputCap = typeof maxOutputTokens === 'number' && Number.isInteger(maxOutputTokens) && maxOutputTokens > 0
+      ? String(maxOutputTokens)
+      : undefined;
+    const thinkingOff = thinkingDisabledBelowFloor(maxOutputTokens);
+    const settings = outputCap
+      ? JSON.stringify({ disableAllHooks: true, env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: outputCap, ...(thinkingOff ? { MAX_THINKING_TOKENS: '0' } : {}) } })
+      : '{"disableAllHooks":true}';
+    const args = [
+      '--print',
+      // #6791: --verbose turns the json output into the session's event
+      // array, the only record of the segments before an automatic
+      // continuation (the envelope's result holds the last one).
+      '--output-format', 'json', '--verbose',
+      '--model', model,
+      '--disable-slash-commands',
+      // Agent isolation: this subprocess must behave like a raw LLM, not a
+      // full Claude Code agent. `--tools ""` disables every built-in tool
+      // (Bash/Read/WebSearch/...); `--strict-mcp-config` ignores all user-level
+      // MCP servers (without it, each call would boot the user's MCP servers —
+      // including gbrain's own MCP → recursion + PGLite single-writer lock
+      // contention). Verified against claude CLI 2.1.145 --help.
+      '--tools', '',
+      '--strict-mcp-config',
+      // #5820: the child must not run the user's Claude Code hooks — gbrain's
+      // own Stop hook would bank this call's prompt as a "conversation" and
+      // extracting it spawns another call. Unlike --bare this keeps the
+      // subscription login (credentials are not settings). Accepted by every
+      // CLI that accepts the flags above.
+      '--settings', settings,
+    ];
+    if (systemPrompt) {
+      args.push('--system-prompt', systemPrompt);
+    }
+    // Env scrub: guarantee the CLI authenticates via its own OAuth session
+    // (subscription), never via an inherited API key. Without this, an
+    // ANTHROPIC_API_KEY in gbrain's env (the exact setup this recipe is meant
+    // to replace) silently flips billing to per-token API usage.
+    //
+    // Also scrub the CLAUDE_CODE_USE_* backend-switch flags: Bedrock, Vertex
+    // AI, Mantle, Microsoft Foundry, and Claude Platform on AWS are each
+    // gated by one of these, take priority over subscription OAuth when set,
+    // and route billing through a cloud account instead. Clearing the switch
+    // is sufficient — provider-specific creds (AWS_*, ANTHROPIC_VERTEX_*,
+    // ANTHROPIC_FOUNDRY_*, ANTHROPIC_AWS_*, ...) are inert without it.
+    const env = { ...process.env };
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    delete env.ANTHROPIC_BASE_URL;
+    // Prefix wipe, not a denylist (review hardening): the backend-switch
+    // family grows one CLAUDE_CODE_USE_* flag per new cloud backend, and any
+    // future switch inherited from gbrain's env would silently re-route the
+    // child's billing. Subscription-only is the recipe's contract.
+    for (const k of Object.keys(env)) {
+      if (k.startsWith('CLAUDE_CODE_USE_')) delete env[k];
+    }
+    // #4119 opt-in hermetic config: point the child's CLAUDE_CONFIG_DIR at an
+    // isolated directory so user-level ~/.claude state (CLAUDE.md memory,
+    // settings.json, hooks) can't leak into measurements. Off by default —
+    // see resolveHermeticConfigDir for the auth caveat that makes it opt-in.
+    const hermeticConfigDir = resolveHermeticConfigDir();
+    if (hermeticConfigDir) env.CLAUDE_CONFIG_DIR = hermeticConfigDir;
+    if (outputCap) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = outputCap;
+    if (thinkingOff) env.MAX_THINKING_TOKENS = '0';
+    const child = spawn(claudeBin(), args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: ensureCleanCwd(),
+      env,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => { stdout += String(chunk); });
+    child.stderr.on('data', chunk => { stderr += String(chunk); });
+
+    const onAbort = () => {
+      child.kill('SIGTERM');
+      reject(new Error('claude-cli adapter aborted'));
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    child.on('error', err => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      reject(new Error(`claude-cli spawn failed: ${err instanceof Error ? err.message : String(err)}`));
+    });
+
+    child.on('close', code => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (code !== 0) {
+        // Even on a non-zero exit the CLI writes a formatted result envelope
+        // to stdout (e.g. an API 429 arrives as {is_error:true,
+        // api_error_status:429, result:"<human-readable message>", ...}).
+        // Surface that as a typed error instead of burying the status inside
+        // a raw blob. Only an error-reporting envelope qualifies: a SUCCESS
+        // envelope followed by a non-zero exit is a process failure whose
+        // reason lives in stderr, so it falls through to the blob fallback
+        // (as does any stdout without a parseable envelope).
+        const attempt = parseResultEnvelope(stdout);
+        if (attempt.ok && isOutputCapEnvelope(attempt.envelope)) {
+          resolve(outputCapAsLength(attempt.envelope));
+          return;
+        }
+        if (attempt.ok && attempt.envelope.type === 'result' && attempt.envelope.is_error === true) {
+          reject(envelopeError(attempt.envelope, code ?? undefined));
+          return;
+        }
+        // The blob goes AFTER the `--- raw ---` marker: it can carry
+        // model/page-derived text, and classifyGlobalLlmError's phrase
+        // regexes only scan text before the marker (an auth-looking essay in
+        // stdout must never read as a whole-run auth outage).
+        const headline = isUnknownOptionError(stderr)
+          ? oldClaudeCliMessage(claudeCliVersion(env))
+          : `claude-cli exited ${code}`;
+        reject(new ClaudeCliProcessError(
+          `${headline}\n--- raw ---\n${stderr.trim() || stdout.trim()}`,
+          { exitCode: code ?? undefined },
+        ));
+        return;
+      }
+      const attempt = parseResultEnvelope(stdout);
+      if (!attempt.ok) {
+        if (attempt.reason === 'no-result-event') {
+          reject(new Error(`claude-cli JSON event array had no "result" event\n--- raw ---\n${stdout.slice(0, 500)}`));
+          return;
+        }
+        const e = attempt.error;
+        reject(new Error(`claude-cli output not JSON: ${e instanceof Error ? e.message : String(e)}\n--- raw ---\n${stdout.slice(0, 500)}`));
+        return;
+      }
+      const envelope = attempt.envelope;
+      if (isOutputCapEnvelope(envelope)) {
+        resolve(outputCapAsLength(envelope));
+        return;
+      }
+      if (envelope.is_error) {
+        reject(envelopeError(envelope, 0));
+        return;
+      }
+      resolve(envelope);
+    });
+
+    // stdin error handler: if the binary does not exist (ENOENT) or the child
+    // dies before draining stdin, write/end can emit an unhandled 'error'
+    // (EPIPE) that would crash the worker. The spawn-level 'error' / non-zero
+    // 'close' handlers above already surface the real failure, so the stdin
+    // error itself is safe to swallow.
+    child.stdin.on('error', () => { /* surfaced via child 'error'/'close' */ });
+    try {
+      child.stdin.write(userPrompt);
+      child.stdin.end();
+    } catch (e) {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      reject(new Error(`claude-cli stdin write failed (is the claude binary installed?): ${e instanceof Error ? e.message : String(e)}`));
+    }
+  });
+}
+
+interface ParsedToolCall {
+  id: string;
+  name: string;
+  /** Stringified JSON, matching the ai-sdk LanguageModelV2ToolCall.input contract. */
+  input: string;
+}
+
+/**
+ * Keys the `<use_tools>` protocol reserves on an entry. `type: "tool_use"`
+ * and a `toolu_*` `id` are tolerated leftovers of the Anthropic tool_use
+ * shape; nothing reads them. Any OTHER `type`/`id` value is a real tool
+ * argument (e.g. the allowlisted `list_pages` op's `type` filter) and stays.
+ */
+function isReservedEntryKey(k: string, v: unknown): boolean {
+  if (k === 'name' || k === 'input') return true;
+  if (k === 'type') return v === 'tool_use';
+  if (k === 'id') return typeof v === 'string' && v.startsWith('toolu_');
+  return false;
+}
+
+/**
+ * Resolve the tool input of one `<use_tools>` entry. The protocol asks for
+ * `{name, input}`, but the model sometimes emits the arguments flat on the
+ * entry itself (`{"name": "brain_search", "query": "..."}`), the Anthropic
+ * tool_use shape with the `input` wrapper dropped. Reading only `e.input`
+ * turned every such call into `{}`, and the tool then failed on its missing
+ * required parameter with nothing the model could act on. When `input` is
+ * absent, the entry's non-reserved keys ARE the input; when it is present
+ * it wins verbatim, stray sibling keys ignored.
+ */
+function resolveEntryInput(e: Record<string, unknown>): unknown {
+  if (e.input !== undefined && e.input !== null) return e.input;
+  const flat: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(e)) {
+    if (!isReservedEntryKey(k, v)) flat[k] = v;
+  }
+  return flat;
+}
+
+/**
+ * Locate and parse the `<use_tools>...</use_tools>` block in the assistant's
+ * raw text response. Returns the parsed tool calls plus whatever prose
+ * surrounded the block. Returns an empty `toolCalls` array when no block is
+ * present, malformed, or unterminated — the caller then treats the full
+ * raw text as a final text response.
+ */
+function extractToolCalls(raw: string): {
+  toolCalls: ParsedToolCall[];
+  beforeText: string;
+  afterText: string;
+} {
+  const openTag = '<use_tools>';
+  const closeTag = '</use_tools>';
+  // No single anchoring rule survives every shape the model emits: a prose
+  // mention of `<use_tools>` BEFORE the block ("Let me use the correct
+  // `<use_tools>` format:") breaks anchoring on the first open tag; a prose
+  // mention of `</use_tools>` before the block breaks anchoring on the first
+  // close tag; and a LITERAL tag inside a JSON string argument (a page body
+  // being written that documents the protocol) breaks "last open tag before
+  // the close" — the inner tag wins, the slice is truncated JSON, and a
+  // valid call is discarded as prose. So: enumerate the (open, close) pairs
+  // outermost-first (earliest open, then each later close) and accept the
+  // first slice that parses as a JSON array. Tags inside argument strings
+  // sit inside an accepted slice or produce a rejected one; they never anchor.
+  // ponytail: O(opens × closes) JSON.parse attempts — tags are a handful per
+  // response; a linear scanner is the upgrade if a payload ever has hundreds.
+  const opens: number[] = [];
+  for (let i = raw.indexOf(openTag); i !== -1; i = raw.indexOf(openTag, i + 1)) opens.push(i);
+  const closes: number[] = [];
+  for (let i = raw.indexOf(closeTag); i !== -1; i = raw.indexOf(closeTag, i + 1)) closes.push(i);
+
+  let parsed: unknown[] | null = null;
+  let openIdx = -1;
+  let closeIdx = -1;
+  let firstError: string | null = null;
+  outer: for (const o of opens) {
+    for (const c of closes) {
+      if (c < o + openTag.length) continue;
+      let inner = raw.slice(o + openTag.length, c).trim();
+      if (inner.startsWith('```')) {
+        inner = inner.replace(/^```(?:json|JSON)?\s*\n?/, '').replace(/\n?```$/, '').trim();
+      }
+      try {
+        const v: unknown = JSON.parse(inner);
+        if (Array.isArray(v)) { parsed = v; openIdx = o; closeIdx = c; break outer; }
+      } catch (e) {
+        firstError ??= e instanceof Error ? e.message : String(e);
+      }
+    }
+  }
+  if (parsed === null) {
+    // A malformed block is a LOST tool call — the caller sees prose and the
+    // turn ends as if the model never called anything. Say so on stderr.
+    // (No pair at all — unterminated, absent, or only orphan close tags — and
+    // a non-array payload both recover silently as before.)
+    if (firstError !== null) {
+      process.stderr.write(`[claude-cli] <use_tools> block failed to parse — tool call discarded: ${firstError}\n`);
+    }
+    return { toolCalls: [], beforeText: raw.trim(), afterText: '' };
+  }
+
+  const beforeText = raw.slice(0, openIdx).trim();
+  const afterText = raw.slice(closeIdx + closeTag.length).trim();
+
+  const toolCalls: ParsedToolCall[] = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== 'object') continue;
+    const e = entry as Record<string, unknown>;
+    const name = typeof e.name === 'string' ? e.name : null;
+    if (!name) continue;
+    // #4155: ALWAYS mint — never trust a model-authored id. Each doGenerate
+    // is a fresh subprocess replayed from an id-stripped transcript
+    // (renderPrompt), so the model structurally CANNOT keep ids unique
+    // across turns; it echoed the prompt's example entropy-free (toolu_01,
+    // toolu_02 every turn) and collided real dream jobs to death before the
+    // job-wide unique constraint was retired (migration v131). The prompt no
+    // longer asks for an id; a stray `id` field from older cached behavior
+    // is deliberately ignored — nothing round-trips it (renderPrompt strips
+    // ids on replay; the loop pairs results in-memory within one turn).
+    const id = `toolu_claude_cli_${randomUUIDv7()}`;
+    const inputJson = JSON.stringify(resolveEntryInput(e));
+    toolCalls.push({ id, name, input: inputJson });
+  }
+
+  return { toolCalls, beforeText, afterText };
+}
+
+// Module-scoped so the counter survives the fresh ClaudeCliLanguageModel
+// instance created for every doGenerate call (gateway resolves the provider
+// per-call). Keeps the historical `toolu_claude_cli_` prefix — one grep target.
+
+/**
+ * Strip provider prefixes (`anthropic:`, `litellm:`, `claude-cli:`) that the
+ * underlying CLI does not understand. The gateway hands us a bare model id
+ * via `recipe.aliases` resolution, but defensive normalization here keeps
+ * direct LanguageModelV2 construction (in tests, for example) ergonomic.
+ */
+function normalizeModel(model: string): string {
+  const idx = model.indexOf(':');
+  return idx >= 0 ? model.slice(idx + 1) : model;
+}
+
+/**
+ * #6260: the CLI's own `stop_reason` decides the finish reason, so a response
+ * cut off at the output cap reads as `length` and a refusal as
+ * `content-filter`; callers that refuse to commit a clipped answer can only
+ * see it this way. Tool calls parsed from the text finish as `tool-calls`
+ * unless the answer was cut off. A missing or unknown reason stays `stop`.
+ */
+export function claudeCliFinishReason(stopReason: string | null | undefined, hasToolCalls: boolean): 'stop' | 'length' | 'content-filter' | 'tool-calls' {
+  if (stopReason === 'max_tokens') return 'length';
+  if (stopReason === 'refusal') return 'content-filter';
+  return hasToolCalls ? 'tool-calls' : 'stop';
+}
+
+export class ClaudeCliLanguageModel implements LanguageModelV2 {
+  readonly specificationVersion = 'v2' as const;
+  readonly provider = 'claude-cli';
+  readonly modelId: string;
+  readonly supportedUrls = {};
+
+  constructor(modelId: string) {
+    this.modelId = normalizeModel(modelId);
+  }
+
+  async doGenerate(options: LanguageModelV2CallOptions): Promise<{
+    content: LanguageModelV2Content[];
+    finishReason: 'stop' | 'length' | 'content-filter' | 'tool-calls' | 'error' | 'other' | 'unknown';
+    usage: {
+      inputTokens: number | undefined;
+      outputTokens: number | undefined;
+      totalTokens: number | undefined;
+      cachedInputTokens: number | undefined;
+    };
+    providerMetadata?: SharedV2ProviderMetadata;
+    warnings: never[];
+  }> {
+    const { systemText, userPrompt } = renderPrompt(options.prompt);
+    const toolInstructions = buildToolUseInstructions(options.tools);
+    const systemPrompt = [systemText, toolInstructions].filter(s => s.length > 0).join('\n');
+
+    const result = await runClaude(systemPrompt, userPrompt, this.modelId, options.abortSignal, options.maxOutputTokens);
+    // The CLI reports Anthropic's separate buckets; LanguageModelV2Usage wants
+    // the TOTAL input with the cache read as a subset (what every SDK provider
+    // reports), so the gateway prices cache tokens once. Cache creation has no
+    // V2 field: it stays inside the total at the input rate.
+    const cachedInputTokens =
+      result.usage?.cache_read_input_tokens !== undefined
+        ? Number(result.usage.cache_read_input_tokens)
+        : undefined;
+    const inputTokens = result.usage?.input_tokens === undefined ? undefined
+      : result.usage.input_tokens + (cachedInputTokens ?? 0) + Number(result.usage.cache_creation_input_tokens ?? 0);
+    const outputTokens = result.usage?.output_tokens;
+    const totalTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
+    const usage = {
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens !== undefined && outputTokens !== undefined ? totalTokens : undefined,
+      cachedInputTokens,
+    };
+
+    // #6791: a continued answer is rebuilt from its segments, or refused
+    // before any tool block in its tail can be parsed and dispatched.
+    const thinking = thinkingDisabledBelowFloor(options.maxOutputTokens) ? { thinking: 'disabled_below_floor' } : null;
+    const answer = resolveClaudeCliAnswer(result, options.maxOutputTokens);
+    if (answer.kind === 'unproven') {
+      return {
+        content: [{ type: 'text', text: '' }],
+        finishReason: 'length',
+        usage,
+        providerMetadata: { 'claude-cli': { ...continuationUnprovenMetadata(answer.reason)['claude-cli'], ...thinking } },
+        warnings: [],
+      };
+    }
+    const { toolCalls, beforeText, afterText } = extractToolCalls(answer.text);
+
+    const content: LanguageModelV2Content[] = [];
+    if (beforeText) content.push({ type: 'text', text: beforeText });
+    for (const call of toolCalls) {
+      content.push({
+        type: 'tool-call',
+        toolCallId: call.id,
+        toolName: call.name,
+        input: call.input,
+      });
+    }
+    if (afterText) content.push({ type: 'text', text: afterText });
+    if (content.length === 0) {
+      // Empty response — still hand the caller a well-formed content array.
+      content.push({ type: 'text', text: answer.text ?? '' });
+    }
+
+    return {
+      content,
+      finishReason: claudeCliFinishReason(result.stop_reason, toolCalls.length > 0),
+      usage,
+      ...(thinking ? { providerMetadata: { 'claude-cli': thinking } } : {}),
+      warnings: [],
+    };
+  }
+
+  async doStream(): Promise<never> {
+    throw new Error(
+      'claude-cli LanguageModel does not support streaming. Use doGenerate or set ' +
+      'the model on a non-streaming chat surface (gateway.toolLoop is non-streaming).',
+    );
+  }
+}

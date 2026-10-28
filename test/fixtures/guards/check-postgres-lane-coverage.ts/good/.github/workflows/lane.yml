@@ -1,0 +1,10 @@
+name: lane
+on: workflow_dispatch
+jobs:
+  pg:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Postgres arms
+        env:
+          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+        run: bun test test/stepped.test.ts

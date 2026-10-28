@@ -1,0 +1,958 @@
+/**
+ * Cathedral 5 (WI5) — the DONE-CRITERION test: post-compaction recall. A fact
+ * from the pre-compaction window survives context death via a brain:// link
+ * re-pull THROUGH THE SURFACE THE AGENT USES (handleToolCall get_page,
+ * trusted-local) — never a raw engine read (raw reads prove storage, not
+ * recall). Plus the harvest discipline: claim fencing, receipt-ordered
+ * commits, abort-after-partial retryability, gate skips, handler validation.
+ *
+ * Serial: real PGLite engine + module-global harvest queue + GBRAIN_HOME env.
+ */
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, spyOn } from 'bun:test';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { serializePageToMarkdown } from '../src/core/markdown.ts';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { __setChatTransportForTests, configureGateway, isAvailable, resetGateway, type ChatResult } from '../src/core/ai/gateway.ts';
+import { detectCapabilities } from '../src/core/capability.ts';
+import { RECIPES } from '../src/core/ai/recipes/index.ts';
+import { __resetFactsQueueForTests } from '../src/core/facts/queue.ts';
+import type { CapabilityReport } from '../src/core/capability.ts';
+import { CORPUS_CLAIM_SUFFIX, CORPUS_INGESTED_SUFFIX, runMaintenanceSweep } from '../src/core/sweep.ts';
+import { CLAUDE_CLI_CWD_PREFIX } from '../src/core/ai/providers/claude-cli-scratch.ts';
+import { toCorpusText } from '../src/core/transcripts/claude-code-jsonl.ts';
+import {
+  __drainCheckpointHarvestForTests,
+  __resetCheckpointHarvestForTests,
+  HARVEST_RECEIPT_SUFFIX,
+  __setWriterBusyRetryDelaysForTests,
+  scheduleCheckpointHarvest,
+  shutdownCheckpointHarvest,
+  WRITEBACK_SESSION_CAP,
+} from '../src/core/context/checkpoint-harvest.ts';
+import { appendSegmentLedger, bankWritebackTurn, segmentFileName, segmentHash, writeSegment } from '../src/core/context/corpus-segments.ts';
+import { gateWritebackTurn } from '../src/core/facts/writeback-gate.ts';
+import { getCheckpointManifest } from '../src/core/context/session-state.ts';
+import { makeContextPackIpcHandler } from '../src/mcp/context-pack-handler.ts';
+import { handleToolCall } from '../src/mcp/server.ts';
+import { readHeartbeatTail } from '../src/core/context/hook-heartbeat.ts';
+import { acquireWorktree, claimWorktree, getWorktreeBinding, MANAGED_WRITER_PROBE_WAIT_MS, type WorktreeBinding } from '../src/core/persistence/ownership.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+
+const KEYED: CapabilityReport = {
+  embeddings: { available: false },
+  extraction: { available: true, provider: 'anthropic' },
+  search: 'keyword-only',
+  mode: 'keyed',
+};
+const KEYLESS: CapabilityReport = {
+  embeddings: { available: false },
+  extraction: { available: false },
+  search: 'keyword-only',
+  mode: 'keyless',
+};
+
+let engine: PGLiteEngine;
+let corpusDir: string;
+let homeDir: string;
+let savedHome: string | undefined;
+const tmpDirs: string[] = [];
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+}, 120_000);
+
+afterAll(async () => {
+  await engine.disconnect();
+  for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+});
+
+beforeEach(async () => {
+  __resetCheckpointHarvestForTests();
+  corpusDir = mkdtempSync(join(tmpdir(), 'gb-ckpt-corpus-'));
+  homeDir = mkdtempSync(join(tmpdir(), 'gb-ckpt-home-'));
+  tmpDirs.push(corpusDir, homeDir);
+  savedHome = process.env.GBRAIN_HOME;
+  process.env.GBRAIN_HOME = homeDir;
+  await engine.setConfig('dream.synthesize.session_corpus_dir', corpusDir);
+  await engine.executeRaw(`UPDATE sources SET local_path = NULL WHERE id = 'default'`).catch(() => {});
+  await engine.executeRaw('DELETE FROM facts').catch(() => {});
+  await engine.executeRaw('DELETE FROM pages').catch(() => {});
+  await engine.executeRaw('DELETE FROM session_context_state').catch(() => {});
+});
+
+afterEach(() => {
+  __setChatTransportForTests(null);
+  resetGateway();
+  __resetFactsQueueForTests();
+  if (savedHome === undefined) delete process.env.GBRAIN_HOME;
+  else process.env.GBRAIN_HOME = savedHome;
+});
+
+function chatStub(facts: Array<{ fact: string; entity: string | null }>) {
+  __setChatTransportForTests(async (): Promise<ChatResult> => ({
+    text: JSON.stringify({
+      facts: facts.map((f) => ({ fact: f.fact, kind: 'decision', entity: f.entity, confidence: 1.0, notability: 'high' })),
+    }),
+    blocks: [],
+    stopReason: 'end',
+    usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    model: 'test:stub',
+    providerId: 'test',
+  }));
+}
+
+/** Bank a segment + ledger entry the way `gbrain hook compact` does. */
+function bankSegment(sessionId: string, text: string): { file: string; hash: string } {
+  const w = writeSegment(corpusDir, sessionId, text);
+  appendSegmentLedger(corpusDir, sessionId, w.hash);
+  return { file: segmentFileName(sessionId, w.hash), hash: w.hash };
+}
+
+/** Brain repo dir with sources.local_path so fence-writes are enabled. */
+async function enableFenceWrites(): Promise<string> {
+  const brainDir = mkdtempSync(join(tmpdir(), 'gb-ckpt-brain-'));
+  tmpDirs.push(brainDir);
+  await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = 'default'`, [brainDir]);
+  return brainDir;
+}
+
+describe('post-compaction recall (the done criterion)', () => {
+  test('segment → harvest → truthful manifest → link re-pull via trusted get_page', async () => {
+    const brainDir = await enableFenceWrites();
+    const alice = await engine.putPage('people/alice-example', {
+      type: 'person', title: 'Alice Example', compiled_truth: 'Alice Example is a synthetic fixture person.',
+    }, { sourceId: 'default' });
+    // The page has its file, as a local_path brain's pages do (#6398: a DB-only page takes the DB-only fact route).
+    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    writeFileSync(join(brainDir, 'people/alice-example.md'), serializePageToMarkdown(alice, []));
+    chatStub([
+      { fact: 'decided to move the auth check into the middleware', entity: 'people/alice-example' },
+      { fact: 'unparented aside that produces no link', entity: null },
+    ]);
+
+    const seg = bankSegment('sess-recall', 'User: we decided to move the auth check into the middleware.\n');
+    const ack = scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-recall', corpusDir, file: seg.file, capabilities: KEYED,
+    });
+    expect(ack.status).toBe('scheduled');
+    await __drainCheckpointHarvestForTests();
+
+    // Facts durable with hook provenance.
+    const rows = await engine.executeRaw<{ source: string; source_session: string }>(
+      `SELECT source, source_session FROM facts WHERE source = 'hook:compact'`,
+    );
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[0].source_session).toBe('sess-recall');
+
+    // Manifest banked: ONLY the resolvable fence-written link, seg-hash keyed.
+    const links = (await getCheckpointManifest(engine, 'default', null, 'sess-recall'))!;
+    expect(links).toHaveLength(1);
+    expect(links[0].slug).toBe('people/alice-example');
+    expect(links[0].title).toBe('Alice Example');
+    expect(links[0].seg).toBe(seg.hash);
+    expect(links[0].n).toBe(1);
+
+    // Commit order artifacts: .ingested written LAST, receipt consumed, claim released.
+    const full = join(corpusDir, seg.file);
+    expect(existsSync(full + CORPUS_INGESTED_SUFFIX)).toBe(true);
+    expect(existsSync(full + HARVEST_RECEIPT_SUFFIX)).toBe(false);
+    expect(existsSync(full + CORPUS_CLAIM_SUFFIX)).toBe(false);
+
+    // THE RECALL: re-pull the link through the agent's actual surfaces
+    // (trusted-local handleToolCall) — raw engine reads would prove storage,
+    // not recall. get_page proves the brain:// link RESOLVES; the `recall`
+    // memory verb proves the FACT survived context death (fence-writes are
+    // file-first by design — the DB page body catches up at sync, while the
+    // fact row is queryable immediately).
+    const page = await handleToolCall(engine, 'get_page', { slug: links[0].slug }, { sourceId: 'default' });
+    expect(JSON.stringify(page)).toContain('Alice Example');
+    const recalled = await handleToolCall(
+      engine, 'recall', { entity: 'people/alice-example', budget_tokens: 2000 }, { sourceId: 'default' },
+    );
+    expect(JSON.stringify(recalled)).toContain('auth check into the middleware');
+    // The fence itself IS on disk (system-of-record) for the next sync.
+    const fenceFile = readFileSync(join(brainDir, 'people/alice-example.md'), 'utf8');
+    expect(fenceFile).toContain('auth check into the middleware');
+
+    // Heartbeat telemetry: counts + codes only.
+    const hb = (await readHeartbeatTail(5)).find((e) => e.event === 'checkpoint-harvest');
+    expect(hb?.outcome).toBe('ok');
+    expect(hb?.inserted).toBeGreaterThan(0);
+    expect(hb?.links).toBe(1);
+    expect(JSON.stringify(hb)).not.toContain('alice-example'); // never slugs [S3#7]
+  });
+
+  test('receipt retry publishes the manifest WITHOUT re-extracting (no chat transport needed)', async () => {
+    await engine.putPage('people/charlie-example', {
+      type: 'person', title: 'Charlie Example', compiled_truth: 'Synthetic fixture.',
+    }, { sourceId: 'default' });
+    // No chatStub: extraction would throw. The receipt path must not extract.
+    const seg = bankSegment('sess-receipt', 'window text already extracted last time\n');
+    const full = join(corpusDir, seg.file);
+    writeFileSync(full + HARVEST_RECEIPT_SUFFIX, JSON.stringify({
+      session_id: 'sess-receipt', seg: seg.hash, links: ['people/charlie-example'], ts: new Date().toISOString(),
+    }) + '\n');
+
+    scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-receipt', corpusDir, file: seg.file, capabilities: KEYED,
+    });
+    await __drainCheckpointHarvestForTests();
+
+    const links = (await getCheckpointManifest(engine, 'default', null, 'sess-receipt'))!;
+    expect(links.map((l) => l.slug)).toEqual(['people/charlie-example']);
+    const ingested = JSON.parse(readFileSync(full + CORPUS_INGESTED_SUFFIX, 'utf8')) as { from_receipt?: boolean };
+    expect(ingested.from_receipt).toBe(true);
+    expect(existsSync(full + HARVEST_RECEIPT_SUFFIX)).toBe(false);
+  });
+
+  test('manifest publish failure keeps the receipt, skips .ingested, and the retry recovers (adversarial review)', async () => {
+    await engine.putPage('people/dora-example', {
+      type: 'person', title: 'Dora Example', compiled_truth: 'Synthetic fixture.',
+    }, { sourceId: 'default' });
+    const seg = bankSegment('sess-mfail', 'window text extracted; publish will fail\n');
+    const full = join(corpusDir, seg.file);
+    writeFileSync(full + HARVEST_RECEIPT_SUFFIX, JSON.stringify({
+      session_id: 'sess-mfail', seg: seg.hash, links: ['people/dora-example'], ts: new Date().toISOString(),
+    }) + '\n');
+
+    // Force the publish to fail: pre-v132 shape (column missing).
+    await engine.executeRaw('ALTER TABLE session_context_state DROP COLUMN checkpoint_manifest');
+    try {
+      scheduleCheckpointHarvest({
+        engine, sourceId: 'default', sessionId: 'sess-mfail', corpusDir, file: seg.file, capabilities: KEYED,
+      });
+      await __drainCheckpointHarvestForTests();
+      // Receipt kept (the only durable copy of the links), no .ingested —
+      // deleting either here would lose the links forever.
+      expect(existsSync(full + HARVEST_RECEIPT_SUFFIX)).toBe(true);
+      expect(existsSync(full + CORPUS_INGESTED_SUFFIX)).toBe(false);
+      const hb = (await readHeartbeatTail(5)).find((e) => e.event === 'checkpoint-harvest');
+      expect(hb?.outcome).toBe('degraded');
+      expect(hb?.reason).toBe('manifest_failed');
+    } finally {
+      await engine.executeRaw(
+        `ALTER TABLE session_context_state ADD COLUMN checkpoint_manifest JSONB NOT NULL DEFAULT '[]'::jsonb`,
+      );
+    }
+
+    // Retry after recovery: publishes from the receipt (no extraction), cleans up.
+    scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-mfail', corpusDir, file: seg.file, capabilities: KEYED,
+    });
+    await __drainCheckpointHarvestForTests();
+    const links = (await getCheckpointManifest(engine, 'default', null, 'sess-mfail'))!;
+    expect(links.map((l) => l.slug)).toEqual(['people/dora-example']);
+    expect(existsSync(full + HARVEST_RECEIPT_SUFFIX)).toBe(false);
+    expect(existsSync(full + CORPUS_INGESTED_SUFFIX)).toBe(true);
+  });
+
+  test('non-resolvable link candidates are never banked (truthful links)', async () => {
+    await enableFenceWrites();
+    // Receipt names a slug whose page does NOT exist.
+    const seg = bankSegment('sess-lies', 'text\n');
+    const full = join(corpusDir, seg.file);
+    writeFileSync(full + HARVEST_RECEIPT_SUFFIX, JSON.stringify({
+      session_id: 'sess-lies', seg: seg.hash, links: ['people/nobody-here'], ts: new Date().toISOString(),
+    }) + '\n');
+    scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-lies', corpusDir, file: seg.file, capabilities: KEYED,
+    });
+    await __drainCheckpointHarvestForTests();
+    expect(await getCheckpointManifest(engine, 'default', null, 'sess-lies')).toEqual([]);
+    expect(existsSync(full + CORPUS_INGESTED_SUFFIX)).toBe(true); // still done — facts durable regardless
+  });
+});
+
+describe('harvest discipline', () => {
+  test('DB-plane local extraction model is not mistaken for a keyless file-plane install', async () => {
+    const authNames = new Set(Array.from(RECIPES.values()).flatMap((recipe) => recipe.auth_env?.required ?? []));
+    const saved = new Map(Array.from(authNames, (name) => [name, process.env[name]]));
+    for (const name of authNames) delete process.env[name];
+    try {
+      await engine.setConfig('facts.extraction_model', 'ollama:qwen2.5-coder:14b');
+      configureGateway({ env: {} });
+      expect(detectCapabilities().extraction.available).toBe(false);
+      expect(isAvailable('chat', 'ollama:qwen2.5-coder:14b')).toBe(true);
+      chatStub([{ fact: 'The synthetic team chose a local extraction model.', entity: null }]);
+      const seg = bankSegment('sess-db-model', 'The synthetic team chose a local extraction model.\n');
+      const full = join(corpusDir, seg.file);
+      scheduleCheckpointHarvest({
+        engine, sourceId: 'default', sessionId: 'sess-db-model', corpusDir, file: seg.file,
+      });
+      await __drainCheckpointHarvestForTests();
+      expect(existsSync(full + CORPUS_INGESTED_SUFFIX)).toBe(true);
+      const rows = await engine.executeRaw<{ source_session: string }>(
+        `SELECT source_session FROM facts WHERE source = 'hook:compact'`,
+      );
+      expect(rows.some((row) => row.source_session === 'sess-db-model')).toBe(true);
+    } finally {
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await engine.unsetConfig('facts.extraction_model');
+    }
+  });
+
+  test('abort mid-pipeline writes NOTHING and stays retryable (post-check on partial-returning pipeline)', async () => {
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      await new Promise((r) => setTimeout(r, 200)); // outlive the 1ms budget
+      return {
+        text: JSON.stringify({ facts: [] }), blocks: [], stopReason: 'end',
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'test:stub', providerId: 'test',
+      };
+    });
+    const seg = bankSegment('sess-abort', 'window that will be aborted\n');
+    const full = join(corpusDir, seg.file);
+    scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-abort', corpusDir, file: seg.file,
+      capabilities: KEYED, timeoutMs: 1,
+    });
+    await __drainCheckpointHarvestForTests();
+    expect(existsSync(full + HARVEST_RECEIPT_SUFFIX)).toBe(false);
+    expect(existsSync(full + CORPUS_INGESTED_SUFFIX)).toBe(false);
+    expect(existsSync(full + CORPUS_CLAIM_SUFFIX)).toBe(false); // released — retryable
+    const hb = (await readHeartbeatTail(5)).find((e) => e.event === 'checkpoint-harvest');
+    expect(hb?.reason).toBe('aborted');
+  });
+
+  test('keyless capability gate skips cleanly: no sidecars, claim released, typed reason', async () => {
+    const seg = bankSegment('sess-keyless', 'text\n');
+    const full = join(corpusDir, seg.file);
+    scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-keyless', corpusDir, file: seg.file, capabilities: KEYLESS,
+    });
+    await __drainCheckpointHarvestForTests();
+    expect(existsSync(full + CORPUS_INGESTED_SUFFIX)).toBe(false); // sweep retries when a key appears
+    expect(existsSync(full + CORPUS_CLAIM_SUFFIX)).toBe(false);
+    const hb = (await readHeartbeatTail(5)).find((e) => e.event === 'checkpoint-harvest');
+    expect(hb?.reason).toBe('keyless');
+  });
+
+  test('shutdown drops the queue and refuses new work (serve-lifecycle seam)', async () => {
+    await shutdownCheckpointHarvest();
+    const ack = scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 's', corpusDir, file: 's.seg-abc.txt', capabilities: KEYED,
+    });
+    expect(ack).toEqual({ status: 'skipped', reason: 'shutting_down' });
+  });
+});
+
+describe('context_pack handler arms', () => {
+  test('bankOnly + flushCorpusFile: bad basename / traversal / missing file are typed skips; valid file schedules', async () => {
+    const handler = makeContextPackIpcHandler(engine, 'default');
+    const base = { kind: 'context_pack' as const, protocol: 2 as const, secret: 's', sessionId: 'sess-h', bankOnly: true, window: [{ role: 'user' as const, text: 'acme-example ships widgets' }] };
+
+    const bad = await handler({ ...base, flushCorpusFile: '../../etc/passwd.txt' });
+    expect(bad?.checkpointFlush).toEqual({ status: 'skipped', reason: 'bad_basename' });
+    const slash = await handler({ ...base, flushCorpusFile: 'x/y.txt' });
+    expect(slash?.checkpointFlush).toEqual({ status: 'skipped', reason: 'bad_basename' });
+    const missing = await handler({ ...base, flushCorpusFile: 'sess-h.seg-nothere.txt' });
+    expect(missing?.checkpointFlush).toEqual({ status: 'skipped', reason: 'not_found' });
+
+    // Stub the transport BEFORE scheduling: pump() starts the job
+    // synchronously, so a shutdown race cannot reliably beat it — with
+    // ambient provider keys that would be a REAL LLM call (pre-landing
+    // review, testing). The stub makes the drain fast and spend-free.
+    chatStub([]);
+    const seg = bankSegment('sess-h', 'handler text\n');
+    const ok = await handler({ ...base, flushCorpusFile: seg.file });
+    expect(ok?.checkpointFlush?.status).toBe('scheduled');
+    await __drainCheckpointHarvestForTests();
+  });
+
+  test('manifestOnly returns links and is side-effect-free (no cursor advance, no banking) [REGRESSION PIN]', async () => {
+    const handler = makeContextPackIpcHandler(engine, 'default');
+    await engine.executeRaw(
+      `INSERT INTO session_context_state (source_id, client_id, session_id, checkpoint_manifest, last_wake_at)
+       VALUES ('default', 'local', 'sess-m', $1::text::jsonb, now() - interval '1 hour')`,
+      [JSON.stringify([{ slug: 'a', title: 'A', at: new Date().toISOString(), n: 1, seg: 'h1' }])],
+    );
+    const before = await engine.executeRaw<{ last_wake_at: string; standing_entities: unknown }>(
+      `SELECT last_wake_at::text AS last_wake_at, standing_entities FROM session_context_state WHERE session_id = 'sess-m'`,
+    );
+    const res = await handler({
+      kind: 'context_pack', protocol: 2, secret: 's', sessionId: 'sess-m', manifestOnly: true,
+      window: [{ role: 'user', text: 'should not be banked' }],
+      entities: ['should-not-be-banked'],
+    });
+    expect(res?.checkpointLinks?.map((l) => l.slug)).toEqual(['a']);
+    expect(res?.text).toBe('');
+    const after = await engine.executeRaw<{ last_wake_at: string; standing_entities: unknown }>(
+      `SELECT last_wake_at::text AS last_wake_at, standing_entities FROM session_context_state WHERE session_id = 'sess-m'`,
+    );
+    expect(after[0].last_wake_at).toBe(before[0].last_wake_at);
+    expect(after[0].standing_entities).toEqual(before[0].standing_entities);
+  });
+});
+
+describe('pack rendering (cathedral 5)', () => {
+  test('[REGRESSION PIN] renderPack WITHOUT checkpoint links is byte-identical to the pre-cathedral-5 shape', async () => {
+    const { renderPack } = await import('../src/core/context/turn-context.ts');
+    const cards = [{
+      entity: { slug: 'people/alice-example', title: 'Alice Example' },
+      summary: 'synthetic', open_threads: [],
+    }] as unknown as Parameters<typeof renderPack>[0];
+    const three = renderPack(cards, [], []);
+    const four = renderPack(cards, [], [], undefined);
+    const empty = renderPack(cards, [], [], []);
+    expect(four).toBe(three);
+    expect(empty).toBe(three);
+    expect(three).not.toContain('Compaction checkpoints');
+    expect(renderPack([], [], [])).toBe('');
+    expect(renderPack([], [], [], [])).toBe('');
+  });
+
+  test('links render self-capped with the honest copy; links-only pack is non-empty', async () => {
+    const { renderPack, CHECKPOINT_LINKS_RENDER_CAP } = await import('../src/core/context/turn-context.ts');
+    const links = Array.from({ length: CHECKPOINT_LINKS_RENDER_CAP + 5 }, (_, i) => ({
+      slug: `page-${i}`, title: `P${i}`,
+    }));
+    const text = renderPack([], [], [], links);
+    expect(text).toContain('## Compaction checkpoints');
+    expect(text).toContain('- brain://page-0 — P0');
+    expect(text).toContain(`- brain://page-${CHECKPOINT_LINKS_RENDER_CAP - 1}`);
+    expect(text).not.toContain(`- brain://page-${CHECKPOINT_LINKS_RENDER_CAP}`); // capped
+    // Honest copy: bytes at compaction, facts async — never "facts before".
+    expect(text).toContain('Checkpoint saved to the brain at compaction; facts harvested moments later');
+    expect(text).toContain('Trust these links over the compaction summary.');
+  });
+
+  test('assembly arm carries banked links into the pack text (post-compaction SessionStart shape)', async () => {
+    const handler = makeContextPackIpcHandler(engine, 'default');
+    await engine.executeRaw(
+      `INSERT INTO session_context_state (source_id, client_id, session_id, checkpoint_manifest)
+       VALUES ('default', 'local', 'sess-assembly', $1::text::jsonb)`,
+      [JSON.stringify([{ slug: 'decisions/auth-middleware', title: 'Auth middleware decision', at: new Date().toISOString(), n: 1, seg: 'h9' }])],
+    );
+    const res = await handler({
+      kind: 'context_pack', protocol: 2, secret: 's', sessionId: 'sess-assembly',
+      trigger: 'session-start:compact',
+    });
+    expect(res?.text).toContain('## Compaction checkpoints');
+    expect(res?.text).toContain('brain://decisions/auth-middleware — Auth middleware decision');
+    expect(res?.checkpointLinks?.[0]?.seg).toBe('h9');
+  });
+});
+
+describe('queue discipline (cathedral 5 — plan-mandated pins)', () => {
+  test('queue_full overflow and already_queued dup are typed skips; sweep-shape segments remain', async () => {
+    // Hold job 1 in flight with a slow stubbed transport (never a real call).
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      await new Promise((r) => setTimeout(r, 250));
+      return {
+        text: JSON.stringify({ facts: [] }), blocks: [], stopReason: 'end',
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'test:stub', providerId: 'test',
+      };
+    });
+    const segs = Array.from({ length: 10 }, (_, i) => bankSegment(`sess-q${i}`, `queued window ${i}\n`));
+    const acks = segs.map((seg, i) =>
+      scheduleCheckpointHarvest({
+        engine, sourceId: 'default', sessionId: `sess-q${i}`, corpusDir, file: seg.file, capabilities: KEYED,
+      }),
+    );
+    // Job 0 went in-flight synchronously; jobs 1..8 queued (cap 8); job 9 overflows.
+    expect(acks[0].status).toBe('scheduled');
+    for (let i = 1; i <= 8; i++) expect(acks[i].status).toBe('scheduled');
+    expect(acks[9]).toEqual({ status: 'skipped', reason: 'queue_full' });
+    // Duplicate of a QUEUED file is a typed skip too.
+    const dup = scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-q1', corpusDir, file: segs[1].file, capabilities: KEYED,
+    });
+    expect(dup).toEqual({ status: 'skipped', reason: 'already_queued' });
+    await __drainCheckpointHarvestForTests();
+    // The overflowed segment is still a plain .txt in the corpus dir — the
+    // sweep backstop extracts it later (no .ingested was written for it).
+    expect(existsSync(join(corpusDir, segs[9].file))).toBe(true);
+    expect(existsSync(join(corpusDir, segs[9].file + CORPUS_INGESTED_SUFFIX))).toBe(false);
+  }, 30_000);
+});
+
+// ── ambient-writeback lane (WP4) ────────────────────────────────────────────
+
+describe('writeback lane (ambient memory backstop)', () => {
+  async function bankWb(sessionId: string, turn: string): Promise<string> {
+    const gated = gateWritebackTurn(turn);
+    if (!gated.ok) throw new Error(`fixture turn gated: ${gated.reason}`);
+    const banked = await bankWritebackTurn(corpusDir, sessionId, gated.normalized, gated.hash24);
+    if (!banked.flushCorpusFile) throw new Error(`bank failed: ${banked.status}`);
+    return banked.flushCorpusFile;
+  }
+
+  test('DB-plane local model extracts an opted-in turn despite a keyless file plane', async () => {
+    const authNames = new Set(Array.from(RECIPES.values()).flatMap((recipe) => recipe.auth_env?.required ?? []));
+    const saved = new Map(Array.from(authNames, (name) => [name, process.env[name]]));
+    for (const name of authNames) delete process.env[name];
+    try {
+      await engine.setConfig('memory.auto_writeback', 'salient');
+      await engine.setConfig('facts.extraction_model', 'ollama:qwen2.5-coder:14b');
+      configureGateway({ env: {} });
+      expect(detectCapabilities().extraction.available).toBe(false);
+      expect(isAvailable('chat', 'ollama:qwen2.5-coder:14b')).toBe(true);
+      chatStub([{ fact: 'Prefers local models for private notes.', entity: null }]);
+      const file = await bankWb('sess-db-writeback', 'I prefer local models for my private notes from now on.');
+      scheduleCheckpointHarvest({
+        engine, sourceId: 'default', sessionId: 'sess-db-writeback', corpusDir, file, lane: 'writeback',
+      });
+      await __drainCheckpointHarvestForTests();
+      expect(existsSync(join(corpusDir, file + CORPUS_INGESTED_SUFFIX))).toBe(true);
+      const rows = await engine.executeRaw<{ source_session: string }>(
+        `SELECT source_session FROM facts WHERE source = 'hook:writeback'`,
+      );
+      expect(rows.some((row) => row.source_session === 'sess-db-writeback')).toBe(true);
+    } finally {
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await engine.unsetConfig('facts.extraction_model');
+    }
+  });
+
+  test('gate ON: extracts with hook:writeback provenance, writeback heartbeat, NO manifest, terminal .ingested', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    chatStub([{ fact: 'prefers dark mode in every editor', entity: null }]);
+    const file = await bankWb('sess-wb1', 'I prefer dark mode in every editor, set it everywhere.');
+    expect(file).toMatch(/\.wb-[0-9a-f]{24}\.txt$/);
+    const ack = scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-wb1', corpusDir, file, capabilities: KEYED, lane: 'writeback',
+    });
+    expect(ack.status).toBe('scheduled');
+    await __drainCheckpointHarvestForTests();
+
+    const rows = await engine.executeRaw<{ source: string; fact: string }>(
+      `SELECT source, fact FROM facts WHERE source = 'hook:writeback'`,
+    );
+    expect(rows.length).toBe(1);
+    // No manifest publish for turn files (no segment ledger).
+    const manifest = await getCheckpointManifest(engine, 'default', null, 'sess-wb1');
+    expect(manifest ?? []).toEqual([]);
+    const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'writeback');
+    expect(hb.length).toBe(1);
+    expect(hb[0].outcome).toBe('ok');
+    expect(hb[0].inserted).toBe(1);
+    const sidecar = JSON.parse(readFileSync(join(corpusDir, file + '.ingested'), 'utf8'));
+    expect(sidecar.lane).toBe('writeback');
+    expect(sidecar.facts_inserted).toBe(1);
+  });
+
+  test('gate OFF (DB authoritative): terminal writeback_off sidecar, zero facts — a stale hook-side bank never extracts', async () => {
+    // Clear any prior test's row — the serve-side gate must be off.
+    await engine.unsetConfig('memory.auto_writeback');
+    chatStub([{ fact: 'should never be written', entity: null }]);
+    const file = await bankWb('sess-wb2', 'I moved to Lisbon for the spring and summer season.');
+    scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-wb2', corpusDir, file, capabilities: KEYED, lane: 'writeback',
+    });
+    await __drainCheckpointHarvestForTests();
+    const rows = await engine.executeRaw<{ id: number }>(`SELECT id FROM facts WHERE source = 'hook:writeback'`);
+    expect(rows.length).toBe(0);
+    const sidecar = JSON.parse(readFileSync(join(corpusDir, file + '.ingested'), 'utf8'));
+    expect(sidecar.skipped).toBe('writeback_off');
+    const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'writeback');
+    expect(hb[0]?.reason).toBe('writeback_off');
+  });
+
+  test('gate OFF beats keyless: the terminal writeback_off sidecar lands even when the brain cannot extract (codex re-review)', async () => {
+    // The gate resolves BEFORE the capability short-circuit — otherwise the
+    // banked file of an operator who turned writeback OFF would linger
+    // eligible on a keyless brain and a later re-enable would extract it.
+    await engine.unsetConfig('memory.auto_writeback');
+    const keyless: CapabilityReport = {
+      embeddings: { available: false },
+      extraction: { available: false },
+      search: 'keyword-only',
+      mode: 'keyless',
+    };
+    const file = await bankWb('sess-wboffkeyless', 'I moved the standing desk into the garden office yesterday.');
+    scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-wboffkeyless', corpusDir, file, capabilities: keyless, lane: 'writeback',
+    });
+    await __drainCheckpointHarvestForTests();
+    const sidecar = JSON.parse(readFileSync(join(corpusDir, file + '.ingested'), 'utf8'));
+    expect(sidecar.skipped).toBe('writeback_off');
+  });
+
+  test('plane drift (DB unset + file mirror enabled): NO sidecar, file survives — a failed dual-write is not operator intent (adversarial review)', async () => {
+    await engine.unsetConfig('memory.auto_writeback');
+    const { configDir } = await import('../src/core/config.ts');
+    const cfgDir = configDir();
+    const cfgPath = join(cfgDir, 'config.json');
+    const hadCfg = existsSync(cfgPath);
+    const prior = hadCfg ? readFileSync(cfgPath, 'utf8') : null;
+    mkdirSync(cfgDir, { recursive: true });
+    writeFileSync(cfgPath, JSON.stringify({ engine: 'pglite', memory: { auto_writeback: 'salient' } }) + '\n');
+    try {
+      chatStub([{ fact: 'must not be extracted under drift', entity: null }]);
+      const file = await bankWb('sess-wbdrift', 'I moved my standing desk to the garden office for the summer.');
+      scheduleCheckpointHarvest({
+        engine, sourceId: 'default', sessionId: 'sess-wbdrift', corpusDir, file, capabilities: KEYED, lane: 'writeback',
+      });
+      await __drainCheckpointHarvestForTests();
+      // The OLD behavior wrote the terminal writeback_off sidecar here —
+      // permanently destroying every turn banked during the drift window.
+      expect(existsSync(join(corpusDir, file + '.ingested'))).toBe(false);
+      expect(existsSync(join(corpusDir, file))).toBe(true);
+      const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'writeback');
+      expect(hb[0]?.reason).toBe('writeback_plane_drift');
+      const rows = await engine.executeRaw<{ id: number }>(`SELECT id FROM facts WHERE source = 'hook:writeback'`);
+      expect(rows.length).toBe(0);
+    } finally {
+      if (prior !== null) writeFileSync(cfgPath, prior);
+      else rmSync(cfgPath, { force: true });
+    }
+  });
+
+  test('non-transport extraction skip (refusal/malformed class): NO sidecar — the sweep gets one retry instead of silent permanent loss', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    __setChatTransportForTests(async (): Promise<ChatResult> => ({
+      text: 'I cannot extract facts from this text.',
+      blocks: [],
+      stopReason: 'end',
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'test:stub',
+      providerId: 'test',
+    }));
+    const file = await bankWb('sess-wbskip', 'I switched my primary editor theme to solarized light last week.');
+    scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-wbskip', corpusDir, file, capabilities: KEYED, lane: 'writeback',
+    });
+    await __drainCheckpointHarvestForTests();
+    expect(existsSync(join(corpusDir, file + '.ingested'))).toBe(false);
+    expect(existsSync(join(corpusDir, file))).toBe(true);
+    const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'writeback');
+    expect(String(hb[0]?.reason)).toStartWith('extract_skipped_');
+  });
+
+  test('duplicate turn: same text → same wb name → wb_dup on re-bank; pre-existing .ingested short-circuits the harvest', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    const turn = 'I decided to consolidate the staging environments next week.';
+    const g = gateWritebackTurn(turn);
+    if (!g.ok) throw new Error('fixture gated');
+    const first = await bankWritebackTurn(corpusDir, 'sess-wb3', g.normalized, g.hash24);
+    expect(first.status).toBe('wb_banked');
+    const second = await bankWritebackTurn(corpusDir, 'sess-wb3', g.normalized, g.hash24);
+    expect(second.status).toBe('wb_dup');
+    expect(second.flushCorpusFile).toBe(first.flushCorpusFile);
+
+    // Pre-mark ingested: the harvest must short-circuit without extraction.
+    writeFileSync(join(corpusDir, first.flushCorpusFile! + '.ingested'), JSON.stringify({ ingested_at: 'x' }) + '\n');
+    scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-wb3', corpusDir, file: first.flushCorpusFile!, capabilities: KEYED, lane: 'writeback',
+    });
+    await __drainCheckpointHarvestForTests();
+    const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'writeback');
+    expect(hb[0]?.reason).toBe('already_ingested');
+    const rows = await engine.executeRaw<{ id: number }>(`SELECT id FROM facts WHERE source = 'hook:writeback'`);
+    expect(rows.length).toBe(0);
+  });
+
+  test('per-session prompt-harvest cap (F9/OV2-4): the 31st schedule is session_cap; other sessions unaffected', async () => {
+    // Gate OFF keeps each drain LLM-free (writeback_off is a cheap terminal
+    // skip) — the cap counts enqueues regardless of extraction outcome.
+    // (Explicit unset: the previous test set 'salient' on the shared engine.)
+    await engine.unsetConfig('memory.auto_writeback');
+    for (let i = 0; i < WRITEBACK_SESSION_CAP; i++) {
+      const file = await bankWb('sess-cap', `Standing preference number ${i}: I want weekly summary emails variant ${i}.`);
+      const ack = scheduleCheckpointHarvest({
+        engine, sourceId: 'default', sessionId: 'sess-cap', corpusDir, file, capabilities: KEYED, lane: 'writeback',
+      });
+      expect(ack.status).toBe('scheduled');
+      await __drainCheckpointHarvestForTests();
+    }
+    const over = await bankWb('sess-cap', 'One preference too many: I want a monthly digest as well now.');
+    const ack = scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-cap', corpusDir, file: over, capabilities: KEYED, lane: 'writeback',
+    });
+    expect(ack).toEqual({ status: 'skipped', reason: 'session_cap' });
+    // The banked file REMAINS for the sweep batch (nothing dropped).
+    expect(existsSync(join(corpusDir, over))).toBe(true);
+    // A different session still schedules.
+    const other = await bankWb('sess-other', 'I prefer the dashboard sorted by most recent activity.');
+    const ack2 = scheduleCheckpointHarvest({
+      engine, sourceId: 'default', sessionId: 'sess-other', corpusDir, file: other, capabilities: KEYED, lane: 'writeback',
+    });
+    expect(ack2.status).toBe('scheduled');
+    await __drainCheckpointHarvestForTests();
+  });
+});
+
+/** A chat stub that records every prompt the extractor sends. */
+function recordingChatStub(): string[] {
+  const prompts: string[] = [];
+  __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+    prompts.push(opts.messages.map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content))).join('\n'));
+    return {
+      text: JSON.stringify({ facts: [{ fact: 'prefers dark roast coffee', kind: 'preference', entity: null, confidence: 1.0, notability: 'high' }] }),
+      blocks: [], stopReason: 'end',
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'test:stub', providerId: 'test',
+    };
+  });
+  return prompts;
+}
+
+const PASTE = '<pasted_content id="2830">\nForwarded email: the offsite moves to March and the budget is final.\n</pasted_content id="2830">';
+
+describe('pasted content never reaches the extractor (#5812)', () => {
+  test('compact lane: a paste inside a [user] block is stripped before extraction; the segment file is unchanged', async () => {
+    const prompts = recordingChatStub();
+    const text = toCorpusText([
+      { role: 'user', text: `Please remember this note I got:\n\n${PASTE}\n\nand also I prefer dark roast coffee.` },
+      { role: 'assistant', text: 'Saved both.' },
+    ]);
+    const seg = bankSegment('sess-paste-compact', text);
+    scheduleCheckpointHarvest({ engine, sourceId: 'default', sessionId: 'sess-paste-compact', corpusDir, file: seg.file, capabilities: KEYED });
+    await __drainCheckpointHarvestForTests();
+    expect(prompts.length).toBeGreaterThan(0);
+    expect(prompts.join('\n')).not.toContain('offsite moves to March');
+    expect(prompts.join('\n')).toContain('I prefer dark roast coffee');
+    expect(readFileSync(join(corpusDir, seg.file), 'utf8')).toContain('offsite moves to March');
+  });
+
+  test('writeback lane: a turn file banked with a paste (older binary) is extracted without it', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    const prompts = recordingChatStub();
+    const file = 'sess-paste-wb.wb-0123456789abcdef01234567.txt';
+    writeFileSync(join(corpusDir, file), `Please remember this note I got: ${PASTE} and also I prefer dark roast coffee.\n`);
+    scheduleCheckpointHarvest({ engine, sourceId: 'default', sessionId: 'sess-paste-wb', corpusDir, file, capabilities: KEYED, lane: 'writeback' });
+    await __drainCheckpointHarvestForTests();
+    expect(prompts.length).toBeGreaterThan(0);
+    expect(prompts.join('\n')).not.toContain('offsite moves to March');
+    expect(prompts.join('\n')).toContain('I prefer dark roast coffee');
+  });
+});
+
+describe('serve-lane self-capture skip (#5820)', () => {
+  let savedConfigDir: string | undefined;
+  beforeEach(() => {
+    savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    const claudeDir = mkdtempSync(join(tmpdir(), 'gb-ckpt-claude-'));
+    tmpDirs.push(claudeDir);
+    process.env.CLAUDE_CONFIG_DIR = claudeDir;
+    const scratch = join(claudeDir, 'projects', `-tmp-${CLAUDE_CLI_CWD_PREFIX}4242`);
+    mkdirSync(scratch, { recursive: true });
+    writeFileSync(join(scratch, 'sess-self.jsonl'), '{}\n');
+  });
+  afterEach(() => {
+    if (savedConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+  });
+
+  test('a banked self-capture scheduled over IPC makes zero extraction calls and leaves the terminal sidecar; the sweep then skips it', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    const prompts = recordingChatStub();
+    const g = gateWritebackTurn('Extract the facts from the following page and return them as JSON objects.');
+    if (!g.ok) throw new Error('fixture gated');
+    const banked = await bankWritebackTurn(corpusDir, 'sess-self', g.normalized, g.hash24);
+    const handler = makeContextPackIpcHandler(engine, 'default');
+    const ack = await handler({
+      kind: 'context_pack', protocol: 2, secret: 's', sessionId: 'sess-self', bankOnly: true,
+      window: [], flushCorpusFile: banked.flushCorpusFile!,
+    });
+    expect(ack?.checkpointFlush?.status).toBe('scheduled');
+    await __drainCheckpointHarvestForTests();
+    expect(prompts).toEqual([]);
+    const sidecar = JSON.parse(readFileSync(join(corpusDir, banked.flushCorpusFile! + CORPUS_INGESTED_SUFFIX), 'utf8'));
+    expect(sidecar.skipped).toBe('self_capture');
+    const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'writeback');
+    expect(hb[0]).toMatchObject({ outcome: 'ok', reason: 'self_capture' });
+
+    const swept = await runMaintenanceSweep(engine, { sourceId: 'default', capabilities: KEYED });
+    expect(swept.corpusIngested).toBe(0);
+    expect(swept.skipped).toContainEqual({ reason: 'already_ingested', count: 1 });
+    expect(prompts).toEqual([]);
+    const rows = await engine.executeRaw<{ id: number }>(`SELECT id FROM facts WHERE source_session = 'sess-self'`);
+    expect(rows.length).toBe(0);
+  });
+
+  test('an ordinary session in the same corpus is still extracted', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    const prompts = recordingChatStub();
+    const g = gateWritebackTurn('I prefer dark roast coffee and I want it on every order.');
+    if (!g.ok) throw new Error('fixture gated');
+    const banked = await bankWritebackTurn(corpusDir, 'sess-human', g.normalized, g.hash24);
+    scheduleCheckpointHarvest({ engine, sourceId: 'default', sessionId: 'sess-human', corpusDir, file: banked.flushCorpusFile!, capabilities: KEYED, lane: 'writeback' });
+    await __drainCheckpointHarvestForTests();
+    expect(prompts.length).toBeGreaterThan(0);
+    expect(JSON.parse(readFileSync(join(corpusDir, banked.flushCorpusFile! + CORPUS_INGESTED_SUFFIX), 'utf8')).lane).toBe('writeback');
+  });
+});
+
+// ── canonical writer busy past the preflight wait (#5557) ──────────────────
+describe('canonical writer busy past the preflight wait (#5557)', () => {
+  const COFFEE_TURN = 'I prefer dark roast coffee and I want it on every order.';
+  const releases: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    for (const release of releases.splice(0)) await release();
+    __setWriterBusyRetryDelaysForTests(null);
+    await disposePersistenceConsumer(engine);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+  });
+
+  /** A managed source owned by this host, its worktree lock free. */
+  async function managedSource(): Promise<{ sourceId: string; binding: WorktreeBinding }> {
+    const sourceId = `wb-busy-${randomUUID().slice(0, 8)}`;
+    const root = mkdtempSync(join(homeDir, 'root-'));
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    await engine.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [sourceId, root]);
+    await claimWorktree(engine, sourceId, root);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    return { sourceId, binding: (await getWorktreeBinding(engine, sourceId))! };
+  }
+
+  /** Takes the worktree lock, as a Git effect's commit and push do, until the returned release runs. */
+  async function takeWriter(binding: WorktreeBinding): Promise<() => Promise<void>> {
+    const lock = await acquireWorktree(binding, 0, undefined, engine);
+    expect(lock).not.toBeNull();
+    const release = () => lock!.release();
+    releases.push(release);
+    return release;
+  }
+
+  async function bankTurn(sessionId: string, turn: string): Promise<string> {
+    const gated = gateWritebackTurn(turn);
+    if (!gated.ok) throw new Error(`fixture turn gated: ${gated.reason}`);
+    return (await bankWritebackTurn(corpusDir, sessionId, gated.normalized, gated.hash24)).flushCorpusFile!;
+  }
+
+  const scheduleWb = (sourceId: string, sessionId: string, file: string) =>
+    scheduleCheckpointHarvest({ engine, sourceId, sessionId, corpusDir, file, capabilities: KEYED, lane: 'writeback' });
+
+  async function untilHeartbeat(event: string): Promise<void> {
+    while (!(await readHeartbeatTail(10)).some((e) => e.event === event)) await new Promise((r) => setTimeout(r, 25));
+  }
+
+  /** Captures console.error lines while `run` executes. */
+  async function stderrDuring(run: () => Promise<void>): Promise<string[]> {
+    const lines: string[] = [];
+    const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { lines.push(args.map(String).join(' ')); });
+    try {
+      await run();
+    } finally {
+      spy.mockRestore();
+    }
+    return lines;
+  }
+
+  test('a turn refused while the writer is busy is re-queued and extracted once the writer frees', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    const prompts = recordingChatStub();
+    __setWriterBusyRetryDelaysForTests([200]);
+    const { sourceId, binding } = await managedSource();
+    const file = await bankTurn('sess-busy-recover', COFFEE_TURN);
+    const release = await takeWriter(binding);
+    scheduleWb(sourceId, 'sess-busy-recover', file);
+    await untilHeartbeat('writeback');
+    await release();
+    await __drainCheckpointHarvestForTests();
+
+    const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'writeback');
+    expect(hb.map((e) => [e.outcome, e.reason ?? null])).toEqual([['degraded', 'writer_busy_requeued'], ['ok', null]]);
+    expect(hb[1]?.inserted).toBe(1);
+    expect(prompts.length).toBe(1);
+    expect(existsSync(join(corpusDir, file + CORPUS_INGESTED_SUFFIX))).toBe(true);
+    const rows = await engine.executeRaw<{ source_session: string }>(`SELECT source_session FROM facts WHERE source = 'hook:writeback'`);
+    expect(rows.map((r) => r.source_session)).toEqual(['sess-busy-recover']);
+  }, 30_000);
+
+  test('a writer still busy after the last retry ends as an error that keeps its code, logged once per code; the turns stay for the sweep', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    const prompts = recordingChatStub();
+    __setWriterBusyRetryDelaysForTests([50]);
+    const { sourceId, binding } = await managedSource();
+    const files = [
+      await bankTurn('sess-busy-a', COFFEE_TURN),
+      await bankTurn('sess-busy-b', 'I decided to move the weekly review to Thursday mornings.'),
+    ];
+    const release = await takeWriter(binding);
+    const errors = await stderrDuring(async () => {
+      scheduleWb(sourceId, 'sess-busy-a', files[0]!);
+      scheduleWb(sourceId, 'sess-busy-b', files[1]!);
+      await __drainCheckpointHarvestForTests();
+    });
+    await release();
+
+    const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'writeback');
+    expect(hb.filter((e) => e.outcome === 'degraded').map((e) => e.reason)).toEqual(['writer_busy_requeued', 'writer_busy_requeued']);
+    expect(hb.filter((e) => e.outcome === 'error').map((e) => e.reason))
+      .toEqual(['operationerror:writer_lock_unavailable', 'operationerror:writer_lock_unavailable']);
+    expect(errors.filter((line) => line.includes('operationerror:writer_lock_unavailable')).length).toBe(1);
+    expect(prompts).toEqual([]);
+    for (const file of files) {
+      expect(existsSync(join(corpusDir, file))).toBe(true);
+      expect(existsSync(join(corpusDir, file + CORPUS_INGESTED_SUFFIX))).toBe(false);
+    }
+  }, 30_000);
+
+  test('a compact segment refused while the writer is busy is not re-queued: the error stands for the sweep', async () => {
+    const prompts = recordingChatStub();
+    __setWriterBusyRetryDelaysForTests([50]);
+    const { sourceId, binding } = await managedSource();
+    const seg = bankSegment('sess-busy-compact', `User: ${COFFEE_TURN}\n`);
+    const release = await takeWriter(binding);
+    scheduleCheckpointHarvest({ engine, sourceId, sessionId: 'sess-busy-compact', corpusDir, file: seg.file, capabilities: KEYED });
+    await __drainCheckpointHarvestForTests();
+    await release();
+
+    const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'checkpoint-harvest');
+    expect(hb.map((e) => [e.outcome, e.reason ?? null])).toEqual([['error', 'operationerror:writer_lock_unavailable']]);
+    expect(prompts).toEqual([]);
+    expect(existsSync(join(corpusDir, seg.file))).toBe(true);
+    expect(existsSync(join(corpusDir, seg.file + CORPUS_INGESTED_SUFFIX))).toBe(false);
+  }, 30_000);
+
+  test('an extraction failure keeps its reason; each distinct reason reaches stderr once', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    __setChatTransportForTests(async (): Promise<ChatResult> => { throw new Error('synthetic provider outage'); });
+    __setWriterBusyRetryDelaysForTests([]);
+    const { sourceId, binding } = await managedSource();
+    const extractionFailure = await bankTurn('sess-fail-provider', COFFEE_TURN);
+    const busyFailure = await bankTurn('sess-fail-busy', 'I decided to move the weekly review to Thursday mornings.');
+    const errors = await stderrDuring(async () => {
+      scheduleWb('default', 'sess-fail-provider', extractionFailure);
+      await __drainCheckpointHarvestForTests();
+      const release = await takeWriter(binding);
+      scheduleWb(sourceId, 'sess-fail-busy', busyFailure);
+      await __drainCheckpointHarvestForTests();
+      await release();
+    });
+
+    const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'writeback');
+    expect(hb.map((e) => [e.outcome, e.reason])).toEqual([
+      ['error', 'factsextractionerror:provider_error'],
+      ['error', 'operationerror:writer_lock_unavailable'],
+    ]);
+    const harvestLines = errors.filter((line) => line.startsWith('[checkpoint-harvest]'));
+    expect(harvestLines.length).toBe(2);
+    expect(harvestLines[0]).toContain('(factsextractionerror:provider_error)');
+    expect(harvestLines[1]).toContain('(operationerror:writer_lock_unavailable)');
+  }, 30_000);
+
+  test('a pending retry dedups a re-scheduled turn; shutdown drops the retry and nothing runs after it', async () => {
+    await engine.setConfig('memory.auto_writeback', 'salient');
+    const prompts = recordingChatStub();
+    __setWriterBusyRetryDelaysForTests([60_000]);
+    const { sourceId, binding } = await managedSource();
+    const file = await bankTurn('sess-busy-shutdown', COFFEE_TURN);
+    await takeWriter(binding);
+    scheduleWb(sourceId, 'sess-busy-shutdown', file);
+    await untilHeartbeat('writeback');
+    expect(scheduleWb(sourceId, 'sess-busy-shutdown', file)).toEqual({ status: 'skipped', reason: 'already_queued' });
+    const started = performance.now();
+    await shutdownCheckpointHarvest();
+    await __drainCheckpointHarvestForTests();
+    expect(performance.now() - started).toBeLessThan(1000);
+    const hb = (await readHeartbeatTail(10)).filter((e) => e.event === 'writeback');
+    expect(hb.map((e) => e.reason)).toEqual(['writer_busy_requeued']);
+    expect(prompts).toEqual([]);
+    expect(existsSync(join(corpusDir, file))).toBe(true);
+  }, 30_000);
+});

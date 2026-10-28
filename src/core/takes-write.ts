@@ -1,0 +1,863 @@
+/**
+ * Shared takes write-through core — consumed by the `gbrain takes` CLI
+ * (src/commands/takes.ts) and the takes_* MCP ops (src/core/ops/takes.ts).
+ *
+ * MARKDOWN IS CANONICAL (the extract-takes contract, src/core/cycle/
+ * extract-takes.ts): the md→DB reconcile upserts ON CONFLICT(page_id,row_num)
+ * and the extract rebuild lane deletes+reinserts from md, so any writer that
+ * creates DB-only rows gets silently clobbered by the next sync/extract. Every
+ * mutation here is therefore md-FIRST — row numbers derive from the fence
+ * (takes-fence.ts), the .md file is written before the DB — and the markdown
+ * write is REQUIRED: when the page file can't be located the write REFUSES
+ * (TakesWriteError 'mirror_unavailable') instead of creating divergence.
+ *
+ * Every mutate runs this pipeline:
+ *
+ *   lock(slug, timeout) ─▶ page id (DB, source-scoped) ─▶ read .md
+ *        │                                                   │
+ *        │                    row lookup + holder fence ◀────┘ (fence rows,
+ *        │                          │                          md-canonical)
+ *        │                    fence edit ─▶ write .md ─▶ DB mirror ─▶ release
+ *        ▼
+ *   [contended → 'page_locked' (retryable)]
+ *
+ * The DB mirror for add/update/supersede is addTakesBatch's upsert of the
+ * affected fence rows — the same primitive the extract pipeline uses, so the
+ * mirror can never disagree with a later reconcile. Its DO UPDATE clause
+ * touches base columns only (resolution columns preserved). resolve mirrors
+ * via engine.resolveTake (resolution fields aren't in TakeBatchInput);
+ * a drifted DB missing the row is self-healed by upserting the base row
+ * first — md is the truth being propagated.
+ *
+ * Holder fence (remote callers): callers pass `allowList` (null/undefined =
+ * trusted local, unfenced; [] = deny-all). Row-level checks look up the
+ * PARSED FENCE row and a fenced holder presents as 'row_not_found' — the
+ * same shape as a genuinely missing row — hiding content and holder.
+ * (Existence-by-count via dense row numbers is a documented, accepted
+ * limitation — see ops/takes.ts.)
+ */
+
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import type { BrainEngine, TakeBatchInput, TakeKind } from './engine.ts';
+import {
+  parseTakesFence,
+  renderTakesFence,
+  upsertTakeRow,
+  supersedeRow,
+  TAKES_FENCE_BEGIN,
+  TAKES_FENCE_END,
+  type ParsedTake,
+  type ParseResult,
+  type TakeQuality,
+} from './takes-fence.ts';
+import { locateOutsideCode } from './fence-scan.ts';
+import { withPageLock } from './page-lock.ts';
+import { resolvePageFilePath, resolveSourceLocalFilePath } from './markdown.ts';
+import { sanitizeRecordedSourcePath, recordedPathFromFileUri, scannerSlugRootMode } from './write-through.ts';
+import { isWriteTargetContained, msysToNativePath } from './path-confine.ts';
+import { atomicWriteFileSync } from './atomic-write.ts';
+import { commitWriteThroughFile, isDurabilityHardened } from './brain-repo-durability.ts';
+import { maintenanceTransaction } from './persistence/attribution.ts';
+import type { WriteTrust } from './trust/tier.ts';
+
+export type TakesWriteErrorCode =
+  | 'page_not_found'      // slug has no pages row (scoped)
+  | 'row_not_found'       // fence lacks the row OR the holder fence masks it
+  | 'already_resolved'    // resolved rows are immutable; supersede instead
+  | 'row_inactive'        // superseded rows can't be updated/resolved again
+  | 'holder_denied'       // add with a holder outside the allow-list
+  | 'no_fields'           // update with zero mutable fields
+  | 'mirror_unavailable'  // sync.repo_path unset, page file absent, or write target escapes the source root
+  | 'page_locked'         // lock contention within the timeout (retryable)
+  | 'fence_unparsed'      // the page's fence has parser-skipped rows a whole-fence re-render would delete
+  | 'invalid_input';      // free-text field carries control chars, fence markers, or out-of-range values
+
+export class TakesWriteError extends Error {
+  code: TakesWriteErrorCode;
+  hint?: string;
+  constructor(code: TakesWriteErrorCode, message: string, hint?: string) {
+    super(message);
+    this.name = 'TakesWriteError';
+    this.code = code;
+    this.hint = hint;
+  }
+}
+
+/** null/undefined = trusted local (unfenced); [] = deny-all. */
+export type HolderAllowList = readonly string[] | null | undefined;
+
+export interface TakesWriteTarget {
+  engine: BrainEngine;
+  slug: string;
+  /** Brain repo dir (resolveTakesRepoDir or an explicit CLI --dir). */
+  brainDir: string;
+  /** Scalar source scope for the pages lookup (writes are scalar). */
+  sourceId?: string;
+  allowList?: HolderAllowList;
+  /** Lock wait budget. CLI keeps the 30s default; ops pass ~2000. */
+  lockTimeoutMs?: number;
+  /** #5575 I2: a deriver's tier for the added row (`think --take`); absent, the row is undeclared. */
+  trust?: WriteTrust;
+}
+
+/**
+ * The markdown write always succeeds before the DB mirror is attempted, and md
+ * is canonical — so a failed DB mirror is NOT fatal (the next reconcile heals
+ * it; throwing would make the caller retry and duplicate the durable md row).
+ * `mirror_warning` carries the DB-mirror error when it happened; `written` is
+ * still true because the markdown row is on disk.
+ */
+export interface TakeMirror { written: true; path: string; mirror_warning?: string }
+
+/** DB-mirror failures are non-fatal (md is canonical) — stringify for the warning. */
+function mirrorErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Resolve the markdown brain dir for takes write-through. Returns null when
+ * `sync.repo_path` is unset or missing on disk — callers decide the refusal
+ * shape (ops: 'mirror_unavailable'; CLI: its historical error text + exit 1).
+ */
+export async function resolveTakesRepoDir(engine: BrainEngine): Promise<string | null> {
+  const configured = await engine.getConfig('sync.repo_path');
+  if (configured && existsSync(configured)) return configured;
+  return null;
+}
+
+/**
+ * P1-1 (source isolation): resolve the ACTUAL per-source markdown path for a
+ * write, mirroring write-through.ts's topology so a source-scoped take lands in
+ * the SAME working tree `gbrain sync` reads it back from. The old
+ * `join(brainDir, slug.md)` ignored the page's source entirely, so a non-default
+ * source's write clobbered a same-slug file in the wrong tree.
+ *
+ *   1. Source has its OWN `local_path` working tree → use the page's recorded
+ *      `source_path`, removing a duplicated Git-root scope when local_path is
+ *      a repo subdirectory; a DB-born page falls back to `<local_path>/<slug>.md`.
+ *   2. No per-source `local_path` → the shared host repo (`brainDir`): default
+ *      source at the root, non-default nested under `.sources/<id>/`.
+ *
+ * #3605: in BOTH topologies the page's vetted recorded path (`source_path`,
+ * or a contained `file://` `source_uri` from `gbrain capture --file`) is
+ * preferred over a slug-derived name — the on-disk name is often NOT the slug
+ * (`people/Jane Doe.md` has slug `people/jane-doe`), so deriving `<slug>.md`
+ * minted a stray twin on add and refused update/resolve with
+ * 'mirror_unavailable' even though the page's file was right there. A hostile
+ * or unusable recorded path sanitizes to null and falls back to the slug path.
+ *
+ * The returned `writeRoot` is the containment boundary enforced before any write
+ * (P1-2). `resolvePageFilePath` does the slug→path join for the fallback case.
+ */
+async function resolveTakesFilePath(
+  engine: BrainEngine,
+  brainDir: string | null,
+  slug: string,
+  sourceId?: string,
+): Promise<{ path: string; writeRoot: string }> {
+  const src = sourceId ?? 'default';
+  const rows = await engine.executeRaw<
+    { local_path: string | null; source_path: string | null; source_uri: string | null }
+  >(
+    `SELECT s.local_path, p.source_path, p.source_uri
+       FROM sources s
+       LEFT JOIN pages p ON p.source_id = s.id AND p.slug = $2 AND p.deleted_at IS NULL
+      WHERE s.id = $1
+      LIMIT 1`,
+    [src, slug],
+  );
+  // #2955: heal Git Bash/MSYS-recorded local_path (`/c/Users/x`) before any
+  // join/containment math — same normalization as write-through.ts. Without
+  // it the writeRoot resolves to a phantom `<cwd-drive>:\c\...` on Windows.
+  const sourceLocalPath = rows[0]?.local_path ? msysToNativePath(rows[0].local_path) : null;
+  const recordedSourcePath = rows[0]?.source_path ?? null;
+  const recordedUri = rows[0]?.source_uri ?? null;
+  if (sourceLocalPath) {
+    const recordedPath =
+      (recordedSourcePath ? resolveSourceLocalFilePath(sourceLocalPath, recordedSourcePath, slug, await scannerSlugRootMode(engine, src, sourceLocalPath)) : null) ??
+      (() => {
+        const fromUri = recordedPathFromFileUri(recordedUri, sourceLocalPath);
+        return fromUri ? join(sourceLocalPath, fromUri) : null;
+      })();
+    // A null recorded path means a DB-born page. Keep the established slug path.
+    const path = recordedPath ?? resolvePageFilePath(sourceLocalPath, slug, 'default');
+    return { path, writeRoot: sourceLocalPath };
+  }
+  // #4473: a null brainDir (sync.repo_path unset) is only survivable when the
+  // source carries its own local_path (handled above). A host-repo page has
+  // nowhere to land — refuse with the standard mirror_unavailable shape so
+  // batch callers (takes bootstrap) can skip-and-count instead of aborting.
+  if (brainDir === null) {
+    throw new TakesWriteError(
+      'mirror_unavailable',
+      `No markdown repo for source '${src}' — sync.repo_path is unset and the source has no local_path.`,
+      'takes_mirror_unavailable',
+    );
+  }
+  const pageRoot = src === 'default' ? brainDir : join(brainDir, '.sources', src);
+  const knownPath =
+    sanitizeRecordedSourcePath(recordedSourcePath) ??
+    recordedPathFromFileUri(recordedUri, pageRoot);
+  const path = knownPath
+    ? join(pageRoot, knownPath)
+    : resolvePageFilePath(brainDir, slug, src);
+  return { path, writeRoot: brainDir };
+}
+
+/** Test seam: pins the #2955 msys local_path healing at THIS read site. */
+export const __takesWriteTesting = { resolveTakesFilePath };
+
+/**
+ * #4473 — public read-only probe of the takes write path. The takes-bootstrap
+ * sweep (extract-takes-from-pages.ts) checks file existence BEFORE spending an
+ * LLM call on a page it could never write (a skipped page is rescanned by
+ * every future run, so classifying it first would re-burn budget each time).
+ * Throws 'mirror_unavailable' when the page has no resolvable markdown home.
+ */
+export async function resolveTakesWritePath(
+  engine: BrainEngine,
+  brainDir: string | null,
+  slug: string,
+  sourceId?: string,
+): Promise<{ path: string; writeRoot: string }> {
+  return resolveTakesFilePath(engine, brainDir, slug, sourceId);
+}
+
+async function getPageId(engine: BrainEngine, slug: string, sourceId?: string): Promise<number> {
+  const rows = sourceId
+    ? await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM pages WHERE slug = $1 AND source_id = $2 LIMIT 1`,
+        [slug, sourceId],
+      )
+    : await engine.executeRaw<{ id: number }>(
+        `SELECT id FROM pages WHERE slug = $1 LIMIT 1`,
+        [slug],
+      );
+  if (!rows[0]) {
+    throw new TakesWriteError(
+      'page_not_found',
+      `Page not found in brain: ${slug}${sourceId ? ` (source=${sourceId})` : ''}.`,
+      'Run a brain sync first, or check the slug/source.',
+    );
+  }
+  return rows[0].id;
+}
+
+function assertHolderAllowed(holder: string, allowList: HolderAllowList): void {
+  if (allowList === null || allowList === undefined) return; // trusted local
+  if (!allowList.includes(holder)) {
+    throw new TakesWriteError(
+      'holder_denied',
+      `holder '${holder}' is not in this caller's takes-holder allow-list.`,
+      'holder_not_in_allowlist',
+    );
+  }
+}
+
+/**
+ * Fence-injection guard for free-text cells. Every user-supplied string that
+ * lands in a fence cell must be single-line (control chars — newlines
+ * included — would let one cell mint extra table rows) and must not carry the
+ * fence-marker text: 'gbrain:takes' is the tightest common substring of
+ * TAKES_FENCE_BEGIN/TAKES_FENCE_END, so a cell containing it could terminate
+ * the fence early or open a second one, rewriting rows the caller doesn't own.
+ */
+const CELL_CONTROL_CHARS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\n\r\t]/;
+const FENCE_MARKER_SUBSTRING = 'gbrain:takes';
+function assertSafeCellText(field: string, value: string | undefined): void {
+  if (typeof value !== 'string') return;
+  if (CELL_CONTROL_CHARS.test(value)) {
+    throw new TakesWriteError(
+      'invalid_input',
+      `${field} contains control characters (newlines included) — takes fence cells are single-line.`,
+    );
+  }
+  if (value.includes(FENCE_MARKER_SUBSTRING)) {
+    throw new TakesWriteError(
+      'invalid_input',
+      `${field} contains the takes fence marker text ('${FENCE_MARKER_SUBSTRING}') — refusing a fence-injection write.`,
+    );
+  }
+  // F2: a wholly-strikethrough value (`~~x~~`) round-trips as active:false —
+  // fence-shared.ts stripStrikethrough matches ^~~(.+?)~~$ — so writing it as an
+  // active claim would silently mark the take inactive on the next parse.
+  if (/^~~[\s\S]*~~$/.test(value.trim())) {
+    throw new TakesWriteError(
+      'invalid_input',
+      `${field} is wholly strikethrough-wrapped; that markup marks a take inactive on the next parse.`,
+    );
+  }
+}
+
+/**
+ * #4473 — non-throwing form of the fence-cell guards. The takes-bootstrap
+ * sweep pre-filters LLM-authored claims with this so one hostile/garbled
+ * claim drops alone instead of sinking the page's other claims (the writer
+ * below still asserts — defense in depth).
+ */
+export function isSafeFenceCellText(value: string): boolean {
+  try {
+    assertSafeCellText('cell', value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The param docs promise weight 0..1 and the DB clamps out-of-range values
+ * (normalizeWeightForStorage) — writing the raw value to md would diverge the
+ * markdown from the DB mirror, so out-of-range is refused up front.
+ */
+function assertValidWeight(weight: number | undefined): void {
+  if (weight === undefined) return;
+  if (!Number.isFinite(weight) || weight < 0 || weight > 1) {
+    throw new TakesWriteError('invalid_input', `weight must be a number in [0, 1] (got ${weight}).`);
+  }
+}
+
+const SINCE_DATE_RE = /^\d{4}-\d{2}(-\d{2})?$/;
+function assertValidSinceDate(value: string | undefined): void {
+  if (value === undefined) return;
+  if (!SINCE_DATE_RE.test(value)) {
+    throw new TakesWriteError(
+      'invalid_input',
+      `since date must be 'YYYY-MM' or 'YYYY-MM-DD' (got '${value}').`,
+    );
+  }
+}
+
+/**
+ * Row lookup with the no-existence-leak masking: a row that is absent from
+ * the fence AND a row whose holder the caller cannot see produce the SAME
+ * error shape.
+ */
+function findFenceRow(takes: ParsedTake[], rowNum: number, allowList: HolderAllowList, slug: string): ParsedTake {
+  const target = takes.find(t => t.rowNum === rowNum);
+  const visible = target
+    && (allowList === null || allowList === undefined || allowList.includes(target.holder));
+  if (!target || !visible) {
+    throw new TakesWriteError('row_not_found', `Row #${rowNum} not found on ${slug}.`);
+  }
+  return target;
+}
+
+function readPageBody(path: string): string {
+  if (!existsSync(path)) {
+    throw new TakesWriteError(
+      'mirror_unavailable',
+      `Page file not found at ${path} — takes are markdown-canonical, so the write is refused.`,
+      'takes_mirror_unavailable',
+    );
+  }
+  return readFileSync(path, 'utf-8');
+}
+
+/**
+ * P1-2: contain the target within the source's working tree before any
+ * mkdir/write (a pre-existing hostile row or a symlinked intermediate dir must
+ * not escape), then atomic temp+rename so a reader never observes a torn file
+ * and a crash mid-write leaves only a tmp sibling.
+ */
+function writePageBody(path: string, body: string, writeRoot: string, slug: string): void {
+  if (!isWriteTargetContained(path, writeRoot)) {
+    throw new TakesWriteError(
+      'mirror_unavailable',
+      'takes write target escapes the source root',
+      'path_escapes_source_root',
+    );
+  }
+  mkdirSync(dirname(path), { recursive: true });
+  atomicWriteFileSync(path, body);
+  // Same #2426 contract as put_page write-through: a durability-hardened repo
+  // gets a best-effort, path-limited commit; a failed commit never fails the write.
+  if (isDurabilityHardened(writeRoot)) commitWriteThroughFile(writeRoot, path, slug);
+}
+
+/**
+ * F1 (cross-holder data-loss guard): the row-targeting mutates re-render the
+ * WHOLE fence from `parsed.takes`, so any row parseTakesFence skipped (duplicate
+ * row_num, unknown kind outside {fact,take,bet,hunch}, malformed cells) — or any
+ * row it flagged — would be permanently deleted on the next write, INCLUDING a
+ * row held by an identity a world-fenced caller can't see. Refuse the write when
+ * the fence carries any parse warning; it must be reconciled first.
+ */
+function assertFenceRoundTrips(parsed: ParseResult): void {
+  if (parsed.warnings.length > 0) {
+    throw new TakesWriteError(
+      'fence_unparsed',
+      `The page's takes fence has rows this version can't safely round-trip: ${parsed.warnings[0]}`,
+      // #3697: this used to name `gbrain extract takes --slugs`, which is not the
+      // command grammar (extract has links/timeline/all; takes extraction lives
+      // under `gbrain takes extract`). Point at surfaces that exist.
+      "Reconcile the page's takes fence before mutating — it contains rows this version can't safely round-trip. Preview its repair with `gbrain repair fences` (read-only; it names the exact edit when gbrain will not repair it), fix the malformed fence rows by hand, or re-extract via `gbrain takes extract --from-pages --include-covered`.",
+    );
+  }
+}
+
+/**
+ * Re-render the body's takes fence with `rows`. The fence's reservation rows
+ * stay, and `reserve` adds new ones (W9F item 4: `takes remove`).
+ */
+function replaceFence(body: string, rows: ParsedTake[], reserve: readonly number[] = []): string {
+  const newFence = renderTakesFence(rows, [...parseTakesFence(body).reservedRowNums, ...reserve]);
+  const { beginIdx, endIdx } = locateOutsideCode(body, TAKES_FENCE_BEGIN, TAKES_FENCE_END);
+  return body.slice(0, beginIdx) + newFence + body.slice(endIdx + TAKES_FENCE_END.length);
+}
+
+function toBatchInput(pageId: number, t: ParsedTake, supersededBy?: number | null): TakeBatchInput {
+  return {
+    page_id: pageId,
+    row_num: t.rowNum,
+    claim: t.claim,
+    kind: t.kind,
+    holder: t.holder,
+    weight: t.weight,
+    since_date: t.sinceDate,
+    until_date: t.untilDate,
+    source: t.source,
+    active: t.active,
+    superseded_by: supersededBy ?? null,
+  };
+}
+
+/** The row a canonical takes fence projects: an inactive row citing `superseded by #N` points at row N. */
+function toCanonicalBatchInput(pageId: number, t: ParsedTake): TakeBatchInput {
+  return toBatchInput(pageId, t, t.active ? null : Number(t.source?.match(/superseded by #(\d+)/)?.[1]) || null);
+}
+
+async function withTakesLock<T>(
+  target: Pick<TakesWriteTarget, 'slug' | 'lockTimeoutMs'>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await withPageLock(target.slug, fn, {
+      ...(target.lockTimeoutMs !== undefined ? { timeoutMs: target.lockTimeoutMs } : {}),
+    });
+  } catch (err) {
+    if (err instanceof TakesWriteError) throw err;
+    if (err instanceof Error && err.message.includes('could not acquire lock')) {
+      throw new TakesWriteError(
+        'page_locked',
+        `Another writer holds the page lock for ${target.slug} — retry shortly.`,
+        'retryable',
+      );
+    }
+    throw err;
+  }
+}
+
+export interface AddTakeInput {
+  claim: string;
+  kind: TakeKind;
+  holder: string;
+  weight?: number;
+  source?: string;
+  sinceDate?: string;
+}
+
+/**
+ * Carry take resolutions recorded only in the database into the page's takes
+ * fence, so a republication of the page keeps them: the canonical projection
+ * writes every resolution column from the fence. A resolution the fence
+ * cannot carry losslessly (no quality, a multi-line or fence-breaking cell)
+ * and a fence with rows the parser skipped refuse with a TakesWriteError
+ * instead of publishing a body that would clear or drop data.
+ */
+export async function materializeTakeResolutions(engine: BrainEngine, pageId: number, body: string): Promise<string> {
+  const parsed = parseTakesFence(body);
+  const rows = parsed.takes.length ? await engine.executeRaw<{ row_num: number; resolved_at: Date | string; resolved_quality: TakeQuality | null;
+    resolved_source: string | null; resolved_value: number | string | null; resolved_unit: string | null; resolved_by: string | null }>(
+    `SELECT row_num,resolved_at,resolved_quality,resolved_source,resolved_value,resolved_unit,resolved_by FROM takes
+      WHERE page_id=$1 AND resolved_at IS NOT NULL`, [pageId]) : [];
+  const missing = new Map(rows.filter(row => parsed.takes.some(take => take.rowNum === Number(row.row_num)
+    && take.resolvedAt === undefined && take.resolvedQuality === undefined)).map(row => [Number(row.row_num), row]));
+  if (!missing.size) return body;
+  assertFenceRoundTrips(parsed);
+  const takes = parsed.takes.map(take => {
+    const row = missing.get(take.rowNum);
+    if (!row) return take;
+    if (!row.resolved_quality) {
+      throw new TakesWriteError('invalid_input', `Take row #${take.rowNum} has a resolution without a quality, which the takes fence cannot carry; republishing would clear it.`);
+    }
+    for (const [field, value] of [['resolved_source', row.resolved_source], ['resolved_unit', row.resolved_unit], ['resolved_by', row.resolved_by]] as const) {
+      assertSafeCellText(field, value ?? undefined);
+    }
+    return { ...take, resolvedAt: new Date(row.resolved_at).toISOString(), resolvedQuality: row.resolved_quality,
+      resolvedEvidence: row.resolved_source ?? undefined, resolvedValue: row.resolved_value === null ? undefined : Number(row.resolved_value),
+      resolvedUnit: row.resolved_unit ?? undefined, resolvedBy: row.resolved_by ?? undefined };
+  });
+  const next = replaceFence(body, takes);
+  const reparsed = parseTakesFence(next);
+  assertFenceRoundTrips(reparsed);
+  if (reparsed.takes.length !== takes.length) throw new TakesWriteError('invalid_input', 'The takes fence lost rows while carrying database resolutions.');
+  for (const take of takes) {
+    if (!missing.has(take.rowNum)) continue;
+    const back = reparsed.takes.find(t => t.rowNum === take.rowNum);
+    if (!back || back.resolvedQuality !== take.resolvedQuality || (back.resolvedEvidence ?? undefined) !== take.resolvedEvidence
+      || back.resolvedValue !== take.resolvedValue || (back.resolvedUnit ?? undefined) !== take.resolvedUnit || (back.resolvedBy ?? undefined) !== take.resolvedBy) {
+      throw new TakesWriteError('invalid_input', `Take row #${take.rowNum}'s database resolution does not round-trip through the takes fence.`);
+    }
+  }
+  return next;
+}
+
+/** Compose the same append sequence used by the legacy md-first writer. */
+export function appendTakesToPageBody(body: string, rows: ReadonlyArray<AddTakeInput>): { body: string; rowNums: number[] } {
+  for (const row of rows) {
+    assertHolderAllowed(row.holder, null);
+    assertSafeCellText('claim', row.claim);
+    assertSafeCellText('kind', row.kind);
+    assertSafeCellText('holder', row.holder);
+    assertSafeCellText('source', row.source);
+    assertValidWeight(row.weight);
+    assertValidSinceDate(row.sinceDate);
+  }
+  assertFenceRoundTrips(parseTakesFence(body));
+  let nextBody = body;
+  const rowNums: number[] = [];
+  for (const row of rows) {
+    const result = upsertTakeRow(nextBody, {
+      claim: row.claim,
+      kind: row.kind,
+      holder: row.holder,
+      weight: row.weight ?? 0.5,
+      source: row.source,
+      sinceDate: row.sinceDate,
+      active: true,
+    });
+    nextBody = result.body;
+    rowNums.push(result.rowNum);
+  }
+  return { body: nextBody, rowNums };
+}
+
+export async function addTakeToPage(
+  target: TakesWriteTarget,
+  input: AddTakeInput,
+): Promise<{ rowNum: number; mirror: TakeMirror }> {
+  assertHolderAllowed(input.holder, target.allowList);
+  // Fence-injection + range guards run before any I/O (invalid input must
+  // never acquire the lock or touch the page).
+  assertSafeCellText('claim', input.claim);
+  assertSafeCellText('kind', input.kind);
+  assertSafeCellText('holder', input.holder);
+  assertSafeCellText('source', input.source);
+  assertValidWeight(input.weight);
+  assertValidSinceDate(input.sinceDate);
+  return withTakesLock(target, async () => {
+    // Resolve the page BEFORE touching the markdown (the historical CLI
+    // ordering): failing after a fence write would leave a take on disk the
+    // DB never saw until the next reconcile.
+    const pageId = await getPageId(target.engine, target.slug, target.sourceId);
+    // add is the one mutate that may CREATE the page file + fence (first take
+    // on a page) — readPageBody's existence refusal applies to row-targeting
+    // mutates, not appends; the page itself was verified in the DB above.
+    const { path, writeRoot } = await resolveTakesFilePath(
+      target.engine, target.brainDir, target.slug, target.sourceId,
+    );
+    const body = existsSync(path) ? readFileSync(path, 'utf-8') : '';
+    // F1: guard only fires when a fence ALREADY exists (an empty/fence-less body
+    // parses to zero warnings) — a whole-fence re-render must not delete rows
+    // this version couldn't parse.
+    assertFenceRoundTrips(parseTakesFence(body));
+    const { body: nextBody, rowNum } = upsertTakeRow(body, {
+      claim: input.claim,
+      kind: input.kind,
+      holder: input.holder,
+      weight: input.weight ?? 0.5,
+      source: input.source,
+      sinceDate: input.sinceDate,
+      active: true,
+    });
+    writePageBody(path, nextBody, writeRoot, target.slug);
+    let mirrorWarning: string | undefined;
+    try {
+      await maintenanceTransaction(target.engine, tx => tx.addTakesBatch([{
+        page_id: pageId, row_num: rowNum, claim: input.claim, kind: input.kind,
+        holder: input.holder, weight: input.weight ?? 0.5,
+        since_date: input.sinceDate, source: input.source,
+        active: true, superseded_by: null,
+      }]), target.trust);
+    } catch (err) {
+      // P1-4/F4: md is canonical + already written — a failed DB mirror is
+      // healed by the next reconcile, so surface a warning instead of throwing
+      // (a throw would make the caller retry and duplicate the durable md row).
+      mirrorWarning = mirrorErrorMessage(err);
+    }
+    return { rowNum, mirror: { written: true, path, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+  });
+}
+
+/**
+ * #4473 — md-first batch append for the takes-bootstrap lane
+ * (extract-takes-from-pages.ts). MARKDOWN IS CANONICAL: the bootstrap
+ * classifier used to call engine.addTakesBatch directly, minting DB-only rows
+ * that the next md→DB reconcile / extract rebuild silently clobbered. This
+ * routes the whole per-page batch through the same fence pipeline as
+ * addTakeToPage (lock → page id → fence append → md write → DB mirror), with
+ * two bootstrap-specific differences:
+ *
+ *   - `brainDir` may be null (sync.repo_path unset): a page whose source
+ *     carries its own local_path still resolves; a host-repo page throws
+ *     'mirror_unavailable' and the caller skips + counts it.
+ *   - The page FILE must already exist. Bootstrap sweeps a whole corpus, and
+ *     minting fence-only twin .md files for DB-born pages would recreate
+ *     divergence at scale (#3605's stray-twin lesson) — a missing file is a
+ *     per-page 'mirror_unavailable' skip, never a create.
+ *
+ * Row numbers derive from the fence (max existing + 1, appended in order),
+ * so the historical (page_id, row_num=1) collision posture is gone.
+ */
+export async function appendTakesToPageMdFirst(
+  target: Omit<TakesWriteTarget, 'brainDir'> & { brainDir: string | null },
+  rows: ReadonlyArray<AddTakeInput>,
+): Promise<{ rowNums: number[]; mirror: TakeMirror }> {
+  for (const row of rows) {
+    assertHolderAllowed(row.holder, target.allowList);
+    assertSafeCellText('claim', row.claim);
+    assertSafeCellText('kind', row.kind);
+    assertSafeCellText('holder', row.holder);
+    assertSafeCellText('source', row.source);
+    assertValidWeight(row.weight);
+    assertValidSinceDate(row.sinceDate);
+  }
+  return withTakesLock(target, async () => {
+    const pageId = await getPageId(target.engine, target.slug, target.sourceId);
+    const { path, writeRoot } = await resolveTakesFilePath(
+      target.engine, target.brainDir, target.slug, target.sourceId,
+    );
+    // Unlike addTakeToPage, a missing file REFUSES (readPageBody's
+    // mirror_unavailable) — see the contract note above.
+    const body = readPageBody(path);
+    const { body: nextBody, rowNums } = appendTakesToPageBody(body, rows);
+    writePageBody(path, nextBody, writeRoot, target.slug);
+    // Mirror md→DB with the reconcile primitive, exactly as the fence now
+    // states the appended rows.
+    const appended = new Set(rowNums);
+    const after = parseTakesFence(nextBody).takes.filter(t => appended.has(t.rowNum));
+    let mirrorWarning: string | undefined;
+    try {
+      await maintenanceTransaction(target.engine, tx => tx.addTakesBatch(after.map(t => toBatchInput(pageId, t))));
+    } catch (err) {
+      mirrorWarning = mirrorErrorMessage(err); // P1-4/F4: md written; DB mirror deferred to reconcile.
+    }
+    return { rowNums, mirror: { written: true, path, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+  });
+}
+
+export interface UpdateTakeFields {
+  weight?: number;
+  source?: string;
+  sinceDate?: string;
+}
+
+export async function updateTakeOnPage(
+  target: TakesWriteTarget,
+  rowNum: number,
+  fields: UpdateTakeFields,
+): Promise<{ rowNum: number; mirror: TakeMirror }> {
+  if (fields.weight === undefined && fields.source === undefined && fields.sinceDate === undefined) {
+    throw new TakesWriteError('no_fields', 'No mutable fields given (weight, source, since date).');
+  }
+  assertSafeCellText('source', fields.source);
+  assertValidWeight(fields.weight);
+  assertValidSinceDate(fields.sinceDate);
+  return withTakesLock(target, async () => {
+    const pageId = await getPageId(target.engine, target.slug, target.sourceId);
+    const { path, writeRoot } = await resolveTakesFilePath(
+      target.engine, target.brainDir, target.slug, target.sourceId,
+    );
+    const body = readPageBody(path);
+    const parsed = parseTakesFence(body);
+    assertFenceRoundTrips(parsed); // F1: refuse a whole-fence re-render that would drop skipped rows.
+    const targetRow = findFenceRow(parsed.takes, rowNum, target.allowList, target.slug);
+    if (targetRow.resolvedAt) {
+      throw new TakesWriteError('already_resolved', `Row #${rowNum} on ${target.slug} is resolved — resolved takes are immutable.`, 'Supersede instead.');
+    }
+    if (!targetRow.active) {
+      // A superseded row's mirror upsert would also wipe its superseded_by
+      // pointer — refuse, matching supersedeTakeOnPage's guard.
+      throw new TakesWriteError('row_inactive', `Row #${rowNum} on ${target.slug} is already superseded.`);
+    }
+    const updated: ParsedTake = {
+      ...targetRow,
+      weight: fields.weight ?? targetRow.weight,
+      source: fields.source ?? targetRow.source,
+      sinceDate: fields.sinceDate ?? targetRow.sinceDate,
+    };
+    const allRows = parsed.takes.map(t => (t.rowNum === rowNum ? updated : t));
+    writePageBody(path, replaceFence(body, allRows), writeRoot, target.slug);
+    // Mirror md→DB with the reconcile primitive (upsert on (page_id,row_num));
+    // base columns only, resolution columns preserved by the DO UPDATE list.
+    let mirrorWarning: string | undefined;
+    try {
+      await maintenanceTransaction(target.engine, tx => tx.addTakesBatch([toBatchInput(pageId, updated)]));
+    } catch (err) {
+      mirrorWarning = mirrorErrorMessage(err); // P1-4/F4: md written; DB mirror deferred to reconcile.
+    }
+    return { rowNum, mirror: { written: true, path, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+  });
+}
+
+export interface SupersedeTakeInput {
+  claim: string;
+  kind?: TakeKind;
+  holder?: string;
+  weight?: number;
+  source?: string;
+  sinceDate?: string;
+}
+
+export async function supersedeTakeOnPage(
+  target: TakesWriteTarget,
+  rowNum: number,
+  input: SupersedeTakeInput,
+): Promise<{ oldRow: number; newRow: number; mirror: TakeMirror }> {
+  assertSafeCellText('claim', input.claim);
+  assertSafeCellText('kind', input.kind);
+  assertSafeCellText('holder', input.holder);
+  assertSafeCellText('source', input.source);
+  assertValidWeight(input.weight);
+  assertValidSinceDate(input.sinceDate);
+  return withTakesLock(target, async () => {
+    const pageId = await getPageId(target.engine, target.slug, target.sourceId);
+    const { path, writeRoot } = await resolveTakesFilePath(
+      target.engine, target.brainDir, target.slug, target.sourceId,
+    );
+    const body = readPageBody(path);
+    const parsed = parseTakesFence(body);
+    assertFenceRoundTrips(parsed); // F1: refuse a whole-fence re-render that would drop skipped rows.
+    const targetRow = findFenceRow(parsed.takes, rowNum, target.allowList, target.slug);
+    if (!targetRow.active) {
+      throw new TakesWriteError('row_inactive', `Row #${rowNum} on ${target.slug} is already superseded.`);
+    }
+    if (targetRow.resolvedAt) {
+      throw new TakesWriteError('already_resolved', `Row #${rowNum} on ${target.slug} is resolved — resolved takes are immutable.`, 'Add a new take instead.');
+    }
+    const holder = input.holder ?? targetRow.holder;
+    // An explicit replacement holder must clear the fence too (an allow-listed
+    // caller must not mint rows held by identities it can't see).
+    if (input.holder !== undefined) assertHolderAllowed(input.holder, target.allowList);
+    // CLI-parity default: unset weight decays the target's by 0.1.
+    const weight = input.weight ?? Math.max(0, targetRow.weight - 0.1);
+    const { body: nextBody, newRowNum } = supersedeRow(body, rowNum, {
+      claim: input.claim,
+      kind: input.kind ?? targetRow.kind,
+      holder,
+      weight,
+      sinceDate: input.sinceDate,
+      source: input.source,
+    });
+    writePageBody(path, nextBody, writeRoot, target.slug);
+    // Mirror BOTH affected rows exactly as the fence now states them:
+    // old → inactive + superseded_by pointer, new → active append.
+    const after = parseTakesFence(nextBody).takes;
+    const oldAfter = after.find(t => t.rowNum === rowNum);
+    const newAfter = after.find(t => t.rowNum === newRowNum);
+    const mirrorRows: TakeBatchInput[] = [];
+    if (oldAfter) mirrorRows.push(toBatchInput(pageId, oldAfter, newRowNum));
+    if (newAfter) mirrorRows.push(toBatchInput(pageId, newAfter, null));
+    let mirrorWarning: string | undefined;
+    try {
+      await maintenanceTransaction(target.engine, tx => tx.addTakesBatch(mirrorRows));
+    } catch (err) {
+      mirrorWarning = mirrorErrorMessage(err); // P1-4/F4: md written; DB mirror deferred to reconcile.
+    }
+    return { oldRow: rowNum, newRow: newRowNum, mirror: { written: true, path, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+  });
+}
+
+export type ResolveQuality = 'correct' | 'incorrect' | 'partial' | 'unresolvable';
+
+export interface ResolveTakeInput {
+  quality: ResolveQuality;
+  /** Evidence text (stored as the resolution source). */
+  evidence?: string;
+  value?: number;
+  unit?: string;
+  resolvedBy: string;
+}
+
+export async function resolveTakeOnPage(
+  target: TakesWriteTarget,
+  rowNum: number,
+  input: ResolveTakeInput,
+): Promise<{ rowNum: number; quality: ResolveQuality; mirror: TakeMirror }> {
+  assertSafeCellText('evidence', input.evidence);
+  assertSafeCellText('unit', input.unit);
+  assertSafeCellText('resolved_by', input.resolvedBy);
+  return withTakesLock(target, async () => {
+    const pageId = await getPageId(target.engine, target.slug, target.sourceId);
+    const { path, writeRoot } = await resolveTakesFilePath(
+      target.engine, target.brainDir, target.slug, target.sourceId,
+    );
+    const body = readPageBody(path);
+    const parsed = parseTakesFence(body);
+    assertFenceRoundTrips(parsed); // F1: refuse a whole-fence re-render that would drop skipped rows.
+    const targetRow = findFenceRow(parsed.takes, rowNum, target.allowList, target.slug);
+    if (targetRow.resolvedAt) {
+      throw new TakesWriteError('already_resolved', `Row #${rowNum} on ${target.slug} is already resolved.`);
+    }
+    if (!targetRow.active) {
+      // Resolving a superseded row would feed calibration with an already-
+      // revised claim — resolve the replacement row instead.
+      throw new TakesWriteError('row_inactive', `Row #${rowNum} on ${target.slug} is already superseded.`, 'Resolve the replacement row instead.');
+    }
+    // quality → outcome per the schema CHECK (v74): correct↔true,
+    // incorrect↔false, partial/unresolvable↔NULL.
+    const outcome = input.quality === 'correct' ? true
+      : input.quality === 'incorrect' ? false : undefined;
+    const updated: ParsedTake = {
+      ...targetRow,
+      resolvedAt: new Date().toISOString().slice(0, 10),
+      resolvedQuality: input.quality,
+      resolvedOutcome: outcome,
+      resolvedEvidence: input.evidence,
+      resolvedValue: input.value,
+      resolvedUnit: input.unit,
+      resolvedBy: input.resolvedBy,
+    };
+    const allRows = parsed.takes.map(t => (t.rowNum === rowNum ? updated : t));
+    writePageBody(path, replaceFence(body, allRows), writeRoot, target.slug);
+    // Resolution fields aren't in TakeBatchInput — mirror via resolveTake.
+    // A drifted DB missing the row is self-healed md→DB (upsert the base row,
+    // then resolve): the markdown is the truth being propagated.
+    // One shared argument object so the self-heal retry can never silently
+    // diverge from the primary call.
+    const resolveArgs = {
+      quality: input.quality,
+      outcome,
+      value: input.value,
+      unit: input.unit,
+      source: input.evidence,
+      resolvedBy: input.resolvedBy,
+    };
+    // P1-4/F4: md is canonical + already written — a failed DB mirror (incl. a
+    // failed self-heal) is healed by the next reconcile, so it surfaces as a
+    // warning, never a throw (a throw would make the caller retry the durable
+    // md write and duplicate the row).
+    let mirrorWarning: string | undefined;
+    try {
+      await maintenanceTransaction(target.engine, tx => tx.resolveTake(pageId, rowNum, resolveArgs));
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('TAKE_ROW_NOT_FOUND')) {
+        try {
+          await maintenanceTransaction(target.engine, async tx => {
+            await tx.addTakesBatch([toBatchInput(pageId, targetRow)]);
+            await tx.resolveTake(pageId, rowNum, resolveArgs);
+          });
+        } catch (healErr) {
+          mirrorWarning = mirrorErrorMessage(healErr);
+        }
+      } else {
+        mirrorWarning = mirrorErrorMessage(err);
+      }
+    }
+    return { rowNum, quality: input.quality, mirror: { written: true, path, ...(mirrorWarning ? { mirror_warning: mirrorWarning } : {}) } };
+  });
+}
+
+/** Pure fence primitives shared by durable semantic preparation and legacy callers. */
+export const takesPreparation = { assertHolderAllowed, assertSafeCellText, assertValidWeight, assertValidSinceDate, findFenceRow, assertFenceRoundTrips, replaceFence, toBatchInput, toCanonicalBatchInput };

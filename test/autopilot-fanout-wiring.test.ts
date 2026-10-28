@@ -1,0 +1,288 @@
+/**
+ * v0.38 — static-shape regression for autopilot.ts ↔ dispatchPerSource wiring.
+ *
+ * autopilot.ts's `shouldFullCycle` branch was rewired in this wave to
+ * call `dispatchPerSource` from autopilot-fanout.ts instead of
+ * submitting one `autopilot-cycle` job per tick. Because the autopilot
+ * loop is deep inside `runAutopilot()` and gated by a connected engine,
+ * a full integration test would require a Postgres fixture. The fan-out
+ * helper itself has 27 unit tests + 6 PGLite/Postgres parity tests; this
+ * file pins the WIRING in autopilot.ts so a future refactor that
+ * accidentally reverts to single-job dispatch fails this guard first.
+ *
+ * Same pattern as test/autopilot-supervisor-wiring.test.ts.
+ */
+import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { resolveAutopilotDispatchTimeoutMs } from '../src/commands/autopilot-timeout.ts';
+import { defaultTimeoutMsFor } from '../src/core/minions/handler-timeouts.ts';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
+
+// W4 autopilot: containment reads the autopilot surface; positional spans name the module that holds the dispatch tick.
+const AUTOPILOT_SRC = surfaceSource('autopilot');
+const DISPATCH_SRC = surfaceFileSource('autopilot', 'src/commands/autopilot-dispatch.ts');
+
+const AUTOPILOT_TIMEOUT_SRC = readFileSync(
+  join(import.meta.dir, '..', 'src', 'commands', 'autopilot-timeout.ts'),
+  'utf8',
+);
+
+describe('autopilot.ts ↔ dispatchPerSource wiring', () => {
+  test('imports dispatchPerSource from the fan-out helper', () => {
+    expect(AUTOPILOT_SRC).toMatch(
+      /(import\s+.*dispatchPerSource.*from\s+['"]\.\/autopilot-fanout\.ts['"]|await import\(['"]\.\/autopilot-fanout\.ts['"]\))/,
+    );
+  });
+
+  test('imports resolveEffectiveFanoutMax (clamps to worker concurrency; PGLite base still 1)', () => {
+    // #2194 fix #1: autopilot now resolves the CLAMPED fan-out (gated on a live
+    // supervisor) instead of the raw resolveFanoutMax. The clamp wraps
+    // resolveFanoutMax, so PGLite's base-1 still holds (codex P1-3).
+    expect(AUTOPILOT_SRC).toMatch(/resolveEffectiveFanoutMax/);
+  });
+
+  test('calls dispatchPerSource within the shouldFullCycle branch', () => {
+    // dispatchPerSource must appear in the same hot path as the
+    // pre-fix `queue.add('autopilot-cycle', ...)` did — i.e. when
+    // shouldFullCycle is true, not in the targeted-plan path.
+    const dispatchIdx = DISPATCH_SRC.indexOf('dispatchPerSource(engine, queue');
+    expect(dispatchIdx).toBeGreaterThan(-1);
+    // Verify shouldFullCycle is structurally near the call (within
+    // ~3000 chars of source, roughly the same if/else branch)
+    const fullCycleIdx = DISPATCH_SRC.indexOf('shouldFullCycle');
+    expect(fullCycleIdx).toBeGreaterThan(-1);
+    expect(Math.abs(dispatchIdx - fullCycleIdx)).toBeLessThan(3000);
+  });
+
+  test('applies the 30-minute timeout floor only to full-cycle dispatch', () => {
+    const baseIntervalSeconds = 60;
+    const intervalDerivedTimeoutMs = Math.max(baseIntervalSeconds * 2 * 1000, 300_000);
+
+    expect(resolveAutopilotDispatchTimeoutMs(baseIntervalSeconds, true)).toBeGreaterThanOrEqual(30 * 60_000);
+    expect(resolveAutopilotDispatchTimeoutMs(baseIntervalSeconds, false)).toBe(intervalDerivedTimeoutMs);
+
+    expect(AUTOPILOT_SRC).toContain(
+      'const timeoutMs = resolveAutopilotDispatchTimeoutMs(baseInterval, false);',
+    );
+    expect(AUTOPILOT_SRC).toContain(
+      'const fullCycleTimeoutMs = resolveAutopilotDispatchTimeoutMs(baseInterval, true);',
+    );
+    expect(DISPATCH_SRC).toMatch(
+      /dispatchPerSource\(engine, queue, \{[\s\S]{0,300}timeoutMs: fullCycleTimeoutMs/,
+    );
+  });
+
+  test('lastFullCycleAt advance-gate counts coalesced ticks (parity with pre-split dispatched)', () => {
+    // Before the dispatched/coalesced split, a coalesced submission advanced
+    // the local full-cycle clock via result.dispatched. Without this arm, an
+    // all-coalesced tick (maxPending single-flight suppression) retakes the
+    // full-cycle branch every tick and starves the targeted-plan path for the
+    // whole in-flight window.
+    const updateIdx = DISPATCH_SRC.indexOf('lastFullCycleAt = Date.now()');
+    expect(updateIdx).toBeGreaterThan(-1);
+    const advanceGate = DISPATCH_SRC.slice(Math.max(0, updateIdx - 400), updateIdx + 80);
+    expect(advanceGate).toContain('result.coalesced.length > 0');
+    // all_sources_handled subsumes all_sources_fresh (fresh + locally skipped
+    // === every source); the redundant arm is gone (wave review).
+    expect(advanceGate).not.toContain('result.all_sources_fresh');
+    expect(advanceGate).toContain('result.all_sources_handled');
+  });
+
+  test('unavailable-path skips in the daemon loops are NDJSON events under --json, and sources-load is a static import (wave review)', () => {
+    // Bare prose on stderr breaks the --json NDJSON stream every other daemon
+    // line keeps; the two path-skip sites and the #6803 account-mismatch
+    // skip emit an event in jsonMode.
+    expect(AUTOPILOT_SRC.match(/event: 'freshness_source_path_skipped'/g)?.length).toBe(3);
+    expect(AUTOPILOT_SRC).toContain("event: 'freshness_source_path_skipped', source_id: src.id, code: 'connector_account_changed'");
+    expect(AUTOPILOT_SRC).not.toContain("await import('../core/sources-load.ts')");
+    // The stale "#3696 RELATIVE path" narration is gone: the skip covers any
+    // unavailable path (relative OR missing on this machine).
+    expect(AUTOPILOT_SRC).not.toContain('a RELATIVE local_path is meaningless');
+    expect(AUTOPILOT_SRC).not.toContain('same relative-path skip as the freshness loop');
+  });
+
+  test('fanout_summary reports coalesced separately from dispatched (honest surfaces)', () => {
+    expect(DISPATCH_SRC).toMatch(/event: 'fanout_summary',[\s\S]{0,200}coalesced: result\.coalesced/);
+    expect(DISPATCH_SRC).toMatch(/event: 'fanout_summary',[\s\S]{0,400}skipped_unavailable_path: result\.skipped_unavailable_path/);
+  });
+
+  test('targeted-plan dispatch honors the honest-dispatch contract (red-team finding)', () => {
+    // The targeted remediation loop submits with maxWaiting:1 and expects
+    // coalesces when a handler outlives one interval — its events must split
+    // on job.coalesced like every other dispatch surface in this file.
+    expect(DISPATCH_SRC).toMatch(/event: 'dispatch_coalesced',[\s\S]{0,80}mode: 'targeted'/);
+  });
+
+  test('freshness sync dispatch uses the automatic pull policy (#5463)', () => {
+    const freshnessIdx = DISPATCH_SRC.indexOf('idempotency_key: `autopilot-sync:');
+    expect(freshnessIdx).toBeGreaterThan(-1);
+    const freshnessBlock = DISPATCH_SRC.slice(Math.max(0, freshnessIdx - 700), freshnessIdx + 200);
+    expect(freshnessBlock).toContain('pull: await automaticSyncPull(engine, src)');
+  });
+
+  test('freshness sync dispatch skips unavailable source paths before enqueueing', () => {
+    const freshnessIdx = DISPATCH_SRC.indexOf('idempotency_key: `autopilot-sync:');
+    expect(freshnessIdx).toBeGreaterThan(-1);
+    const freshnessBlock = DISPATCH_SRC.slice(Math.max(0, freshnessIdx - 1400), freshnessIdx + 100);
+    expect(freshnessBlock).toContain('sourceLocalPathSkipWarning(src.id, src.local_path, undefined, src.config)');
+  });
+
+  test('#4399: freshness sync dispatch skips a syncEnabled:false source BEFORE queuing a job', () => {
+    // Real execution of this loop needs the full runAutopilot() daemon (per
+    // this file's own header comment), so this pins the static shape:
+    // the isSyncDisabledConfig skip must sit between the loop's local_path
+    // guard and the queue.add call this file already pins above, so it can
+    // never fire too late to prevent the enqueue. isSyncDisabledConfig
+    // itself has direct unit coverage in test/sync-policy.test.ts.
+    const loopIdx = DISPATCH_SRC.indexOf('for (const src of sources) {');
+    expect(loopIdx).toBeGreaterThan(-1);
+    const queueAddIdx = DISPATCH_SRC.indexOf('idempotency_key: `autopilot-sync:');
+    expect(queueAddIdx).toBeGreaterThan(loopIdx);
+    const loopBody = DISPATCH_SRC.slice(loopIdx, queueAddIdx);
+    // Exact-literal match on the FULL guard clause (condition + continue),
+    // not just the function-call substring — a mutation that keeps calling
+    // the predicate but drops the `if (skip) continue` (a no-op statement)
+    // restores the #4399 bug while still containing the bare substring, so a
+    // loose `.toContain('automaticSyncSkip')` check alone would not catch it.
+    // P4.2: the disabled-config check is the first arm of the shared
+    // automaticSyncSkip predicate (unit coverage in test/sync-policy.test.ts
+    // and test/autopilot-freshness-not-applicable-6465.test.ts).
+    expect(loopBody).toContain('const skip = await automaticSyncSkip(engine, src, activationPending);');
+    expect(loopBody).toContain('if (skip) continue;');
+    // The predicate comes from the sync-policy module via a STATIC import
+    // (the wave review made sources-load static for the same loop; a dynamic
+    // import here would re-introduce what that review removed), not from
+    // performSync's own enforcement — this dispatcher is meant to stand on
+    // its own regardless of what performSync does internally.
+    expect(AUTOPILOT_SRC).toMatch(/import \{ automaticSyncSkip, [^\n]*\} from '\.\.\/core\/sync-policy\.ts';/);
+    expect(AUTOPILOT_SRC).not.toContain("await import('../core/sync-policy.ts')");
+    const skipIdx = loopBody.indexOf('if (skip) continue;');
+    const localPathGuardIdx = loopBody.indexOf("if (!src.local_path) continue;");
+    expect(localPathGuardIdx).toBeGreaterThan(-1);
+    expect(skipIdx).toBeGreaterThan(localPathGuardIdx);
+  });
+
+  test('#5198: freshness sync dispatch skips a claimed source awaiting activation BEFORE queuing a job', () => {
+    // Same static-shape pin as #4399 above: the skip must sit inside the loop
+    // and before the queue.add call, and it must `continue` rather than only
+    // report. loadActivationPendingSourceIds is exercised against a real
+    // claim/activate sequence in test/persistence-onboarding.test.ts.
+    const loopIdx = DISPATCH_SRC.indexOf('for (const src of sources) {');
+    const queueAddIdx = DISPATCH_SRC.indexOf('idempotency_key: `autopilot-sync:');
+    expect(loopIdx).toBeGreaterThan(-1);
+    expect(queueAddIdx).toBeGreaterThan(loopIdx);
+    const loopBody = DISPATCH_SRC.slice(loopIdx, queueAddIdx);
+    // P4.2: the pending-activation check is the second arm of the shared automaticSyncSkip predicate; the loop
+    // passes the loaded set and `continue`s on any skip.
+    expect(loopBody).toContain('const skip = await automaticSyncSkip(engine, src, activationPending);');
+    expect(loopBody).toContain("reportAutomaticSyncSkip(src.id, skip, 'freshness_sync_skipped', jsonMode,");
+    expect(loopBody).toContain('if (skip) continue;');
+    const setupIdx = DISPATCH_SRC.lastIndexOf('const activationPending = await loadActivationPendingSourceIds(engine);', loopIdx);
+    expect(setupIdx).toBeGreaterThan(-1);
+    expect(loopIdx - setupIdx).toBeLessThan(300);
+  });
+
+  test('#4046: targeted dispatch scopes stable recommendation keys to the interval', () => {
+    expect(AUTOPILOT_SRC).toContain(
+      'idempotency_key: autopilotRemediationIdempotencyKey(step.idempotency_key, slot)',
+    );
+    expect(AUTOPILOT_SRC).not.toContain('idempotency_key: step.idempotency_key,');
+  });
+
+  test('#2781: dispatchGlobalMaintenance gets the full-cycle floor, not the outer (non-full-cycle) timeoutMs', () => {
+    // Live #2781 regression, found in review: dispatchGlobalMaintenance's
+    // call used the object-shorthand `timeoutMs`, which resolved to the
+    // OUTER `const timeoutMs = resolveAutopilotDispatchTimeoutMs(baseInterval, false)`
+    // declared earlier in the same function for the sync/freshness dispatch
+    // — not to the full-cycle value computed for dispatchPerSource a few
+    // lines above it. 'autopilot-global-maintenance' carries the same
+    // 30-min handler anchor as 'autopilot-cycle' (handler-timeouts.ts), so
+    // this silently starved brain-wide maintenance (embed/orphans/purge/…)
+    // at exactly the #2781 symptom (600s budget at the default 300s
+    // interval) even after the per-source path was fixed. Pin the correct
+    // wiring by source-shape: the call must pass the *full-cycle* variable.
+    const dispatchGlobalIdx = DISPATCH_SRC.indexOf('dispatchGlobalMaintenance(engine, queue');
+    expect(dispatchGlobalIdx).toBeGreaterThan(-1);
+    const dispatchGlobalCall = DISPATCH_SRC.slice(dispatchGlobalIdx, dispatchGlobalIdx + 200);
+    expect(dispatchGlobalCall).toContain('timeoutMs: fullCycleTimeoutMs');
+    // Guard against the exact regression: the shorthand `timeoutMs` (bare,
+    // no colon) resolving to the non-full-cycle outer const.
+    expect(dispatchGlobalCall).not.toMatch(/\{\s*repoPath,\s*slot,\s*timeoutMs,/);
+  });
+
+  test('updates lastFullCycleAt after dispatch or an all-fresh restart check', () => {
+    // After the dispatchPerSource call, the lastFullCycleAt module var
+    // must update so the next tick doesn't immediately re-fan-out.
+    // Coalesced counts as work-in-flight (see the dedicated advance-gate
+    // test below for the full condition).
+    expect(AUTOPILOT_SRC).toContain('result.all_sources_handled');
+    expect(AUTOPILOT_SRC).toMatch(/lastFullCycleAt\s*=\s*Date\.now\(\)/);
+  });
+
+  test('#2781: full-cycle floor is derived from BOTH handler anchors, not a duplicated literal', () => {
+    // #2781's root cause: autopilot stamped an explicit `timeout_ms` that was
+    // only a `Math.max(interval-derived, 300_000)`-shaped literal, so it
+    // silently overrode the 'autopilot-cycle' handler's own #1737 anchor
+    // (`queue.ts`: an explicit stamp always wins over `defaultTimeoutMsFor`).
+    // A prior fix (#2852) hardcoded a matching `1_800_000` floor for
+    // full-cycle dispatch, but a literal that merely happens to equal the
+    // handler anchor can drift from it again if the anchor is ever retuned
+    // in handler-timeouts.ts without a matching edit here — reintroducing
+    // the exact #2781 bug class.
+    //
+    // Prove the floor is *derived* (not just numerically coincidental) two
+    // ways: (a) it equals Math.max of BOTH job names' anchors — a bare
+    // duplicated literal could accidentally match a SINGLE anchor (as the
+    // prior #2852 fix did) but wiring `Math.max(cycle, global)` is what
+    // actually protects a future divergence between the two anchors; (b) a
+    // source-shape check that both job-name string literals reach
+    // `defaultTimeoutMsFor` (directly or via a thin wrapper), and that no
+    // bare numeric literal sits in the full-cycle branch.
+    const cycleAnchorMs = defaultTimeoutMsFor('autopilot-cycle');
+    const globalAnchorMs = defaultTimeoutMsFor('autopilot-global-maintenance');
+    if (cycleAnchorMs === null) throw new Error("expected a handler anchor for 'autopilot-cycle'");
+    if (globalAnchorMs === null) throw new Error("expected a handler anchor for 'autopilot-global-maintenance'");
+    const expectedFloorMs = Math.max(cycleAnchorMs, globalAnchorMs);
+
+    // A short interval collapses the interval-derived component to its
+    // 300_000ms minimum, so the full-cycle result must equal the derived
+    // floor exactly.
+    expect(resolveAutopilotDispatchTimeoutMs(1, true)).toBe(expectedFloorMs);
+    // A regular (non-full-cycle) dispatch — e.g. the 'sync' freshness job,
+    // which has no long-job handler anchor — must NOT pick up the floor.
+    expect(resolveAutopilotDispatchTimeoutMs(1, false)).toBe(300_000);
+
+    // Guard against reintroducing a hardcoded literal floor directly in the
+    // full-cycle branch instead of the derived FULL_CYCLE_TIMEOUT_FLOOR_MS.
+    expect(AUTOPILOT_TIMEOUT_SRC).not.toMatch(/fullCycle\s*\?\s*Math\.max\([^)]*,\s*1_?800_?000\)/);
+    // Pin the derivation END TO END in source shape (codex round-2): both
+    // job-name anchor lookups must participate in the floor's Math.max, and
+    // the full-cycle branch must consume that derived const — otherwise the
+    // floor could be swapped back to a bare literal while the wrapper,
+    // import, and job-name strings survive as dead code and the assertions
+    // above still pass.
+    expect(AUTOPILOT_TIMEOUT_SRC).toMatch(
+      /FULL_CYCLE_TIMEOUT_FLOOR_MS\s*=\s*Math\.max\(\s*requireHandlerAnchorMs\('autopilot-cycle'\),\s*requireHandlerAnchorMs\('autopilot-global-maintenance'\),?\s*\)/,
+    );
+    expect(AUTOPILOT_TIMEOUT_SRC).toMatch(
+      /fullCycle\s*\?\s*Math\.max\(intervalDerivedTimeoutMs,\s*FULL_CYCLE_TIMEOUT_FLOOR_MS\)/,
+    );
+    // The wrapper itself must consult defaultTimeoutMsFor (fail-loud on a
+    // missing anchor, never a numeric fallback).
+    expect(AUTOPILOT_TIMEOUT_SRC).toMatch(/requireHandlerAnchorMs[\s\S]{0,200}defaultTimeoutMsFor\(jobName\)/);
+  });
+
+  test('does NOT regress to the single-job dispatch on the full-cycle path', () => {
+    // Pre-PR: the shouldFullCycle branch did:
+    //   const job = await queue.add('autopilot-cycle', { repoPath }, {
+    //     idempotency_key: `autopilot-cycle:${slot}`, ...
+    //   });
+    // If a future refactor reintroduces this exact pattern in autopilot.ts,
+    // the per-source fan-out has been silently reverted.
+    //
+    // Allow the legacy idempotency key shape ONLY inside dispatchPerSource's
+    // fallback path (which is in autopilot-fanout.ts, not autopilot.ts).
+    expect(AUTOPILOT_SRC).not.toMatch(/queue\.add\(['"]autopilot-cycle['"][\s\S]{0,400}idempotency_key:\s*`autopilot-cycle:\$\{slot\}`/);
+  });
+});

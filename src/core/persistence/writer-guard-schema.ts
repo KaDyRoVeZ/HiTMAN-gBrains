@@ -1,0 +1,128 @@
+import { ROW_ATTRIBUTION_COLUMNS } from './attribution-schema.ts';
+const ROW_ATTRIBUTION_KEYS = `ARRAY[${ROW_ATTRIBUTION_COLUMNS.map(column => `'${column}'`).join(',')}]`;
+/** Guarded tables with no canonical source_id: their source is always their page's (#5983). */
+export const PAGE_CHILD_TABLES = ['tags', 'timeline_entries', 'takes'];
+export const GUARDED_TABLES = ['pages', 'tags', 'slug_aliases', 'page_aliases', 'facts', 'takes', 'timeline_entries', 'sources', 'page_segment_texts', 'page_body_manifest'];
+const sqlList = (names: string[]) => names.map(name => `'${name}'`).join(',');
+/** The guard function alone: replacing it takes no table lock (v197). */
+export const MANAGED_WRITER_GUARD_FUNCTION_SQL = `
+CREATE OR REPLACE FUNCTION gbrain_require_managed_writer() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
+DECLARE managed boolean; strict_count integer; seen integer; git boolean; unreadable text; target_source text; old_source text; row_data jsonb; old_data jsonb; allowed jsonb;
+BEGIN
+  -- #7636: init always writes the singleton, so a missing row means this role cannot read it (RLS), never "unmanaged".
+  SELECT enabled INTO managed FROM persistence_brain WHERE singleton=1;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+      DETAIL=jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state','persistence_brain')::text;
+  END IF;
+  IF NOT managed THEN
+    IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+  END IF;
+  IF TG_TABLE_NAME='page_segment_texts' THEN
+    -- Only the source decides; the segment body (up to 1 MiB of bytea) never becomes JSON.
+    IF TG_OP='DELETE' THEN row_data := jsonb_build_object('source_id',OLD.source_id); ELSE row_data := jsonb_build_object('source_id',NEW.source_id); END IF;
+    IF TG_OP='UPDATE' THEN old_data := jsonb_build_object('source_id',OLD.source_id); END IF;
+  ELSE
+    row_data := CASE WHEN TG_OP='DELETE' THEN to_jsonb(OLD) ELSE to_jsonb(NEW) END;
+    IF TG_OP='UPDATE' THEN old_data := to_jsonb(OLD); END IF;
+  END IF;
+  IF TG_TABLE_NAME='pages' AND TG_OP='UPDATE' THEN
+    IF (NEW.source_id,NEW.slug,NEW.type,NEW.page_kind,NEW.title,NEW.compiled_truth,NEW.timeline,NEW.frontmatter,NEW.deleted_at,NEW.knowledge_revision)
+      IS NOT DISTINCT FROM
+       (OLD.source_id,OLD.slug,OLD.type,OLD.page_kind,OLD.title,OLD.compiled_truth,OLD.timeline,OLD.frontmatter,OLD.deleted_at,OLD.knowledge_revision)
+      -- The trust tier is guarded content (trust/schema.ts); read by key so brains before the column keep working.
+      AND row_data->'trust_tier' IS NOT DISTINCT FROM old_data->'trust_tier'
+      -- A segmented page's body identity (page-body/schema.ts); read by key for brains before the column.
+      AND row_data->'body_generation' IS NOT DISTINCT FROM old_data->'body_generation' THEN RETURN NEW; END IF;
+  ELSIF TG_TABLE_NAME='sources' THEN
+    IF TG_OP='UPDATE' AND (NEW.id,NEW.incarnation,NEW.local_path,NEW.archived)
+      IS NOT DISTINCT FROM (OLD.id,OLD.incarnation,OLD.local_path,OLD.archived) THEN
+      IF (NEW.last_commit,NEW.last_sync_at,NEW.newest_content_at)
+        IS NOT DISTINCT FROM (OLD.last_commit,OLD.last_sync_at,OLD.newest_content_at) THEN RETURN NEW; END IF;
+      allowed := COALESCE(NULLIF(current_setting('gbrain.write_sources',true),''),'[]')::jsonb;
+      IF NOT (allowed ? NEW.id) THEN
+        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source checkpoints require canonical owner publication',
+          TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:checkpoint',
+          DETAIL=jsonb_build_object('op',TG_OP,'relationship','checkpoint_outside_owner','target_source',NEW.id,'old_source',OLD.id,'allowed',allowed)::text;
+      END IF;
+      RETURN NEW;
+    END IF;
+    IF COALESCE(current_setting('gbrain.topology_change',true),'') <> 'on' THEN
+      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source topology must be drained and changed through writer administration',
+        TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:topology',
+        DETAIL=jsonb_build_object('op',TG_OP,'relationship','topology_outside_administration','target_source',row_data->>'id','old_source',old_data->>'id')::text;
+    END IF;
+    IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+  ELSIF TG_TABLE_NAME IN ('facts','takes') AND TG_OP='UPDATE' THEN
+    row_data := row_data - ARRAY['embedding_model','embedded_text_hash','write_origin'] - ${ROW_ATTRIBUTION_KEYS};
+    old_data := old_data - ARRAY['embedding_model','embedded_text_hash','write_origin'] - ${ROW_ATTRIBUTION_KEYS};
+    -- Embedding completion, retrieval telemetry, write attribution
+    -- (attribution-schema.ts; a journal backfill fills it) and the write origin
+    -- record are physical projections. The trust tier is not: it stays guarded.
+    IF (row_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at'])
+      = (old_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at']) THEN RETURN NEW; END IF;
+  END IF;
+  IF TG_TABLE_NAME NOT IN (${sqlList(PAGE_CHILD_TABLES)}) THEN
+    target_source := row_data->>'source_id'; old_source := old_data->>'source_id';
+  END IF;
+  IF target_source IS NULL THEN
+    SELECT source_id INTO target_source FROM pages WHERE id=(row_data->>'page_id')::integer;
+    IF NOT FOUND AND row_security_active('pages') THEN unreadable := 'pages'; END IF;
+  END IF;
+  IF TG_OP='UPDATE' AND old_source IS NULL THEN
+    SELECT source_id INTO old_source FROM pages WHERE id=(old_data->>'page_id')::integer;
+    IF NOT FOUND AND row_security_active('pages') THEN unreadable := 'pages'; END IF;
+  END IF;
+  -- A page row-level security hides is not a deleted parent (a cascade runs as the table owner, outside RLS).
+  IF unreadable IS NOT NULL THEN
+    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+      DETAIL=jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state',unreadable)::text;
+  END IF;
+  -- Cascaded projection removal after the already-guarded parent deletion.
+  IF target_source IS NULL AND TG_OP='DELETE' THEN RETURN OLD; END IF;
+  allowed := COALESCE(NULLIF(current_setting('gbrain.write_sources',true),''),'[]')::jsonb;
+  IF target_source IS NULL OR NOT (allowed ? target_source) OR (old_source IS NOT NULL AND NOT (allowed ? old_source)) THEN
+    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: canonical writer must use the persistence coordinator',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:allowlist',
+      DETAIL=jsonb_build_object('op',TG_OP,'relationship',CASE WHEN target_source IS NULL THEN 'missing_source'
+        WHEN NOT (allowed ? target_source) THEN 'different_source' ELSE 'old_source_outside' END,
+        'target_source',target_source,'old_source',old_source,'allowed',allowed)::text;
+  END IF;
+  -- G7a (git-canonical-schema.ts): a git-canonical source takes rows only from a writer that declares the git protocol.
+  IF COALESCE(current_setting('gbrain.git_protocol',true),'') <> '1' THEN
+    SELECT strict_sources INTO strict_count FROM git_canonical_brain WHERE singleton=1;
+    IF NOT FOUND THEN unreadable := 'git_canonical_brain';
+    ELSIF strict_count>0 THEN
+      SELECT count(*), COALESCE(bool_or(config->>'canonical'='git'),false) INTO seen, git FROM sources WHERE id IN (target_source, old_source);
+      IF seen < (CASE WHEN old_source IS NULL OR old_source=target_source THEN 1 ELSE 2 END) AND row_security_active('sources') THEN
+        unreadable := 'sources';
+      ELSIF git THEN
+        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='git_protocol_required: this source is git-canonical and the writer does not declare the git protocol',
+          TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='git_canonical_fence:mutation',
+          DETAIL=jsonb_build_object('op',TG_OP,'target_source',target_source,'old_source',old_source)::text;
+      END IF;
+    END IF;
+    IF unreadable IS NOT NULL THEN
+      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: writer state is unreadable to this database role',
+        TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:unreadable_state',
+        DETAIL=jsonb_build_object('op',TG_OP,'relationship','unreadable_state','state',unreadable)::text;
+    END IF;
+  END IF;
+  IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+END $fn$;
+`;
+/** Defense in depth for inventoried legacy writers. Manual SQL is outside the protocol. */
+export const MANAGED_WRITER_GUARD_SQL = `${MANAGED_WRITER_GUARD_FUNCTION_SQL}
+DO $body$
+DECLARE target text;
+BEGIN
+  FOREACH target IN ARRAY ARRAY[${sqlList(GUARDED_TABLES)}] LOOP
+    IF to_regclass(target) IS NOT NULL THEN
+      EXECUTE format('DROP TRIGGER IF EXISTS managed_writer_guard ON %I',target);
+      EXECUTE format('CREATE TRIGGER managed_writer_guard BEFORE INSERT OR UPDATE OR DELETE ON %I FOR EACH ROW EXECUTE FUNCTION gbrain_require_managed_writer()',target);
+    END IF;
+  END LOOP;
+END $body$;
+`;

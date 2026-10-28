@@ -1,0 +1,24 @@
+{
+  "description": "A PGLite owner SIGKILLed inside a withdrawal-mirror effect (after its side effect, before completion) left the effect claimed for its 2-minute lease; the restarted owner neither ran the effect nor published writes to the withdrawn page until the lease expired. Fixed by releaseAbandonedClaims (src/core/persistence/effect-journal.ts).",
+  "engine": "pglite",
+  "shrunk_from": 8,
+  "reproduced_before_fix": "3/3",
+  "failing_runs": [
+    {
+      "schedule": "withdrawal_then_stale_publication",
+      "seed": 5105,
+      "length": 8,
+      "fault": {
+        "point": "effect:withdrawal-mirror:mid",
+        "nth": 1
+      },
+      "crashed": true,
+      "violations": [],
+      "ops": [
+        "wd0",
+        "wd1",
+        "wd2"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,782 @@
+import { describe, test, expect } from "bun:test";
+import { join } from "path";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import {
+  checkResolvable,
+  parseResolverEntries,
+  extractDelegationTargets,
+  extractTriggers,
+} from "../src/core/check-resolvable.ts";
+
+const SKILLS_DIR = join(import.meta.dir, "..", "skills");
+
+describe("parseResolverEntries", () => {
+  test("extracts skill paths from markdown table rows", () => {
+    const content = `## Brain operations
+| Trigger | Skill |
+|---------|-------|
+| "What do we know about" | \`skills/query/SKILL.md\` |
+| Creating a person page | \`skills/enrich/SKILL.md\` |`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(2);
+    expect(entries[0].skillPath).toBe("skills/query/SKILL.md");
+    expect(entries[0].section).toBe("Brain operations");
+    expect(entries[1].skillPath).toBe("skills/enrich/SKILL.md");
+  });
+
+  test("handles GStack entries (external skills)", () => {
+    const content = `## Thinking skills
+| Trigger | Skill |
+|---------|-------|
+| "Brainstorm" | GStack: office-hours |`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(1);
+    expect(entries[0].isGStack).toBe(true);
+  });
+
+  test("handles identity/access rows (non-skill references)", () => {
+    const content = `## Identity
+| Trigger | Skill |
+|---------|-------|
+| Non-owner sends a message | Check \`ACCESS_POLICY.md\` before responding |`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(1);
+    expect(entries[0].isGStack).toBe(true);
+  });
+
+  test("skips separator and header rows", () => {
+    const content = `| Trigger | Skill |
+|---------|-------|
+| "query" | \`skills/query/SKILL.md\` |`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(1);
+  });
+
+  test("tracks section headings", () => {
+    const content = `## Always-on
+| Trigger | Skill |
+|---------|-------|
+| Every message | \`skills/signal-detector/SKILL.md\` |
+
+## Brain operations
+| Trigger | Skill |
+|---------|-------|
+| "What do we know" | \`skills/query/SKILL.md\` |`;
+    const entries = parseResolverEntries(content);
+    expect(entries[0].section).toBe("Always-on");
+    expect(entries[1].section).toBe("Brain operations");
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // v0.41.7.0 — Compact list-format support (OpenClaw-native shape)
+  //
+  // The list branch was added so `gbrain doctor` no longer reports every
+  // skill as unreachable on agents that write the compact `- **name**: t1 | t2`
+  // shape instead of the markdown table. The OpenClaw 306-skill regression
+  // was 238 FAIL errors → 0 errors after this fix.
+  // ──────────────────────────────────────────────────────────────────────
+
+  test("[list] bold-name single trigger", () => {
+    const content = `## Personal
+- **gift-advisor**: gift idea`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(1);
+    expect(entries[0].trigger).toBe("gift idea");
+    expect(entries[0].skillPath).toBe("skills/gift-advisor/SKILL.md");
+    expect(entries[0].isGStack).toBe(false);
+    expect(entries[0].section).toBe("Personal");
+  });
+
+  test("[list] bold-name multi-trigger fan-out", () => {
+    const content = `- **flight-tracker**: track my flight | flight status | when does my flight land`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(3);
+    expect(entries.map(e => e.trigger)).toEqual([
+      "track my flight",
+      "flight status",
+      "when does my flight land",
+    ]);
+    expect(entries.every(e => e.skillPath === "skills/flight-tracker/SKILL.md")).toBe(true);
+  });
+
+  test("[list] plain-name fallback (no bold markers)", () => {
+    const content = `- gift-advisor: gift idea | birthday gift`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(2);
+    expect(entries[0].skillPath).toBe("skills/gift-advisor/SKILL.md");
+    expect(entries[1].trigger).toBe("birthday gift");
+  });
+
+  test("[list] D3: path suffix with Unicode → is stripped, not captured", () => {
+    // D3 walkback: downstream consumers (routing-eval.ts skillSlugFromPath
+    // and check-resolvable.ts:367 manifest derivation) assume the
+    // skills/<name>/SKILL.md shape. Capturing the explicit path would
+    // produce silent orphan_trigger warnings + routing-eval coverage
+    // gaps for that skill. So the suffix is stripped and the path is
+    // always derived from the name.
+    const content = "- **quality**: lint the page → `skills/conventions/quality.md`";
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(1);
+    expect(entries[0].trigger).toBe("lint the page");
+    expect(entries[0].skillPath).toBe("skills/quality/SKILL.md"); // derived, NOT the captured path
+  });
+
+  test("[list] F4: path suffix with ASCII -> is also stripped", () => {
+    const content = "- **quality**: lint the page -> `skills/conventions/quality.md`";
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(1);
+    expect(entries[0].trigger).toBe("lint the page");
+    expect(entries[0].skillPath).toBe("skills/quality/SKILL.md");
+  });
+
+  test("[list] ellipsis placeholder is dropped", () => {
+    const content = `- **foo-skill**: bar | ... | baz`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(2);
+    expect(entries.map(e => e.trigger)).toEqual(["bar", "baz"]);
+  });
+
+  test("[list] empty pipe segments are dropped", () => {
+    const content = `- **foo-skill**: bar | | baz`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(2);
+    expect(entries.map(e => e.trigger)).toEqual(["bar", "baz"]);
+  });
+
+  test("[mixed] table and list rows in the same file", () => {
+    const content = `## Always-on
+| Trigger | Skill |
+|---------|-------|
+| Every message | \`skills/signal-detector/SKILL.md\` |
+
+## Personal
+- **gift-advisor**: gift idea | what should I bring`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(3);
+    expect(entries[0].skillPath).toBe("skills/signal-detector/SKILL.md");
+    expect(entries[0].section).toBe("Always-on");
+    expect(entries[1].skillPath).toBe("skills/gift-advisor/SKILL.md");
+    expect(entries[1].section).toBe("Personal");
+    expect(entries[2].section).toBe("Personal");
+  });
+
+  test("[list] section tracking across list entries", () => {
+    const content = `## Personal
+- **gift-advisor**: gift idea
+
+## Travel
+- **flight-tracker**: track my flight`;
+    const entries = parseResolverEntries(content);
+    expect(entries[0].section).toBe("Personal");
+    expect(entries[1].section).toBe("Travel");
+  });
+
+  test("[list] D4 REGRESSION: prose bullets do not match as skill rows", () => {
+    // The kebab-lowercase name regex deliberately rejects bold names
+    // starting with an uppercase letter. This kills the noise class where
+    // real AGENTS.md files have prose bullets like `- **Note**: …` that
+    // would otherwise be parsed as fake skill rows pointing at
+    // `skills/Note/SKILL.md`. Codex F2; D4 decision.
+    const content = `- **Note**: this is a prose bullet
+- **Convention**: see [some convention link]
+- **TODO**: fix this later
+- **Important**: read this carefully`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(0);
+  });
+
+  test("[list] D4 negative: convention-violating uppercase names are silently skipped", () => {
+    // Documents the trade: a real skill named `MyTool` would not parse.
+    // The user would notice on the first `gbrain doctor` run and lowercase it.
+    const content = `- **MyTool**: this trigger silently disappears
+- **camelCase**: also silently dropped`;
+    const entries = parseResolverEntries(content);
+    expect(entries.length).toBe(0);
+  });
+});
+
+describe("extractTriggers", () => {
+  const LF_FRONTMATTER =
+    "---\nname: query\ndescription: Test\ntriggers:\n  - \"what do we know\"\n  - \"tell me about\"\ntools:\n  - search\n---\n\n# Body\n";
+
+  test("parses triggers from LF-terminated frontmatter", () => {
+    const triggers = extractTriggers(LF_FRONTMATTER);
+    expect(triggers).toEqual(["what do we know", "tell me about"]);
+  });
+
+  test("parses triggers from CRLF-terminated frontmatter (Windows checkouts)", () => {
+    // Regression: `core.autocrlf=true` is the Windows default. Without
+    // CRLF→LF normalization, every Windows skill is reported as a false
+    // mece_gap warning because the `^---\n` regex never matches `---\r\n`.
+    const crlf = LF_FRONTMATTER.replace(/\n/g, "\r\n");
+    const triggers = extractTriggers(crlf);
+    expect(triggers).toEqual(["what do we know", "tell me about"]);
+  });
+
+  test("parses triggers from a single-line YAML flow sequence", () => {
+    const fm = [
+      "---",
+      "name: transcript-insights",
+      'triggers: ["analyze this transcript", podcast takeaways]',
+      "---",
+      "",
+    ].join("\n");
+    expect(extractTriggers(fm)).toEqual([
+      "analyze this transcript",
+      "podcast takeaways",
+    ]);
+  });
+
+  test("parses triggers from a wrapped YAML flow sequence (#3887)", () => {
+    const fm = [
+      "---",
+      "name: transcript-insights",
+      "triggers: [analyze this transcript, podcast takeaways, video transcript insights, interview",
+      "    takeaways, policy mechanisms from transcript]",
+      "---",
+      "",
+    ].join("\n");
+    expect(extractTriggers(fm)).toEqual([
+      "analyze this transcript",
+      "podcast takeaways",
+      "video transcript insights",
+      "interview takeaways",
+      "policy mechanisms from transcript",
+    ]);
+  });
+
+  test("returns [] when frontmatter is missing", () => {
+    expect(extractTriggers("# Just a body, no frontmatter\n")).toEqual([]);
+  });
+
+  test("returns [] when triggers field is absent from frontmatter", () => {
+    const fm = "---\nname: query\ndescription: Test\ntools:\n  - search\n---\n";
+    expect(extractTriggers(fm)).toEqual([]);
+  });
+
+  test("strips surrounding quotes from trigger values", () => {
+    const fm = "---\nname: x\ntriggers:\n  - \"double quoted\"\n  - 'single quoted'\n  - unquoted\n---\n";
+    expect(extractTriggers(fm)).toEqual(["double quoted", "single quoted", "unquoted"]);
+  });
+});
+
+describe("checkResolvable — real skills directory", () => {
+  const report = checkResolvable(SKILLS_DIR);
+
+  test("produces a report with summary", () => {
+    expect(report.summary.total_skills).toBeGreaterThan(0);
+    expect(typeof report.ok).toBe("boolean");
+    expect(Array.isArray(report.issues)).toBe(true);
+  });
+
+  test("action strings are specific (contain file paths)", () => {
+    for (const issue of report.issues) {
+      expect(issue.action.length).toBeGreaterThan(10);
+      // Action should mention a file or a specific fix
+      expect(
+        issue.action.includes("RESOLVER.md") ||
+        issue.action.includes("SKILL.md") ||
+        issue.action.includes("manifest") ||
+        issue.action.includes("conventions/")
+      ).toBe(true);
+    }
+  });
+
+  test("unreachable issues have structured fix objects", () => {
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    for (const issue of unreachable) {
+      expect(issue.fix).toBeDefined();
+      expect(issue.fix!.type).toBe("add_trigger");
+      expect(issue.fix!.file).toContain("RESOLVER.md");
+    }
+  });
+
+  test("whitelisted skills (ingest, signal-detector, brain-ops) don't trigger MECE overlap", () => {
+    const overlaps = report.issues.filter(i => i.type === "mece_overlap");
+    for (const issue of overlaps) {
+      // The skill field lists the overlapping skills
+      expect(issue.skill).not.toContain("signal-detector");
+      expect(issue.skill).not.toContain("brain-ops");
+    }
+  });
+
+  test("summary counts are consistent", () => {
+    expect(report.summary.reachable + report.summary.unreachable).toBe(report.summary.total_skills);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DRY detection — proximity-based suppression
+// ---------------------------------------------------------------------------
+
+function makeSkillsFixture(files: Record<string, string>): string {
+  const dir = mkdtempSync(join(tmpdir(), "gbrain-dry-"));
+  // Minimal RESOLVER.md and manifest.json so checkResolvable doesn't bail.
+  const skillNames = Object.keys(files);
+  const resolverRows = skillNames.map(n => `| "${n}" | \`skills/${n}/SKILL.md\` |`).join("\n");
+  writeFileSync(join(dir, "RESOLVER.md"), `## Test\n| Trigger | Skill |\n|-----|-----|\n${resolverRows}\n`);
+  writeFileSync(
+    join(dir, "manifest.json"),
+    JSON.stringify({ skills: skillNames.map(n => ({ name: n, path: `${n}/SKILL.md` })) }, null, 2)
+  );
+  for (const [name, body] of Object.entries(files)) {
+    mkdirSync(join(dir, name), { recursive: true });
+    // Skill conformance tests (elsewhere) check for frontmatter + triggers;
+    // checkResolvable itself only needs the body.
+    const frontmatter = `---\nname: ${name}\ndescription: test\ntriggers:\n  - "${name}"\n---\n`;
+    writeFileSync(join(dir, name, "SKILL.md"), frontmatter + body);
+  }
+  return dir;
+}
+
+describe("extractDelegationTargets", () => {
+  test("parses > **Convention:** callouts", () => {
+    const refs = extractDelegationTargets(
+      "> **Convention:** See `skills/conventions/quality.md` for citation rules.\n"
+    );
+    expect(refs).toEqual([{ convention: "conventions/quality.md", line: 1 }]);
+  });
+
+  test("parses > **Filing rule:** callouts", () => {
+    const refs = extractDelegationTargets(
+      "> **Filing rule:** Read `skills/_brain-filing-rules.md` before any new page.\n"
+    );
+    expect(refs).toEqual([{ convention: "_brain-filing-rules.md", line: 1 }]);
+  });
+
+  test("parses inline backtick references", () => {
+    const refs = extractDelegationTargets(
+      "some prose.\nSee `skills/conventions/quality.md` for details.\n"
+    );
+    expect(refs).toEqual([{ convention: "conventions/quality.md", line: 2 }]);
+  });
+
+  test("accepts a #anchor after .md and drops it from the path (#6704)", () => {
+    const refs = extractDelegationTargets(
+      "See `skills/conventions/quality.md#citations` and `skills/_brain-filing-rules.md#the-rule`.\n"
+    );
+    expect(refs).toEqual([
+      { convention: "conventions/quality.md", line: 1 },
+      { convention: "_brain-filing-rules.md", line: 1 },
+    ]);
+  });
+
+  test("accepts an anchor with dots and non-ASCII letters (#6704)", () => {
+    const refs = extractDelegationTargets("See `skills/conventions/quality.md#v1.2-引用`.\n");
+    expect(refs).toEqual([{ convention: "conventions/quality.md", line: 1 }]);
+  });
+
+  test("ignores backticks pointing outside known delegation targets", () => {
+    const refs = extractDelegationTargets(
+      "See `skills/random/README.md` for unrelated notes.\n"
+    );
+    expect(refs).toHaveLength(0);
+  });
+
+  test("handles frontmatter-only skill (no body matches)", () => {
+    const refs = extractDelegationTargets("---\nname: foo\n---\n");
+    expect(refs).toHaveLength(0);
+  });
+});
+
+describe("DRY detection — checkResolvable", () => {
+  let dir: string;
+  afterEachCleanup(() => dir && rmSync(dir, { recursive: true, force: true }));
+
+  test("flags inlined notability rule with no reference", () => {
+    dir = makeSkillsFixture({
+      bad: "# BadSkill\n\nCheck the notability gate every time.\n",
+    });
+    const report = checkResolvable(dir);
+    const dry = report.issues.filter(i => i.type === "dry_violation");
+    expect(dry).toHaveLength(1);
+    expect(dry[0].skill).toBe("bad");
+  });
+
+  test("suppresses DRY when > **Convention:** callout points at quality.md (notability)", () => {
+    dir = makeSkillsFixture({
+      good: `# GoodSkill\n\n> **Convention:** See \`skills/conventions/quality.md\` for rules.\n\nCheck the notability gate.\n`,
+    });
+    const report = checkResolvable(dir);
+    const dry = report.issues.filter(i => i.type === "dry_violation");
+    expect(dry).toHaveLength(0);
+  });
+
+  test("suppresses DRY when _brain-filing-rules.md is referenced for notability", () => {
+    dir = makeSkillsFixture({
+      good: `# GoodSkill\n\n> **Filing rule:** Read \`skills/_brain-filing-rules.md\`.\n\nCheck the notability gate.\n`,
+    });
+    const report = checkResolvable(dir);
+    const dry = report.issues.filter(i => i.type === "dry_violation");
+    expect(dry).toHaveLength(0);
+  });
+
+  test("does NOT suppress when reference is >40 lines from the match", () => {
+    const filler = Array(50).fill("padding paragraph with no match.").join("\n");
+    dir = makeSkillsFixture({
+      distant: `> **Convention:** See \`skills/conventions/quality.md\`.\n\n${filler}\n\nCheck the notability gate now.\n`,
+    });
+    const report = checkResolvable(dir);
+    const dry = report.issues.filter(i => i.type === "dry_violation");
+    expect(dry).toHaveLength(1);
+  });
+
+  test("DOES suppress when reference is ~30 lines from the match", () => {
+    const filler = Array(20).fill("padding paragraph with no match.").join("\n");
+    dir = makeSkillsFixture({
+      near: `> **Convention:** See \`skills/conventions/quality.md\`.\n\n${filler}\n\nCheck the notability gate now.\n`,
+    });
+    const report = checkResolvable(dir);
+    const dry = report.issues.filter(i => i.type === "dry_violation");
+    expect(dry).toHaveLength(0);
+  });
+
+  test("iron-law pattern does NOT accept _brain-filing-rules.md as delegation", () => {
+    // iron-law's only accepted target is conventions/quality.md
+    dir = makeSkillsFixture({
+      filing: `> **Filing rule:** Read \`skills/_brain-filing-rules.md\`.\n\n## Iron Law: Back-Linking (MANDATORY)\n`,
+    });
+    const report = checkResolvable(dir);
+    const dry = report.issues.filter(i => i.type === "dry_violation");
+    expect(dry.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("v0.22.4 regression — actual repo skills/ has 0 errors", () => {
+  test("repo skills/ pass check-resolvable cleanly (zero errors AND zero warnings)", () => {
+    // The v0.22.4 (Part A) contract was zero warnings AND zero errors.
+    // The v0.25.1 update relaxed it to allow `routing_miss` warnings as
+    // informational — a stop-gap because the structural matcher
+    // required substring-match against narrow triggers in RESOLVER.md
+    // and natural paraphrases legitimately missed.
+    //
+    // v0.41.11 #1451 closes the drift bug class structurally:
+    // frontmatter triggers + RESOLVER.md rows merge with UNION
+    // semantics via `loadSkillTriggerIndex`. The 7 residual
+    // `routing_miss` warnings on skillpack-harvest (and any future
+    // drift on other skills) MUST be addressed at write time, not
+    // tolerated at test time. The CI gate `bun run check:resolver`
+    // (--strict, exit-1 on any warning) enforces this for PRs.
+    //
+    // The test now asserts the FULL contract: zero errors, zero
+    // warnings. If a routing_miss reappears, the fix is to broaden
+    // the skill's frontmatter `triggers:` so the realistic fixture
+    // intent contains a trigger substring.
+    const report = checkResolvable(SKILLS_DIR);
+    const errors = report.issues.filter(i => i.severity === "error");
+    const warnings = report.issues.filter(i => i.severity === "warning");
+    expect(errors).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
+});
+
+// bun:test has no beforeEach/afterEach at module scope cleanly interacting
+// with closures; a small helper keeps cleanup readable and per-test.
+function afterEachCleanup(fn: () => void) {
+  const { afterEach } = require("bun:test");
+  afterEach(fn);
+}
+
+// ---------------------------------------------------------------------------
+// Low-confidence foreign skills dir: cwd_walk_up (tier 1b) is ungated, so it
+// can land on a directory belonging to a different tool. One skill there
+// coincidentally shipping a `triggers:` field used to flip every OTHER
+// triggerless sibling from the soft "uninitialized" fallback into hard
+// `unreachable` errors. Severity is softened only when ALL hold: found via
+// cwd_walk_up, no resolver file contributes rows, unreachable outnumber
+// reachable, and no manifest.json on disk. Everything else stays strict.
+// ---------------------------------------------------------------------------
+
+function makeSkillWithoutTriggers(dir: string, name: string): void {
+  mkdirSync(join(dir, name), { recursive: true });
+  writeFileSync(
+    join(dir, name, "SKILL.md"),
+    "---\n" +
+    `name: ${name}\n` +
+    "description: belongs to a different tool, no triggers field\n" +
+    "---\n" +
+    "body\n"
+  );
+}
+
+function makeSkillWithTriggers(dir: string, name: string): void {
+  mkdirSync(join(dir, name), { recursive: true });
+  writeFileSync(
+    join(dir, name, "SKILL.md"),
+    "---\n" +
+    `name: ${name}\n` +
+    "description: also unrelated, but happens to declare triggers\n" +
+    "triggers:\n" +
+    "  - \"some phrase\"\n" +
+    "---\n" +
+    "body\n"
+  );
+}
+
+// Sparse trigger coverage (3 triggerless : 1 with triggers) -- matches the
+// real-world repro (1 of 26 skills coincidentally had triggers:). No
+// RESOLVER.md, no AGENTS.md, no manifest.json -- deriveManifest() walks
+// the directory listing instead, same as a real foreign tool's skills/
+// dir with no gbrain awareness whatsoever.
+function makeSparseForeignSkillsFixture(): string {
+  const dir = mkdtempSync(join(tmpdir(), "gbrain-foreign-skills-"));
+  makeSkillWithoutTriggers(dir, "some-unrelated-tool-skill");
+  makeSkillWithoutTriggers(dir, "another-unrelated-skill");
+  makeSkillWithoutTriggers(dir, "yet-another-unrelated-skill");
+  // The one coincidental trigger-bearing skill that defeats the
+  // triggerEntries.length===0 fallback in real-world repros.
+  makeSkillWithTriggers(dir, "coincidentally-has-triggers");
+  return dir;
+}
+
+// Dense trigger coverage (3 with triggers : 1 triggerless) -- a mostly-
+// migrated real skillpack whose RESOLVER.md/AGENTS.md was merely deleted
+// by accident. Must NOT be softened even via cwd_walk_up with no
+// resolver file present (resolver-absence alone isn't proof of "foreign").
+function makeDenseSkillpackFixture(): string {
+  const dir = mkdtempSync(join(tmpdir(), "gbrain-dense-skillpack-"));
+  makeSkillWithTriggers(dir, "migrated-skill-one");
+  makeSkillWithTriggers(dir, "migrated-skill-two");
+  makeSkillWithTriggers(dir, "migrated-skill-three");
+  makeSkillWithoutTriggers(dir, "not-yet-migrated-skill");
+  return dir;
+}
+
+describe("checkResolvable — low-confidence foreign skills dir", () => {
+  let dir: string;
+  afterEachCleanup(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("cwd_walk_up + no RESOLVER.md + sparse triggers: unreachable is downgraded to warning", () => {
+    dir = makeSparseForeignSkillsFixture();
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(3);
+    expect(unreachable.map(i => i.skill).sort()).toEqual([
+      "another-unrelated-skill",
+      "some-unrelated-tool-skill",
+      "yet-another-unrelated-skill",
+    ]);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("warning");
+    }
+    // Downgraded severity must actually move the issues out of errors[]
+    // and into warnings[] (checkResolvable filters on .severity at the
+    // end) -- otherwise health_score still takes the -20 hit.
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(false);
+    expect(report.warnings.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("no skillsDirSource (higher-confidence tiers): unreachable stays a hard error", () => {
+    dir = makeSparseForeignSkillsFixture();
+    const report = checkResolvable(dir);
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(3);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("error");
+    }
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("cwd_walk_up but RESOLVER.md present: stays a hard error (real skillpack, not foreign)", () => {
+    dir = makeSparseForeignSkillsFixture();
+    writeFileSync(
+      join(dir, "RESOLVER.md"),
+      "## Brain operations\n| Trigger | Skill |\n|---------|-------|\n"
+    );
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBeGreaterThan(0);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("error");
+    }
+  });
+
+  test("cwd_walk_up + no RESOLVER.md but DENSE trigger coverage: unreachable stays a hard error", () => {
+    // A mostly-migrated real skillpack whose RESOLVER.md/AGENTS.md was
+    // merely deleted by accident (majority already reachable via
+    // triggers:) must still fail loudly.
+    dir = makeDenseSkillpackFixture();
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(1);
+    expect(unreachable[0].skill).toBe("not-yet-migrated-skill");
+    expect(unreachable[0].severity).toBe("error");
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("cwd_walk_up + no RESOLVER.md + sparse triggers BUT explicit manifest.json: unreachable stays a hard error", () => {
+    // An explicit manifest.json is itself a deliberate "this is a gbrain
+    // skillpack" declaration -- a foreign tool's directory never ships
+    // one. Its presence keeps enforcement strict.
+    dir = makeSparseForeignSkillsFixture();
+    writeFileSync(
+      join(dir, "manifest.json"),
+      JSON.stringify({
+        skills: [
+          { name: "some-unrelated-tool-skill", path: "some-unrelated-tool-skill/SKILL.md" },
+          { name: "another-unrelated-skill", path: "another-unrelated-skill/SKILL.md" },
+          { name: "yet-another-unrelated-skill", path: "yet-another-unrelated-skill/SKILL.md" },
+          { name: "coincidentally-has-triggers", path: "coincidentally-has-triggers/SKILL.md" },
+        ],
+      })
+    );
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(3);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("error");
+    }
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("cwd_walk_up + no RESOLVER.md + sparse triggers BUT MALFORMED manifest.json: unreachable stays a hard error", () => {
+    // loadOrDeriveManifest's `derived` flag is true both when manifest.json
+    // is absent AND when it exists but fails to parse. A corrupted
+    // manifest.json on a real skillpack is exactly what doctor exists to
+    // catch, so the downgrade keys on on-disk absence, not `derived`.
+    dir = makeSparseForeignSkillsFixture();
+    writeFileSync(join(dir, "manifest.json"), "{ this is not valid json");
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(3);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("error");
+    }
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("cwd_walk_up + generic AGENTS.md with no resolver rows + sparse triggers: unreachable is STILL downgraded to warning", () => {
+    // `resolverPathOrNull` is filename-only, not content-aware. A foreign
+    // tool's generic prose AGENTS.md contributes zero resolver rows, so it
+    // must not disable the downgrade; the check keys on a resolver_md-
+    // sourced entry, not `entries.length`.
+    dir = makeSparseForeignSkillsFixture();
+    writeFileSync(
+      join(dir, "AGENTS.md"),
+      "# Agent Instructions\n\nThis is a generic agent configuration file for an unrelated tool. " +
+        "It has no resolver routing table -- just prose.\n"
+    );
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBe(3);
+    expect(unreachable.map(i => i.skill).sort()).toEqual([
+      "another-unrelated-skill",
+      "some-unrelated-tool-skill",
+      "yet-another-unrelated-skill",
+    ]);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("warning");
+    }
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(false);
+    expect(report.warnings.some(i => i.type === "unreachable")).toBe(true);
+  });
+
+  test("cwd_walk_up + AGENTS.md WITH real resolver rows + sparse triggers elsewhere: unreachable stays a hard error", () => {
+    // Inverse of the above: when the found AGENTS.md actually carries a
+    // resolver table (source: 'resolver_md'), it's real routing intent,
+    // not a foreign convention collision -- must NOT be downgraded.
+    dir = makeSparseForeignSkillsFixture();
+    writeFileSync(
+      join(dir, "AGENTS.md"),
+      "## Routing\n\n| trigger | skill |\n| --- | --- |\n" +
+        "| some real trigger | `skills/some-unrelated-tool-skill/SKILL.md` |\n"
+    );
+    const report = checkResolvable(dir, { skillsDirSource: "cwd_walk_up" });
+    const unreachable = report.issues.filter(i => i.type === "unreachable");
+    expect(unreachable.length).toBeGreaterThan(0);
+    for (const issue of unreachable) {
+      expect(issue.severity).toBe("error");
+    }
+    expect(report.errors.some(i => i.type === "unreachable")).toBe(true);
+  });
+});
+
+describe("missing_file is reported once per skill path, not once per trigger row (wave review)", () => {
+  test("three trigger rows for one absent skill file → one missing_file issue", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gbrain-missing-file-"));
+    try {
+      writeFileSync(
+        join(dir, "RESOLVER.md"),
+        "## Test\n| Trigger | Skill |\n|-----|-----|\n" +
+          '| "first" | `skills/ghost-skill/SKILL.md` |\n' +
+          '| "second" | `skills/ghost-skill/SKILL.md` |\n' +
+          '| "third" | `skills/ghost-skill/SKILL.md` |\n',
+      );
+      writeFileSync(join(dir, "manifest.json"), JSON.stringify({ skills: [] }));
+      const report = checkResolvable(dir);
+      const missing = report.issues.filter(i => i.type === "missing_file");
+      expect(missing).toHaveLength(1);
+      expect(missing[0].skill).toBe("skills/ghost-skill/SKILL.md");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fixture trees for the unreachable-skill fix shape and the MECE whitelist.
+// The real skills/ tree has no unreachable skills and no overlaps, so these
+// contracts need their own inputs.
+// ---------------------------------------------------------------------------
+
+function writeSkillTree(skills: { name: string; triggers: string[]; resolverRow?: string }[]): string {
+  const dir = mkdtempSync(join(tmpdir(), "gbrain-resolvable-"));
+  const rows = skills.filter(s => s.resolverRow).map(s => `| "${s.resolverRow}" | \`skills/${s.name}/SKILL.md\` |`).join("\n");
+  writeFileSync(join(dir, "RESOLVER.md"), `## Brain operations\n| Trigger | Skill |\n|-----|-----|\n${rows}\n`);
+  writeFileSync(join(dir, "manifest.json"), JSON.stringify({ skills: skills.map(s => ({ name: s.name, path: `${s.name}/SKILL.md` })) }, null, 2));
+  for (const s of skills) {
+    mkdirSync(join(dir, s.name), { recursive: true });
+    const triggers = s.triggers.length ? `triggers:\n${s.triggers.map(t => `  - "${t}"`).join("\n")}\n` : "";
+    writeFileSync(join(dir, s.name, "SKILL.md"), `---\nname: ${s.name}\ndescription: fixture\n${triggers}---\n# ${s.name}\n`);
+  }
+  return dir;
+}
+
+describe("checkResolvable — fixture trees", () => {
+  test("a manifest skill with no trigger anywhere is an unreachable error carrying an add_trigger fix for RESOLVER.md", () => {
+    const dir = writeSkillTree([
+      { name: "alpha-notes", triggers: ["file an alpha note"] },
+      { name: "orphan-skill", triggers: [] },
+    ]);
+    try {
+      const report = checkResolvable(dir);
+      const unreachable = report.issues.filter(i => i.type === "unreachable");
+      expect(unreachable.map(i => i.skill)).toEqual(["orphan-skill"]);
+      expect(unreachable[0].severity).toBe("error");
+      expect(unreachable[0].fix).toEqual({
+        type: "add_trigger",
+        file: join(dir, "RESOLVER.md"),
+        section: "Brain operations",
+        skill_path: "skills/orphan-skill/SKILL.md",
+      });
+      expect(report.ok).toBe(false);
+      expect(report.summary).toMatchObject({ total_skills: 2, reachable: 1, unreachable: 1 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("shared triggers report a MECE overlap among non-whitelisted skills only; whitelisted skills need no triggers", () => {
+    const dir = writeSkillTree([
+      { name: "alpha-notes", triggers: ["capture this", "save a note"] },
+      { name: "beta-notes", triggers: ["capture this"] },
+      { name: "brain-ops", triggers: ["capture this", "save a note"] },
+      { name: "signal-detector", triggers: ["save a note"] },
+      { name: "ingest", triggers: [], resolverRow: "ingest anything" },
+    ]);
+    try {
+      const report = checkResolvable(dir);
+      const overlaps = report.issues.filter(i => i.type === "mece_overlap");
+      expect(overlaps.map(i => [i.skill, i.message])).toEqual([
+        ["alpha-notes, beta-notes", "Trigger 'capture this' matches multiple skills: alpha-notes, beta-notes"],
+      ]);
+      expect(report.summary.overlaps).toBe(1);
+      expect(report.issues.filter(i => i.type === "mece_gap")).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

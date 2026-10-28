@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "decision_id": "p3-e3-lmes-full-dev",
+  "plan": "P3",
+  "title": "P3 E3 (dev = all 500 LongMemEval-S questions): feedback on with no ratings leaves retrieval unchanged",
+  "verdict_type": "quality",
+  "stage": "dev",
+  "candidate": {
+    "gbrain": "/workspace/gbrain@70ad30e4e9d384df66acad1e9aff7d49eec35c43",
+    "config": {}
+  },
+  "baseline": {
+    "gbrain": "/workspace/gbrain@6622a119e40ea09a7719233046aca24741863ed2",
+    "config": {}
+  },
+  "sources": [
+    {
+      "id": "lme-s-dev",
+      "kind": "memory-qa",
+      "benchmark": "lme-s",
+      "split": "dev",
+      "embed": "real",
+      "limit": null,
+      "search_pins": {
+        "search.mode": "balanced",
+        "search.reranker.enabled": "false",
+        "search.autocut": "false"
+      },
+      "top_k": 10,
+      "id_field": "id",
+      "exclude_when": [
+        "abstention=true"
+      ],
+      "min_clusters": 10,
+      "comparisons": [
+        {
+          "id": "recall-all-5",
+          "metric": "recall_all_at_5",
+          "gate": "noninferiority",
+          "direction": "higher",
+          "tolerance": 0.01,
+          "cluster_by": "conversation",
+          "description": "guardrail: strict recall does not drop by more than one point"
+        },
+        {
+          "id": "ndcg-10",
+          "metric": "ndcg_at_10",
+          "gate": "exploratory",
+          "direction": "higher",
+          "cluster_by": "conversation"
+        },
+        {
+          "id": "latency",
+          "metric": "latency_ms",
+          "gate": "exploratory",
+          "direction": "lower",
+          "cluster_by": "conversation"
+        }
+      ],
+      "estimate_usd": 16
+    }
+  ],
+  "alpha": 0.05,
+  "seed": 42,
+  "draws": 10000,
+  "budget_usd": 16,
+  "created_at": "2026-10-04T20:36:09.409Z",
+  "notes": "Use-attributed feedback weights: the sequential replay-with-feedback mode lands in milestone M2; until then these are guardrails only. E3 run on all 500 LME-S questions (P0 split: all dev). Measured run: the second pass, with every embedding already in the content-addressed cache (first pass cost $6.15 and showed the same identical lists; its latency included cold provider calls on one arm)."
+}

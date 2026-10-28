@@ -1,0 +1,870 @@
+/**
+ * Retrieval Reflex — resolver + assemble() regression tests (#1981, T5).
+ *
+ * Encodes the motivating failure: a turn naming an entity with an existing brain
+ * page must surface a pointer BEFORE the agent answers. Runs against a hermetic
+ * in-memory PGLite engine (no file lock). The PGLite-in-production path is
+ * covered by exercising the resolver through an injected resolver (the same
+ * shape the serve IPC / host ctx.brainQuery supply).
+ */
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { normalizeAlias } from '../src/core/search/alias-normalize.ts';
+import { resolveEntitiesToPointers } from '../src/core/context/retrieval-reflex.ts';
+import { extractCandidates } from '../src/core/context/entity-salience.ts';
+import { createGBrainContextEngine } from '../src/core/context-engine.ts';
+import { disposeReflex, lexicalArmsEnabled } from '../src/core/context/reflex.ts';
+import { TAKES_FENCE_BEGIN, TAKES_FENCE_END } from '../src/core/takes-fence.ts';
+
+let engine: PGLiteEngine;
+
+async function seed(slug: string, title: string, body: string, source = 'default') {
+  await engine.executeRaw(
+    `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+     VALUES ($1, $2, 'person', $3, $4, '')`,
+    [slug, source, title, body],
+  );
+}
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+}, 60_000);
+
+afterAll(async () => {
+  await engine.disconnect();
+  await disposeReflex();
+});
+
+beforeEach(async () => {
+  await engine.executeRaw('DELETE FROM page_aliases').catch(() => {});
+  await engine.executeRaw('DELETE FROM pages');
+});
+
+describe('resolveEntitiesToPointers', () => {
+  test('namespaced slug resolves from a bare title (the recall fix, D6)', async () => {
+    await seed('people/alice-example', 'Alice Example', 'Alice is an early founder.');
+    const candidates = extractCandidates('what do you think about Alice Example?');
+    const block = await resolveEntitiesToPointers(engine, 'default', candidates, {});
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('people/alice-example');
+    expect(block!.text).toContain('people/alice-example');
+    expect(block!.text).toContain('use get_page');
+  });
+
+  test('weak-alias arm: a lowercase mention resolves via an exact unique alias (kta-pos variant 3)', async () => {
+    await seed('people/saoirse-x', 'Saoirse X', 'A founder.');
+    await engine.setPageAliases('people/saoirse-x', 'default', [normalizeAlias('saoirse')]);
+    const candidates = extractCandidates('remind me what saoirse said about the round');
+    expect(candidates.some((c) => c.weak)).toBe(true);
+    const block = await resolveEntitiesToPointers(engine, 'default', candidates, {});
+    expect(block).not.toBeNull();
+    expect(block!.pointers).toHaveLength(1); // other lowercase words resolve nothing
+    expect(block!.pointers[0].slug).toBe('people/saoirse-x');
+    expect(block!.pointers[0].arm).toBe('alias');
+  });
+
+  test('kill switch: lexicalArms=false reproduces pre-wave resolution exactly', async () => {
+    await seed('people/saoirse-x', 'Saoirse X', 'A founder.');
+    await seed('people/ronan-galewright', 'Ronan Galewright', 'An investor.');
+    await engine.setPageAliases('people/saoirse-x', 'default', [normalizeAlias('saoirse')]);
+    const weakTurn = extractCandidates('remind me what saoirse said about the round');
+    const surnameTurn = extractCandidates('Did Galewright ever follow up on that intro?');
+    expect(await resolveEntitiesToPointers(engine, 'default', weakTurn, { lexicalArms: false })).toBeNull();
+    expect(await resolveEntitiesToPointers(engine, 'default', surnameTurn, { lexicalArms: false })).toBeNull();
+  });
+
+  test('surname arm: unique person page resolves from a surname-only reference (kta-pos variant 4)', async () => {
+    await seed('people/ronan-galewright', 'Ronan Galewright', 'An investor.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('Did Galewright ever follow up on that intro?'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('people/ronan-galewright');
+    expect(block!.pointers[0].arm).toBe('title-surname');
+    expect(block!.pointers[0].confidence).toBeGreaterThanOrEqual(0.7); // survives the volunteer gate
+    expect(block!.pointers[0].matchedNorm).toBe(normalizeAlias('Galewright'));
+  });
+
+  test('surname arm: ambiguous surname (two people) injects nothing', async () => {
+    await seed('people/ronan-galewright', 'Ronan Galewright', 'An investor.');
+    await seed('people/mira-galewright', 'Mira Galewright', 'A founder.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('Did Galewright ever follow up?'),
+      {},
+    );
+    expect(block).toBeNull();
+  });
+
+  test('surname arm: company tails are excluded by the person-type guard', async () => {
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+       VALUES ('companies/acme-labs', 'default', 'company', 'Acme Labs', 'A company.', '')`,
+      [],
+    );
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('Did Labs ever ship it?'),
+      {},
+    );
+    expect(block).toBeNull();
+  });
+
+  test('surname arm: adversarial near-miss stays silent', async () => {
+    await seed('people/elias-marrowfield', 'Elias Marrowfield', 'A founder.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('Did Marrowfielder ever reply?'),
+      {},
+    );
+    expect(block).toBeNull();
+  });
+
+  test('weak-alias arm: cross-source ambiguity injects nothing (global uniqueness)', async () => {
+    await engine.executeRaw(`INSERT INTO sources (id, name) VALUES ('other', 'Other') ON CONFLICT DO NOTHING`, []).catch(() => {});
+    await seed('people/saoirse-x', 'Saoirse X', 'A founder.');
+    await seed('people/saoirse-y', 'Saoirse Y', 'Another person.', 'other');
+    await engine.setPageAliases('people/saoirse-x', 'default', [normalizeAlias('saoirse')]);
+    await engine.setPageAliases('people/saoirse-y', 'other', [normalizeAlias('saoirse')]);
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('remind me what saoirse said'),
+      { sourceIds: ['default', 'other'] },
+    );
+    expect(block).toBeNull();
+  });
+
+  test('weak-alias arm: a phantom alias (deleted page) resolves nothing', async () => {
+    await seed('people/ghost-page', 'Ghost Page', 'Gone.');
+    await engine.setPageAliases('people/ghost-page', 'default', [normalizeAlias('ghostly')]);
+    await engine.executeRaw(`UPDATE pages SET deleted_at = now() WHERE slug = 'people/ghost-page'`, []);
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('any update from ghostly today?'),
+      {},
+    );
+    expect(block).toBeNull();
+  });
+
+  test('alias arm resolves an unambiguous single-slug hit', async () => {
+    await seed('people/swami-x', 'Swami X', 'A close friend.');
+    await engine.setPageAliases('people/swami-x', 'default', [normalizeAlias('Swami')]);
+    const block = await resolveEntitiesToPointers(engine, 'default', extractCandidates('Spoke with Swami today'), {});
+    expect(block).not.toBeNull();
+    expect(block!.pointers.some((p) => p.slug === 'people/swami-x')).toBe(true);
+  });
+
+  test('privacy (D5): takes-fence content never leaks into the synopsis', async () => {
+    const body = `${TAKES_FENCE_BEGIN}\nSECRET_HUNCH_DO_NOT_LEAK\n${TAKES_FENCE_END}\nAlice is a founder.`;
+    await seed('people/alice-example', 'Alice Example', body);
+    const block = await resolveEntitiesToPointers(engine, 'default', extractCandidates('about Alice Example'), {});
+    expect(block).not.toBeNull();
+    expect(block!.text).not.toContain('SECRET_HUNCH_DO_NOT_LEAK');
+  });
+
+  test('suppression: a slug already in PRIOR context is dropped', async () => {
+    await seed('people/alice-example', 'Alice Example', 'A founder.');
+    const candidates = extractCandidates('tell me about Alice Example');
+    const block = await resolveEntitiesToPointers(engine, 'default', candidates, {
+      priorContextText: 'earlier we already opened people/alice-example and read it',
+    });
+    expect(block).toBeNull();
+  });
+
+  test('empty candidates → null', async () => {
+    expect(await resolveEntitiesToPointers(engine, 'default', [], {})).toBeNull();
+  });
+
+  test('cap to maxPointers', async () => {
+    await seed('people/aa', 'Aa Bb', 'x');
+    await seed('people/cc', 'Cc Dd', 'y');
+    await seed('people/ee', 'Ee Ff', 'z');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('met Aa Bb, Cc Dd, and Ee Ff'),
+      { maxPointers: 2 },
+    );
+    expect(block!.pointers.length).toBe(2);
+  });
+
+  // The pre-v110 alias-table-absence case lives in its own file
+  // (test/retrieval-reflex-pre-v110.test.ts): it DROPS page_aliases, and
+  // "restoring" via initSchema() is a trap under GBRAIN_PGLITE_SNAPSHOT —
+  // the snapshot fast-path short-circuits initSchema, the table never comes
+  // back, and every later alias test in the sharing file fails with 42P01.
+});
+
+describe('context-engine assemble() — Retrieval Reflex integration', () => {
+  // Each test wraps its body in withEnv (NOT a beforeEach env mutation) so the
+  // flag is restored even on throw — required by check-test-isolation rule R1.
+  const REFLEX_ON = { GBRAIN_RETRIEVAL_REFLEX: 'true' };
+
+  test('regression: a named entity with a page surfaces a pointer (host resolver path)', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      // Inject a resolver the way the OpenClaw host (ctx.brainQuery) or serve IPC would.
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      const res = await ce.assemble({
+        sessionId: 's1',
+        messages: [{ role: 'user', content: 'what do you think about Alice Example?' }],
+      });
+      expect(res.systemPromptAddition).toContain('Brain pages mentioned this turn');
+      expect(res.systemPromptAddition).toContain('people/alice-example');
+      expect(res.systemPromptAddition).toContain('use get_page');
+    });
+  });
+
+  test('turn delivered via `prompt` with empty `messages` still fires the reflex (codex-app-server path)', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-prompt',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      // Runtimes like the codex-app-server (2026.7.x) deliver the current turn
+      // via `prompt` and leave `messages` empty. The reflex must still see it.
+      const res = await ce.assemble({
+        sessionId: 's-prompt',
+        messages: [],
+        prompt: 'what do you think about Alice Example?',
+      });
+      expect(res.systemPromptAddition).toContain('Brain pages mentioned this turn');
+      expect(res.systemPromptAddition).toContain('people/alice-example');
+    });
+  });
+
+  test('the separate current prompt wins over a historical user message without changing caller messages', async () => {
+    await withEnv({ ...REFLEX_ON, GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS: '1', GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER: 'false' }, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      await seed('people/bob-example', 'Bob Example', 'Bob is a founder.');
+      const seen: string[] = [];
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-prompt-ignored',
+        resolveEntities: (candidates, opts) => {
+          seen.push(...candidates.map((c) => c.query));
+          return resolveEntitiesToPointers(engine, 'default', candidates, opts);
+        },
+      });
+      const messages = [{ role: 'user', content: 'what do you think about Alice Example?' }];
+      const res = await ce.assemble({
+        sessionId: 's-prompt-ignored',
+        messages,
+        prompt: 'tell me about Bob Example',
+      });
+      expect(res.systemPromptAddition).toContain('people/bob-example');
+      expect(seen.join(' ')).not.toContain('Alice Example');
+      expect(seen.join(' ')).toContain('Bob Example');
+      expect(res.messages).toBe(messages);
+      expect(messages).toHaveLength(1);
+    });
+  });
+
+  test('fenced repeated text remains historical while a legacy included current turn is not duplicated', async () => {
+    await withEnv({ ...REFLEX_ON, GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS: '1', GBRAIN_RETRIEVAL_REFLEX_VOLUNTEER: 'false' }, async () => {
+      const prompt = 'tell me about Alice Example';
+      const messages = [{ role: 'user', content: prompt }];
+      const seen: Array<{ priorContextText?: string; candidates: string[] }> = [];
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-repeat',
+        resolveEntities: async (candidates, opts) => {
+          seen.push({ priorContextText: opts.priorContextText, candidates: candidates.map((candidate) => candidate.query) });
+          return null;
+        },
+      });
+      const fenced = await ce.assemble({ sessionId: '', messages, prompt, runtimeContext: { transcriptStorage: { kind: 'sqlite' } } });
+      expect(seen[0].priorContextText).toBe(prompt);
+      expect(seen[0].candidates.filter((candidate) => candidate === 'Alice Example')).toHaveLength(1);
+      expect(fenced.messages).toBe(messages);
+      const legacy = await ce.assemble({ sessionId: '', messages, prompt });
+      expect(seen[1].priorContextText).toBe('');
+      expect(seen[1].candidates.filter((candidate) => candidate === 'Alice Example')).toHaveLength(1);
+      expect(legacy.messages).toBe(messages);
+      const absent = await ce.assemble({ sessionId: '', messages });
+      expect(seen[2]).toEqual(seen[1]);
+      expect(absent.messages).toBe(messages);
+      expect(messages).toEqual([{ role: 'user', content: prompt }]);
+    });
+  });
+
+  test('no resolver available (PGLite, no serve/host) → no throw, live context still present', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      const ce = createGBrainContextEngine({ workspaceDir: '/tmp/rr-test-ws-2' });
+      const res = await ce.assemble({
+        sessionId: 's2',
+        messages: [{ role: 'user', content: 'what about Alice Example?' }],
+      });
+      // Live Context block always ships; no pointer block (nothing resolved).
+      expect(res.systemPromptAddition).toContain('Live Context');
+      expect(res.systemPromptAddition).not.toContain('Brain pages mentioned this turn');
+    });
+  });
+
+  test('zero salient candidates → no brain touch, no pointer block', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      let called = false;
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-3',
+        resolveEntities: async () => { called = true; return null; },
+      });
+      // Re-pinned for the v0.46.15 identity wave: the turn must be GENUINELY
+      // candidate-free (stopwords / sub-3-char tokens only) — lowercase words
+      // like "help" are now WEAK candidates and legitimately reach the
+      // resolver's alias arm.
+      const res = await ce.assemble({
+        sessionId: 's3',
+        messages: [{ role: 'user', content: 'can you do it?' }],
+      });
+      expect(called).toBe(false);
+      expect(res.systemPromptAddition).not.toContain('Brain pages mentioned this turn');
+    });
+  });
+
+  test('weak-only smalltalk reaches the resolver but yields no pointer block', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      let called = false;
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-3b',
+        resolveEntities: async (candidates) => {
+          called = true;
+          return resolveEntitiesToPointers(engine, 'default', candidates, {});
+        },
+      });
+      const res = await ce.assemble({
+        sessionId: 's3b',
+        messages: [{ role: 'user', content: 'can you help me with this?' }],
+      });
+      expect(called).toBe(true); // "help" is a weak candidate — alias-arm-restricted
+      expect(res.systemPromptAddition).not.toContain('Brain pages mentioned this turn');
+    });
+  });
+
+  test('suppression uses PRIOR turns only, not the current message', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'A founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-4',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      // The current message names Alice Example; prior context does NOT. Must fire.
+      const res = await ce.assemble({
+        sessionId: 's4',
+        messages: [
+          { role: 'user', content: 'hello' },
+          { role: 'assistant', content: 'hi there' },
+          { role: 'user', content: 'what do you think about Alice Example?' },
+        ],
+      });
+      expect(res.systemPromptAddition).toContain('people/alice-example');
+    });
+  });
+});
+
+describe('v0.43 (#2095) — rolling window extraction through assemble()', () => {
+  const REFLEX_ON = { GBRAIN_RETRIEVAL_REFLEX: 'true' };
+
+  test('entity named ONLY in a previous assistant turn yields a pointer now', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-w1',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      // Current turn is a pronoun follow-up; the antecedent was NAMED two
+      // turns back by the ASSISTANT. Pre-window this never fired.
+      const res = await ce.assemble({
+        sessionId: 'w1',
+        messages: [
+          { role: 'user', content: 'who should I talk to about the seed round?' },
+          { role: 'assistant', content: 'Alice Example led a similar round last year.' },
+          { role: 'user', content: 'what did she invest in?' },
+        ],
+      });
+      expect(res.systemPromptAddition).toContain('people/alice-example');
+    });
+  });
+
+  test('window=1 reproduces the legacy current-turn-only behavior', async () => {
+    await withEnv({ ...REFLEX_ON, GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS: '1' }, async () => {
+      await seed('people/alice-example', 'Alice Example', 'Alice is a founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-w2',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      const res = await ce.assemble({
+        sessionId: 'w2',
+        messages: [
+          { role: 'assistant', content: 'Alice Example led a similar round last year.' },
+          { role: 'user', content: 'what did she invest in?' },
+        ],
+      });
+      // Current turn has no extractable entity; window=1 must NOT widen.
+      expect(res.systemPromptAddition).not.toContain('people/alice-example');
+    });
+  });
+
+  test('windowed suppression is slug-only: a prior-turn MENTION does not suppress (codex D7)', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'A founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-w3',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      // "Alice Example" appears in a PRIOR turn (a bare mention — prior
+      // context contains the TITLE). Under the legacy title rule the pointer
+      // would be suppressed; slug-only windowing must still fire.
+      const res = await ce.assemble({
+        sessionId: 'w3',
+        messages: [
+          { role: 'user', content: 'I met Alice Example yesterday' },
+          { role: 'assistant', content: 'How did the meeting with Alice Example go?' },
+          { role: 'user', content: 'she wants to invest — thoughts?' },
+        ],
+      });
+      expect(res.systemPromptAddition).toContain('people/alice-example');
+    });
+  });
+
+  test('windowed suppression still drops an already-surfaced page (slug in prior context)', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'A founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-w4',
+        resolveEntities: (candidates, opts) =>
+          resolveEntitiesToPointers(engine, 'default', candidates, opts),
+      });
+      const res = await ce.assemble({
+        sessionId: 'w4',
+        messages: [
+          { role: 'assistant', content: 'Pointer: **Alice Example** → `people/alice-example` (use get_page)' },
+          { role: 'user', content: 'tell me more about Alice Example' },
+        ],
+      });
+      expect(res.systemPromptAddition).not.toContain('Brain pages mentioned this turn');
+    });
+  });
+
+  test('fail-open: a throwing resolver under windowing never breaks the turn', async () => {
+    await withEnv(REFLEX_ON, async () => {
+      await seed('people/alice-example', 'Alice Example', 'A founder.');
+      const ce = createGBrainContextEngine({
+        workspaceDir: '/tmp/rr-test-ws-w5',
+        resolveEntities: async () => { throw new Error('resolver exploded'); },
+      });
+      const res = await ce.assemble({
+        sessionId: 'w5',
+        messages: [
+          { role: 'assistant', content: 'Alice Example is relevant here.' },
+          { role: 'user', content: 'ok tell me about her' },
+        ],
+      });
+      expect(res.systemPromptAddition).toContain('Live Context');
+      expect(res.systemPromptAddition).not.toContain('Brain pages mentioned this turn');
+    });
+  });
+});
+
+describe('ambient-channel event logging (codex D11 — accept-side logDeliveredReflexPointers)', () => {
+  test('logDeliveredReflexPointers logs channel=reflex events through the drained sink', async () => {
+    const { logDeliveredReflexPointers } = await import('../src/core/context/retrieval-reflex.ts');
+    const { awaitPendingVolunteerEventWrites, _resetPendingVolunteerEventWritesForTests } =
+      await import('../src/core/context/volunteer-events.ts');
+    _resetPendingVolunteerEventWritesForTests();
+    await engine.executeRaw('DELETE FROM context_volunteer_events').catch(() => {});
+    await seed('people/alice-example', 'Alice Example', 'A founder.');
+
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('what do you think about Alice Example?'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    logDeliveredReflexPointers(engine, block!.pointers);
+    const { unfinished } = await awaitPendingVolunteerEventWrites(5_000);
+    expect(unfinished).toBe(0);
+    const rows = await engine.executeRaw<{ channel: string; slug: string; match_arm: string }>(
+      'SELECT channel, slug, match_arm FROM context_volunteer_events',
+      [],
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].channel).toBe('reflex');
+    expect(rows[0].slug).toBe('people/alice-example');
+    expect(rows[0].match_arm).toBe('title');
+  });
+
+  test('the bare resolver logs nothing — delivery is the only logging seam', async () => {
+    await engine.executeRaw('DELETE FROM context_volunteer_events').catch(() => {});
+    await seed('people/alice-example', 'Alice Example', 'A founder.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('about Alice Example'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    const { awaitPendingVolunteerEventWrites } = await import('../src/core/context/volunteer-events.ts');
+    await awaitPendingVolunteerEventWrites(5_000);
+    const rows = await engine.executeRaw<{ channel: string }>('SELECT channel FROM context_volunteer_events', []);
+    expect(rows.length).toBe(0);
+  });
+
+  test('logDeliveredReflexPointers with an empty pointer list is a no-op', async () => {
+    const { logDeliveredReflexPointers } = await import('../src/core/context/retrieval-reflex.ts');
+    const { awaitPendingVolunteerEventWrites } = await import('../src/core/context/volunteer-events.ts');
+    await engine.executeRaw('DELETE FROM context_volunteer_events').catch(() => {});
+    logDeliveredReflexPointers(engine, []);
+    await awaitPendingVolunteerEventWrites(5_000);
+    const rows = await engine.executeRaw<{ channel: string }>('SELECT channel FROM context_volunteer_events', []);
+    expect(rows.length).toBe(0);
+  });
+});
+
+describe('serve IPC wiring — suppression passthrough + reflex-channel logging (review hardening)', () => {
+  test('the IPC round-trip honors slug-only suppression and logs channel=reflex', async () => {
+    const { startResolveIpcServer, resolveViaIpc, resolveSocketPath, IPC_UNAVAILABLE } =
+      await import('../src/core/context/resolve-ipc.ts');
+    const { awaitPendingVolunteerEventWrites, _resetPendingVolunteerEventWritesForTests } =
+      await import('../src/core/context/volunteer-events.ts');
+    const { mkdtempSync, rmSync } = await import('fs');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+
+    _resetPendingVolunteerEventWritesForTests();
+    await engine.executeRaw('DELETE FROM context_volunteer_events').catch(() => {});
+    await seed('people/alice-example', 'Alice Example', 'A founder.');
+
+    const dir = mkdtempSync(join(tmpdir(), 'rr-ipc-'));
+    const sock = resolveSocketPath(dir);
+    // The SAME wiring shape src/mcp/server.ts uses for serve: forwards
+    // suppression from the request; logging happens at DELIVERY via the
+    // onDelivered hook (post-write), never inside the resolver.
+    const { logDeliveredReflexPointers } = await import('../src/core/context/retrieval-reflex.ts');
+    const server = await startResolveIpcServer(
+      sock,
+      (req) =>
+        resolveEntitiesToPointers(engine, req.sourceId || 'default', req.candidates ?? [], {
+          priorContextText: req.priorContextText,
+          maxPointers: req.maxPointers,
+          suppression: req.suppression,
+        }),
+      (block) => logDeliveredReflexPointers(engine, block.pointers),
+    );
+    expect(server).not.toBeNull();
+    try {
+      // slug-only suppression: a TITLE mention in prior context must NOT
+      // suppress (the windowing contract), and the resolve must log.
+      const block = await resolveViaIpc(sock, {
+        candidates: extractCandidates('tell me about Alice Example'),
+        priorContextText: 'earlier turn merely mentioned Alice Example',
+        suppression: 'slug-only',
+      });
+      expect(block).not.toBe(IPC_UNAVAILABLE);
+      expect(block).not.toBeNull();
+      expect((block as { pointers: Array<{ slug: string }> }).pointers[0].slug).toBe('people/alice-example');
+
+      const { unfinished } = await awaitPendingVolunteerEventWrites(5_000);
+      expect(unfinished).toBe(0);
+      const rows = await engine.executeRaw<{ channel: string }>(
+        'SELECT channel FROM context_volunteer_events', [],
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].channel).toBe('reflex');
+    } finally {
+      server!.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('windowTurnCount — knob edge semantics', () => {
+  test('0, negative, NaN, and absent all fall back to the default of 4 (1 = legacy off)', async () => {
+    const { windowTurnCount, DEFAULT_WINDOW_TURNS } = await import('../src/core/context/reflex.ts');
+    expect(DEFAULT_WINDOW_TURNS).toBe(4);
+    expect(windowTurnCount(null)).toBe(4);
+    expect(windowTurnCount({ retrieval_reflex_window_turns: 0 } as never)).toBe(4);
+    expect(windowTurnCount({ retrieval_reflex_window_turns: -3 } as never)).toBe(4);
+    expect(windowTurnCount({ retrieval_reflex_window_turns: Number.NaN } as never)).toBe(4);
+    // The documented "off" switch is 1 (legacy single-turn), not 0.
+    expect(windowTurnCount({ retrieval_reflex_window_turns: 1 } as never)).toBe(1);
+    expect(windowTurnCount({ retrieval_reflex_window_turns: 6.9 } as never)).toBe(6);
+  });
+
+  test('the env escape hatch is honored even when config is null (no config file / DB)', async () => {
+    const { windowTurnCount } = await import('../src/core/context/reflex.ts');
+    // loadConfig() returns null in a config-less environment (clean CI shard,
+    // no brain) and drops its env→config mapping — windowTurnCount must still
+    // read the env var directly, or the documented escape hatch is dead and
+    // the window silently defaults to 4. withEnv() (not raw process.env
+    // mutation) keeps the linter + isolation guard happy.
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS: '1' }, async () => {
+      expect(windowTurnCount(null)).toBe(1);
+    });
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS: '7' }, async () => {
+      expect(windowTurnCount(null)).toBe(7);
+      // Env wins over a config value too (env is the higher-precedence plane).
+      expect(windowTurnCount({ retrieval_reflex_window_turns: 3 } as never)).toBe(7);
+    });
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_WINDOW_TURNS: 'not-a-number' }, async () => {
+      // Garbage env falls through to config / default, not a crash.
+      expect(windowTurnCount(null)).toBe(4);
+    });
+  });
+});
+
+describe('lexicalArmsEnabled — kill-switch resolution (env > config > default-ON)', () => {
+  const cfg = (o: object) => o as import('../src/core/config.ts').GBrainConfig;
+
+  test('defaults ON with no env and no config', async () => {
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS: undefined }, async () => {
+      expect(lexicalArmsEnabled(null)).toBe(true);
+      expect(lexicalArmsEnabled(cfg({}))).toBe(true);
+    });
+  });
+
+  test('config file-plane key disables and re-enables', async () => {
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS: undefined }, async () => {
+      expect(lexicalArmsEnabled(cfg({ retrieval_reflex_lexical_arms: false }))).toBe(false);
+      expect(lexicalArmsEnabled(cfg({ retrieval_reflex_lexical_arms: true }))).toBe(true);
+    });
+  });
+
+  test('env beats config in BOTH directions (incident escape hatch)', async () => {
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS: 'false' }, async () => {
+      expect(lexicalArmsEnabled(cfg({ retrieval_reflex_lexical_arms: true }))).toBe(false);
+    });
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS: '0' }, async () => {
+      expect(lexicalArmsEnabled(null)).toBe(false);
+    });
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS: 'true' }, async () => {
+      expect(lexicalArmsEnabled(cfg({ retrieval_reflex_lexical_arms: false }))).toBe(true);
+    });
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS: '1' }, async () => {
+      expect(lexicalArmsEnabled(cfg({ retrieval_reflex_lexical_arms: false }))).toBe(true);
+    });
+  });
+
+  test('empty-string env falls through to config (not treated as set)', async () => {
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS: '' }, async () => {
+      expect(lexicalArmsEnabled(cfg({ retrieval_reflex_lexical_arms: false }))).toBe(false);
+      expect(lexicalArmsEnabled(null)).toBe(true);
+    });
+  });
+
+  test('incident-hatch parse is case-insensitive with common negatives (F11)', async () => {
+    for (const v of ['FALSE', 'False', 'OFF', 'off', 'No', ' 0 ']) {
+      await withEnv({ GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS: v }, async () => {
+        expect(lexicalArmsEnabled(null)).toBe(false);
+      });
+    }
+    await withEnv({ GBRAIN_RETRIEVAL_REFLEX_LEXICAL_ARMS: 'TRUE' }, async () => {
+      expect(lexicalArmsEnabled(cfg({ retrieval_reflex_lexical_arms: false }))).toBe(true);
+    });
+  });
+});
+
+describe('v0.46.15 ship-review hardening (adversarial F1/F2 + stale-alias veto)', () => {
+  test('F1: a title-claimed namesake still makes the bare surname AMBIGUOUS', async () => {
+    // Jane resolves via title; the bare "Galewright" must count BOTH holders
+    // and stay silent — classification precedence must not hand John the
+    // "unique" surname slot (wrong-person injection at above-gate confidence).
+    await seed('people/jane-galewright', 'Jane Galewright', 'A founder.');
+    await seed('people/john-galewright', 'John Galewright', 'Her brother.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('Jane Galewright mentioned it. Did Galewright follow up?'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    const slugs = block!.pointers.map((p) => p.slug);
+    expect(slugs).toContain('people/jane-galewright'); // title arm
+    expect(slugs).not.toContain('people/john-galewright'); // surname stays ambiguous
+    expect(block!.pointers.every((p) => p.arm !== 'title-surname')).toBe(true);
+  });
+
+  test('stale-alias veto: a deleted page\'s leftover alias row cannot veto the sole live target', async () => {
+    await seed('people/saoirse-x', 'Saoirse X', 'A founder.');
+    await seed('people/saoirse-old', 'Saoirse Old', 'Renamed away.');
+    await engine.setPageAliases('people/saoirse-x', 'default', [normalizeAlias('saoirse')]);
+    await engine.setPageAliases('people/saoirse-old', 'default', [normalizeAlias('saoirse')]);
+    await engine.executeRaw(`UPDATE pages SET deleted_at = now() WHERE slug = 'people/saoirse-old'`, []);
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('remind me what saoirse said about the round'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers).toHaveLength(1);
+    expect(block!.pointers[0].slug).toBe('people/saoirse-x');
+  });
+
+  test('F2: weak fold goes FAIL-CLOSED when any source\'s alias lookup fails', async () => {
+    // Alias registered in two sources = ambiguous = must inject nothing.
+    // If one source's lookup transiently fails, the survivor must NOT look
+    // unique — partial visibility cannot manufacture uniqueness.
+    await engine.executeRaw(`INSERT INTO sources (id, name, local_path) VALUES ('other', 'Other', '/tmp/other') ON CONFLICT (id) DO NOTHING`, []).catch(() => {});
+    await seed('people/saoirse-x', 'Saoirse X', 'A founder.');
+    await engine.setPageAliases('people/saoirse-x', 'default', [normalizeAlias('saoirse')]);
+    // (In reality 'other' also has the alias, but its lookup fails.)
+    const shim = {
+      resolveAliases: (norms: string[], opts?: { sourceId?: string }) =>
+        opts?.sourceId === 'other'
+          ? Promise.reject(new Error('transient blip'))
+          : engine.resolveAliases(norms, opts),
+      executeRaw: (sql: string, params: unknown[]) => engine.executeRaw(sql, params),
+    } as unknown as typeof engine;
+    const block = await resolveEntitiesToPointers(
+      shim,
+      'default',
+      extractCandidates('remind me what saoirse said'),
+      { sourceIds: ['default', 'other'] },
+    );
+    expect(block).toBeNull();
+  });
+});
+
+describe('#3746 — cjk-title arm (pure-CJK weak norms probe exact title/slug)', () => {
+  test('japanese: unregistered-alias page resolves via exact title', async () => {
+    await seed('people/tanaka', '田中', '田中 is a partner at fund-a.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('people/tanaka');
+    expect(block!.pointers[0].arm).toBe('cjk-title');
+    expect(block!.pointers[0].confidence).toBeGreaterThanOrEqual(0.7); // survives the volunteer gate
+    expect(block!.pointers[0].matchedNorm).toBe(normalizeAlias('田中'));
+  });
+
+  test('korean: registered CJK alias resolves through the alias arm (0.9)', async () => {
+    await seed('people/kim-chulsoo', 'Kim Chulsoo', 'A founder.');
+    await engine.setPageAliases('people/kim-chulsoo', 'default', [normalizeAlias('김철수')]);
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('김철수 미팅 노트 보여줘'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('people/kim-chulsoo');
+    expect(block!.pointers[0].arm).toBe('alias');
+  });
+
+  test('chinese: exact CJK slug resolves when the title differs', async () => {
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+       VALUES ('王小明', 'default', 'person', 'Wang Xiaoming', 'A researcher.', '')`,
+      [],
+    );
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('给我看看王小明的笔记'),
+      {},
+    );
+    expect(block).not.toBeNull();
+    expect(block!.pointers[0].slug).toBe('王小明');
+    expect(block!.pointers[0].arm).toBe('cjk-title');
+  });
+
+  test('no matching page → resolves nothing (junk grams never fabricate)', async () => {
+    await seed('people/unrelated', 'Unrelated Person', 'Nothing CJK here.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      {},
+    );
+    expect(block).toBeNull();
+  });
+
+  test('ambiguous gram (two pages share the title) injects nothing', async () => {
+    await seed('people/tanaka-a', '田中', 'First 田中.');
+    await seed('people/tanaka-b', '田中', 'Second 田中.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      {},
+    );
+    expect(block).toBeNull();
+  });
+
+  test('kill switch: lexicalArms=false disables the cjk-title arm', async () => {
+    await seed('people/tanaka', '田中', '田中 is a partner.');
+    const block = await resolveEntitiesToPointers(
+      engine,
+      'default',
+      extractCandidates('田中さんの会議のメモを見せて'),
+      { lexicalArms: false },
+    );
+    expect(block).toBeNull();
+  });
+});
+
+// #6195: lowercase multi-word names ("call alice example") volunteer through 2-3-word weak
+// n-grams: the exact alias arm, and an exact-title arm limited to entity types with a globally
+// unique title. Single lowercase words stay alias-only.
+describe('lowercase multi-word names (#6195)', () => {
+  async function seedTyped(slug: string, title: string, type: string) {
+    await engine.executeRaw(`INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline) VALUES ($1, 'default', $2, $3, 'Body.', '')`, [slug, type, title]);
+  }
+
+  test('a lowercase multi-word alias or entity title volunteers; a single lowercase word does not', async () => {
+    await seed('people/alice-example', 'Alice Example', 'A founder.');
+    await engine.setPageAliases('people/alice-example', 'default', [normalizeAlias('Alice Sample')]);
+    const viaAlias = await resolveEntitiesToPointers(engine, 'default', extractCandidates('did alice sample reply'), {});
+    expect(viaAlias?.pointers.map((p) => [p.slug, p.arm])).toEqual([['people/alice-example', 'alias']]);
+    const viaTitle = await resolveEntitiesToPointers(engine, 'default', extractCandidates('call alice example tomorrow'), {});
+    expect(viaTitle?.pointers.map((p) => [p.slug, p.arm])).toEqual([['people/alice-example', 'weak-title']]);
+    expect(await resolveEntitiesToPointers(engine, 'default', extractCandidates('ask alice about it'), {})).toBeNull();
+  });
+
+  test('a non-entity or ambiguous title does not volunteer, and the kill switch turns the arm off', async () => {
+    await seedTyped('concepts/open-source', 'Open Source', 'concept');
+    expect(await resolveEntitiesToPointers(engine, 'default', extractCandidates('we like open source tools'), {})).toBeNull();
+    await seedTyped('companies/acme-example', 'Acme Example', 'company');
+    await seedTyped('people/acme-example', 'Acme Example', 'person');
+    expect(await resolveEntitiesToPointers(engine, 'default', extractCandidates('met acme example today'), {})).toBeNull();
+    await seed('people/alice-example', 'Alice Example', 'A founder.');
+    expect(await resolveEntitiesToPointers(engine, 'default', extractCandidates('call alice example'), { lexicalArms: false })).toBeNull();
+  });
+
+  test('a private entity page is hidden from the weak-title arm by default', async () => {
+    await engine.executeRaw(`INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline, frontmatter)
+      VALUES ('people/zora-example', 'default', 'person', 'Zora Example', 'Body.', '', '{"visibility":"private"}'::jsonb)`);
+    expect(await resolveEntitiesToPointers(engine, 'default', extractCandidates('call zora example'), {})).toBeNull();
+    const trusted = await resolveEntitiesToPointers(engine, 'default', extractCandidates('call zora example'), { excludePrivate: false });
+    expect(trusted?.pointers[0].slug).toBe('people/zora-example');
+  });
+
+  test('punctuation breaks an n-gram', () => {
+    const grams = extractCandidates('thanks alice, example follows').filter((c) => c.weak && c.query.includes(' ')).map((c) => c.query);
+    expect(grams).not.toContain('alice example');
+  });
+});

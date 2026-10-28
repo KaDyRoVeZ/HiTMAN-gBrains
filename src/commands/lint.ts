@@ -1,0 +1,999 @@
+import { readSourceFileSync, writeSourceFileSync, hasSourceFilesystemLock, withSourceFilesystemLock, assertSourceFilesystemActive } from '../core/minions/source-filesystem.ts';
+/**
+ * gbrain lint — Deterministic brain page quality checker.
+ *
+ * Zero LLM calls. Catches common quality issues:
+ * - LLM preamble artifacts ("Of course! Here is...")
+ * - Placeholder dates (YYYY-MM-DD, XX-XX left unfilled)
+ * - Missing required frontmatter fields
+ * - Broken citations (unclosed brackets, missing dates)
+ * - Empty/stub sections
+ * - Wrapping code fences from LLM output
+ * - Page types the active schema pack does not declare (type-undeclared)
+ *
+ * Usage:
+ *   gbrain lint <dir>              # report issues
+ *   gbrain lint <dir> --fix        # auto-fix what's fixable
+ *   gbrain lint <dir> --fix --dry-run  # preview fixes
+ *   gbrain lint <file.md>          # lint single file
+ */
+
+import { readdirSync, statSync, lstatSync, existsSync } from 'fs';
+import { join, relative, dirname } from 'path';
+import { isAborted } from '../core/abort-check.ts';
+import { parseMarkdown, type ParseValidationCode } from '../core/markdown.ts';
+import { parseDateLoose } from '../core/effective-date.ts';
+import {
+  assessContentSanity,
+  type OperatorLiteral,
+  DEFAULT_BYTES_WARN,
+} from '../core/content-sanity.ts';
+import { loadOperatorLiterals } from '../core/content-sanity-literals.ts';
+import { loadConfig, loadConfigWithEngine, gbrainPath } from '../core/config.ts';
+import { isDurabilityHardened, commitWriteThroughFile } from '../core/brain-repo-durability.ts';
+import type { BrainEngine } from '../core/engine.ts';
+import { loadActivePack } from '../core/schema-pack/load-active.ts';
+import { loadActivePackForLocalEngine } from '../core/schema-pack/best-effort.ts';
+import { safeCliToken, sanitizeTypeForDisplay, storedTypeMissesPack, type TypeUsagePack } from '../core/schema-pack/type-usage.ts';
+import { parseLineGrammar } from '../core/line-grammar.ts';
+import { stripCodeBlocks } from '../core/markdown-code.ts';
+import { pathToSlug } from '../core/sync.ts';
+import { isManagedBrain } from '../core/cycle/phase-table.ts';
+import { maintenancePreflight, publishMaintenancePage, type MaintenanceAuthority } from '../core/persistence/prepared-maintenance.ts';
+import { fileMatchesSnapshot, prepareFileTarget } from '../core/persistence/page-prepare.ts';
+import { scannerSlugRootMode, scannerSourcePath } from '../core/write-through.ts';
+import { heldFileDiagnostic, writeFailureDiagnostic } from '../core/persistence/verb-errors.ts';
+import { loadActivePackForEngine } from '../core/schema-pack/engine-resolution.ts';
+import { OperationError, opError } from '../core/ops/contract.ts';
+import { readFix } from '../core/ops/op-fix.ts';
+import { ERROR_CATALOGUE } from '../core/error-catalogue.ts';
+import { cliRenderContext, docsUrl, renderAction, toAgentError, type RenderedAction } from '../core/agent-output.ts';
+import type { ParseOpts } from '../core/markdown.ts';
+
+export interface LintIssue {
+  file: string;
+  line: number;
+  rule: string;
+  message: string;
+  fixable: boolean;
+  /** The stable machine code: a repair that was not applied (`managed_write_pending` from a managed brain's coordinator, `fix_not_writable` when the file refused the write), or a listed file removed before lint read it (`file_removed_during_scan`). */
+  code?: 'managed_write_pending' | 'fix_not_writable' | 'file_removed_during_scan';
+  /** Why: the coordinator refusal's reason (`file_database_drift`, `held_file`, `canonical_file_missing`, ...), `revision_changed`, `not_indexed`, or the lowercased errno (`eacces`, `eperm`, `erofs`). */
+  reason?: string;
+  /** The next step, rendered for the CLI: the coordinator refusal's own fix, or the owner's permission fix. */
+  fix?: RenderedAction;
+  docs?: string;
+}
+
+/** Map of frontmatter validation codes to lint rule names. Stable across
+ *  releases — agents and CI consumers can target specific rule names. */
+const FRONTMATTER_RULE_NAMES: Record<ParseValidationCode, string> = {
+  MISSING_OPEN: 'frontmatter-missing-open',
+  MISSING_CLOSE: 'frontmatter-missing-close',
+  YAML_PARSE: 'frontmatter-yaml-parse',
+  SLUG_MISMATCH: 'frontmatter-slug-mismatch',
+  NULL_BYTES: 'frontmatter-null-bytes',
+  NESTED_QUOTES: 'frontmatter-nested-quotes',
+  NON_STRING_FIELD: 'frontmatter-non-string-field',
+  EMPTY_FRONTMATTER: 'frontmatter-empty',
+};
+
+/** Codes whose lint findings are fixable by `gbrain frontmatter validate --fix`. */
+const FRONTMATTER_FIXABLE: ReadonlySet<ParseValidationCode> = new Set<ParseValidationCode>([
+  'MISSING_CLOSE',
+  'NULL_BYTES',
+  'NESTED_QUOTES',
+]);
+
+// ── LLM artifact patterns ──────────────────────────────────────────
+
+// Anchored to the start of the page body (no `g`/`m` flags): an LLM prepends
+// a preamble to its output, so a line further down that merely begins
+// "Sure! Here is..." (a quoted reply, a transcript turn) is real content.
+const LLM_PREAMBLES = [
+  /^Of course\.?\s*Here is (?:a |the )?(?:detailed |comprehensive |updated )?(?:brain )?page[^.\n]*\.?\s*\n*/i,
+  /^Certainly\.?\s*Here is[^.\n]*\.?\s*\n*/i,
+  /^Here is (?:a |the )?(?:detailed |comprehensive |updated )?(?:brain )?page[^.\n]*\.?\s*\n*/i,
+  /^I've (?:created|updated|written|prepared) (?:a |the )?(?:detailed |comprehensive )?(?:brain )?page[^.\n]*\.?\s*\n*/i,
+  /^Sure(?:!|,)?\s*Here (?:is|are)[^.\n]*\.?\s*\n*/i,
+  /^Absolutely\.?\s*Here[^.\n]*\.?\s*\n*/i,
+];
+
+const LEADING_FRONTMATTER = /^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/;
+const LEADING_MARKDOWN_FENCE = /^```(?:markdown|md)[ \t]*\r?\n/;
+
+/**
+ * The leading LLM preamble run (stacked preamble lines) at a body start: the
+ * top of the file, right after a leading frontmatter block, or right after a
+ * whole-page ```markdown wrapper, leading blank lines skipped. Returns the
+ * [start, end) span to remove, or null. Detection and repair both use it.
+ */
+function findLeadingPreamble(content: string): { start: number; end: number } | null {
+  const skipBlank = (i: number) => i + (/^\s*/.exec(content.slice(i))?.[0].length ?? 0);
+  const anchors = [0, LEADING_FRONTMATTER.exec(content)?.[0].length, LEADING_MARKDOWN_FENCE.exec(content)?.[0].length]
+    .filter((a): a is number => a !== undefined).map(skipBlank);
+  for (const start of anchors) {
+    let end = start;
+    for (let guard = 0; guard < 16; guard++) {
+      const hit = LLM_PREAMBLES.map(p => p.exec(content.slice(end))).find(m => m && m[0].length > 0);
+      if (!hit) break;
+      end += hit[0].length;
+    }
+    if (end > start) return { start, end };
+  }
+  return null;
+}
+
+// ── Rules ──────────────────────────────────────────────────────────
+
+/**
+ * #5433: frontmatter keys that count as temporal provenance for the
+ * `missing-created` rule. `created` first for the legacy name; the rest are
+ * what effective-date resolution and the native serializer actually write.
+ */
+const TEMPORAL_KEYS = ['created', 'event_date', 'date', 'published', 'captured_at', 'ingested_at'] as const;
+
+/**
+ * Per-call options for `lintContent`. Tests pass content-sanity opts
+ * directly so the linter can be exercised without an engine.
+ * Production callers (`runLintCore`) resolve effective config first
+ * via the file/env/DB precedence chain and pass through.
+ */
+export interface LintContentOpts {
+  /** v0.41 content-sanity thresholds + operator literals. When omitted,
+   *  the assessor uses its built-in defaults (50K warn, 500K block,
+   *  built-in junk patterns only). */
+  contentSanity?: {
+    bytes_warn?: number;
+    bytes_block?: number;
+    junk_patterns_enabled?: boolean;
+    disabled?: boolean;
+    max_markup_ratio?: number;
+    prose_check_enabled?: boolean;
+    operator_literals?: ReadonlyArray<OperatorLiteral>;
+    /** #4702: built-in junk-pattern names to skip (see content-sanity.ts). */
+    disabled_patterns?: string[];
+  };
+  /** #5626: active schema pack vocabulary for the `type-undeclared` rule.
+   *  Null/omitted (no pack resolved) skips the rule. */
+  typePack?: LintTypePack | null;
+}
+
+export type LintTypePack = TypeUsagePack & { name: string };
+
+export function lintContent(content: string, filePath: string, opts: LintContentOpts = {}): LintIssue[] {
+  const issues: LintIssue[] = [];
+  const lines = content.split('\n');
+
+  // ── Frontmatter validation (delegates to parseMarkdown(validate:true)) ──
+  // This is the single source of truth for frontmatter shape rules. Each
+  // ParseValidationCode maps to a stable lint rule name in
+  // FRONTMATTER_RULE_NAMES. Keeps brain-page lint, doctor's
+  // frontmatter_integrity subcheck, and the frontmatter CLI in lockstep.
+  const parsed = parseMarkdown(content, filePath, { validate: true });
+  for (const err of parsed.errors ?? []) {
+    // Skip MISSING_OPEN — the legacy `no-frontmatter` rule below covers this
+    // exact case with a stable rule name. Emitting both is double-reporting.
+    if (err.code === 'MISSING_OPEN') continue;
+    issues.push({
+      file: filePath,
+      line: err.line ?? 1,
+      rule: FRONTMATTER_RULE_NAMES[err.code],
+      message: err.message,
+      fixable: FRONTMATTER_FIXABLE.has(err.code),
+    });
+  }
+
+  // Rule: line-grammar near-misses (a relation or fact line that will not be
+  // read as written). Read-only; the fix is in each message. Syntax-only: a
+  // file check reads no brain settings or schema pack, so it never implies an
+  // edge will be stored; `gbrain get <slug> --grammar-diagnostics` is the
+  // effective check against the brain.
+  for (const d of parseLineGrammar(content).diagnostics) {
+    issues.push({ file: filePath, line: d.line, rule: 'line-grammar',
+      message: `${d.message} (${d.reason}; syntax-only check: run \`gbrain get <slug> --grammar-diagnostics\` for what the brain reads)`, fixable: false });
+  }
+
+  // Rule: LLM preamble artifacts (only a leading run; see findLeadingPreamble)
+  const preamble = findLeadingPreamble(content);
+  if (preamble) {
+    issues.push({
+      file: filePath, line: content.slice(0, preamble.start).split('\n').length, rule: 'llm-preamble',
+      message: 'LLM preamble artifact detected (e.g., "Of course! Here is...")',
+      fixable: true,
+    });
+  }
+
+  // Rule: Wrapping code fences (```markdown ... ```)
+  // Detector intentionally has NO /m flag so ^/$ match start/end of the whole
+  // file, not inner lines. Keeps detector in sync with fixContent() below,
+  // which also has no /m flag. Without this, lint reports "fixable" false
+  // positives on any page that simply contains a ```markdown code block, but
+  // fixContent can never strip them (its regex only matches whole-file wrappers).
+  if (content.match(/^```(?:markdown|md)\s*\n/) && content.match(/\n```\s*$/)) {
+    issues.push({
+      file: filePath, line: 1, rule: 'code-fence-wrap',
+      message: 'Page wrapped in ```markdown code fences (LLM artifact)',
+      fixable: true,
+    });
+  }
+
+  // Rule: Placeholder dates. #3958/#6133: code is not a placeholder — a page
+  // DOCUMENTING date formats (```\ncreated: YYYY-MM-DD\n``` or `YYYY-MM-DD`)
+  // is not a page with an unfilled one. stripCodeBlocks masks fenced blocks
+  // and inline spans in place, so line numbers stay exact.
+  // #6538: in the body, a YYYY-MM-DD token followed by `-word`, `.ext` or `/` is a filename/path template
+  // (`YYYY-MM-DD-topic.md`), not an unfilled date; frontmatter stays strict.
+  const prose = stripCodeBlocks(content).split('\n');
+  const frontmatterLines = content.startsWith('---') ? lines.indexOf('---', 1) : -1;
+  for (let i = 0; i < lines.length; i++) {
+    const datePlaceholder = i <= frontmatterLines ? /\bYYYY-MM-DD\b/ : /\bYYYY-MM-DD\b(?![-./][A-Za-z0-9]|\/)/;
+    if (prose[i].match(datePlaceholder) || prose[i].match(/\bXX-XX\b/) || prose[i].match(/\b\d{4}-XX-XX\b/)) {
+      issues.push({
+        file: filePath, line: i + 1, rule: 'placeholder-date',
+        message: `Placeholder date found: ${lines[i].trim().slice(0, 60)}`,
+        fixable: false,
+      });
+    }
+  }
+
+  // Rule: Missing frontmatter
+  if (content.startsWith('---')) {
+    const fmEnd = content.indexOf('---', 3);
+    if (fmEnd > 0) {
+      const fm = content.slice(3, fmEnd);
+      if (!fm.match(/^title:/m)) {
+        issues.push({
+          file: filePath, line: 1, rule: 'missing-title',
+          message: 'Frontmatter missing required field: title',
+          fixable: false,
+        });
+      }
+      if (!fm.match(/^type:/m)) {
+        issues.push({
+          file: filePath, line: 1, rule: 'missing-type',
+          message: 'Frontmatter missing required field: type',
+          fixable: false,
+        });
+      } else if (opts.typePack && parsed.typeExplicit && storedTypeMissesPack(parsed.type, opts.typePack)) {
+        // #5626: same classification as the schema lint stored_type_undeclared rule.
+        const t = sanitizeTypeForDisplay(parsed.type);
+        issues.push({
+          file: filePath,
+          line: content.slice(0, 3 + fm.search(/^type:/m)).split('\n').length,
+          rule: 'type-undeclared',
+          message: `Page type '${t}' is not declared in active schema pack '${opts.typePack.name}' (not a page type or alias). ` +
+            `Use a declared type, or declare it: gbrain schema add-type ${safeCliToken(parsed.type) ?? '<type>'} (with its primitive and prefix)`,
+          fixable: false,
+        });
+      }
+      // #5433: the native serializer never writes `created` and effective-date
+      // resolution reads event_date / date / published, so any parseable
+      // temporal key is provenance enough. The rule name stays for consumers;
+      // it is never fixable (ingest time is not creation time, see #3958).
+      // A block YAML could not read is already a frontmatter-yaml-parse finding.
+      const yamlUnreadable = parsed.errors?.some(e => e.code === 'YAML_PARSE') ?? false;
+      if (!yamlUnreadable && !TEMPORAL_KEYS.some(key => parseDateLoose(parsed.frontmatter[key]) !== null)) {
+        issues.push({
+          file: filePath, line: 1, rule: 'missing-created',
+          message: `Frontmatter has no parseable date under any of: ${TEMPORAL_KEYS.join(', ')}`,
+          fixable: false,
+        });
+      }
+    }
+  } else {
+    // No frontmatter at all
+    issues.push({
+      file: filePath, line: 1, rule: 'no-frontmatter',
+      message: 'Page has no YAML frontmatter',
+      fixable: false,
+    });
+  }
+
+  // Rule: Broken citations (unclosed [Source: ...)
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Open [Source: without closing ]
+    if (line.match(/\[Source:[^\]]*$/) && !(i + 1 < lines.length && lines[i + 1].match(/^\s*[^\[]*\]/))) {
+      issues.push({
+        file: filePath, line: i + 1, rule: 'broken-citation',
+        message: 'Unclosed [Source: ...] citation',
+        fixable: false,
+      });
+    }
+  }
+
+  // Rule: Empty/stub sections. #6257: headings and section boundaries are
+  // found in the code-masked text (a `## ` line inside a fence is not a
+  // section); the body and title are read from the original at the same
+  // offsets, so a section whose body is only a code block is not empty.
+  const masked = prose.join('\n');
+  const sectionPattern = /^##\s+(.+)$/gm;
+  let sectionMatch;
+  while ((sectionMatch = sectionPattern.exec(masked)) !== null) {
+    const sectionStart = sectionMatch.index + sectionMatch[0].length;
+    const nextSection = masked.indexOf('\n## ', sectionStart);
+    const sectionBody = content.slice(sectionStart, nextSection > 0 ? nextSection : undefined).trim();
+
+    if (sectionBody === '' || sectionBody === '[No data yet]' || sectionBody === '*[To be filled by agent]*') {
+      const lineNum = content.slice(0, sectionMatch.index).split('\n').length;
+      const title = content.slice(sectionStart - sectionMatch[1].length, sectionStart);
+      issues.push({
+        file: filePath, line: lineNum, rule: 'empty-section',
+        message: `Empty section: ## ${title}`,
+        fixable: false,
+      });
+    }
+  }
+
+  // v0.41 content-sanity rules. Two new lint rules (huge-page +
+  // scraper-junk) backed by the shared assessor in
+  // src/core/content-sanity.ts so the threshold + pattern set stays
+  // in sync with the ingest gate at importFromContent. Kill-switch
+  // (contentSanity.disabled) suppresses both.
+  //
+  // Bytes are measured against the parsed body (compiled_truth +
+  // timeline) for parity with doctor's `oversized_pages` check (D2).
+  // The earlier file-byte design disagreed with doctor on pages with
+  // large frontmatter; pulling from parsed keeps the surfaces aligned
+  // on the operationally-meaningful axis (embed pipeline input).
+  const cs = opts.contentSanity ?? {};
+  if (cs.disabled !== true) {
+    const operator_literals = cs.junk_patterns_enabled !== false
+      ? (cs.operator_literals ?? [])
+      : [];
+    const sanity = assessContentSanity({
+      compiled_truth: parsed.compiled_truth,
+      timeline: parsed.timeline ?? '',
+      title: parsed.title,
+      bytes_warn: cs.bytes_warn,
+      bytes_block: cs.bytes_block,
+      max_markup_ratio: cs.max_markup_ratio,
+      prose_check_enabled: cs.prose_check_enabled,
+      page_kind: parsed.type,
+      extra_literals: operator_literals,
+      // #4702: same resolution as import — lint and import disagreeing about
+      // which patterns are live would make lint report a page as junk that
+      // import is configured to let through.
+      disabled_patterns: Array.isArray(cs.disabled_patterns)
+        ? cs.disabled_patterns
+        : undefined,
+    });
+    // Rule: huge-page fires for both oversize_warn (over warn threshold)
+    // AND oversize_block (over block threshold). Operator sees the same
+    // rule name in both cases; the message names the actual byte count.
+    if (sanity.reasons.includes('oversize_warn') || sanity.reasons.includes('oversize_block')) {
+      const threshold = sanity.reasons.includes('oversize_block') ? 'block' : 'warn';
+      issues.push({
+        file: filePath, line: 1, rule: 'huge-page',
+        message: `Page body is ${sanity.bytes} bytes (exceeds ${threshold} threshold)`,
+        fixable: false,
+      });
+    }
+    // Rule: scraper-junk fires on any built-in pattern or operator literal hit.
+    // Message names which pattern(s) matched so the brain-author can
+    // either delete the file from their source repo or audit the scraper.
+    if (sanity.junk_pattern_matches.length > 0 || sanity.literal_substring_matches.length > 0) {
+      const matched = [
+        ...sanity.junk_pattern_matches,
+        ...sanity.literal_substring_matches,
+      ].join(', ');
+      issues.push({
+        file: filePath, line: 1, rule: 'scraper-junk',
+        message: `Matched junk pattern(s): ${matched}`,
+        fixable: false,
+      });
+    }
+    // Rule: markup-heavy fires when the fuzzy prose pass flags the page as
+    // boilerplate-shaped (issue #1699). At ingest this FLAGS (page stays
+    // searchable, agent warned) rather than hides — surfacing it in lint
+    // lets a brain-author notice nav/boilerplate scrapes in their source.
+    if (sanity.reasons.includes('high_markup')) {
+      issues.push({
+        file: filePath, line: 1, rule: 'markup-heavy',
+        message: `Markup ratio ${sanity.markup_ratio?.toFixed(2)} exceeds threshold (looks like nav/boilerplate; flagged, not hidden)`,
+        fixable: false,
+      });
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * @deprecated #5433: no longer part of `fixContent`. Ingest time is when a
+ * file entered the brain, not when its content was created, and the cycle's
+ * lint phase ran this on every native page, diverging the file from the DB
+ * row that serialized it. Kept for callers who promote explicitly.
+ *
+ * Promotes `captured_at:` (preferred) or `ingested_at:` to `created:` when
+ * the frontmatter has no `created:` of its own. The value is copied verbatim
+ * (quoting preserved) and inserted directly below the source line. No-op
+ * when there is no frontmatter, `created:` already exists, or neither
+ * capture field is present.
+ */
+export function promoteCreatedFromCapture(content: string): string {
+  if (!content.startsWith('---')) return content;
+  const fmEnd = content.indexOf('---', 3);
+  if (fmEnd <= 0) return content;
+  const fm = content.slice(3, fmEnd);
+  if (fm.match(/^created:/m)) return content;
+  const src = fm.match(/^captured_at:[ \t]*(\S.*)$/m) ?? fm.match(/^ingested_at:[ \t]*(\S.*)$/m);
+  if (!src || src.index === undefined) return content;
+  const insertAt = 3 + src.index + src[0].length;
+  return content.slice(0, insertAt) + `\ncreated: ${src[1].trim()}` + content.slice(insertAt);
+}
+
+/** Auto-fix fixable issues */
+export function fixContent(content: string): string {
+  let fixed = content;
+
+  // Fix LLM preambles: only the leading run at a body start.
+  const preamble = findLeadingPreamble(fixed);
+  if (preamble) fixed = fixed.slice(0, preamble.start) + fixed.slice(preamble.end);
+
+  // Fix wrapping code fences
+  fixed = fixed.replace(/^```(?:markdown|md)\s*\n/, '');
+  fixed = fixed.replace(/\n```\s*$/, '');
+
+  // Clean up excessive blank lines left by fixes
+  fixed = fixed.replace(/\n{3,}/g, '\n\n');
+
+  return fixed.trim() + '\n';
+}
+
+/**
+ * Resolve effective content-sanity opts for lint (D1: file/env first,
+ * lift DB-plane when an engine is reachable).
+ *
+ * File/env path is sync via `loadConfig()`; DB-plane lift requires a
+ * brief engine open. Best-effort: any engine failure (no brain
+ * configured, connection refused, transient error) falls through to
+ * the file/env values. CI without `~/.gbrain/` falls through
+ * immediately since `loadConfig()` returns minimal config.
+ *
+ * Also loads the operator literals file (`~/.gbrain/junk-substrings.txt`)
+ * once per lint invocation so multi-file lint runs amortize the read.
+ */
+async function resolveLintContentSanity(
+  sharedEngine?: BrainEngine,
+): Promise<{ contentSanity: LintContentOpts['contentSanity']; typePack: LintTypePack | null }> {
+  const base = loadConfig();
+  let cs = base?.content_sanity;
+  // #5626: the active pack resolves from the same engine (DB-plane
+  // schema_pack, tier 4) when one is reachable, else from file/env config.
+  let typePack: LintTypePack | null | undefined;
+  const packFromEngine = async (engine: BrainEngine) => {
+    typePack = (await loadActivePackForLocalEngine(engine))?.manifest ?? null;
+  };
+
+  // DB-plane lift. issue #1678: when the caller already holds a live engine
+  // (the cycle's lint phase, the Minion lint handler), REUSE it — do NOT
+  // create + disconnect our own. A self-created engine here is module-style
+  // (createEngine without poolSize wraps the db.ts singleton), so its
+  // disconnect() cascades to db.disconnect() and NULLS the shared singleton
+  // mid-cycle — which broke every subsequent cycle phase with a misleading
+  // "connect() has not been called". Reusing the live engine reads the same
+  // 4 config keys with zero connection churn.
+  if (sharedEngine) {
+    try {
+      const lifted = await loadConfigWithEngine(sharedEngine, base);
+      cs = lifted?.content_sanity ?? cs;
+    } catch {
+      // best-effort; fall through to file/env values.
+    }
+    await packFromEngine(sharedEngine);
+  } else {
+    // Standalone path (CLI `gbrain lint`, which is CLI_ONLY and shares no
+    // engine): only attempt when the file/env config suggests an engine is
+    // configured. Avoids spinning up a fresh PGLite just to read 4 config
+    // keys in a CI lint run that has no brain at all. Safe to create +
+    // disconnect here because nothing else shares this process's singleton.
+    const hasEngineConfig = !!(base?.database_url || base?.database_path);
+    if (hasEngineConfig) {
+      try {
+        const { createEngine } = await import('../core/engine-factory.ts');
+        const engine = await createEngine({
+          engine: base!.engine,
+          database_url: base!.database_url,
+          database_path: base!.database_path,
+        });
+        try {
+          await engine.connect({});
+          const lifted = await loadConfigWithEngine(engine, base);
+          cs = lifted?.content_sanity ?? cs;
+          await packFromEngine(engine);
+        } finally {
+          await engine.disconnect().catch(() => { /* best-effort cleanup */ });
+        }
+      } catch {
+        // Engine unreachable or failed mid-probe — fall through to
+        // file/env values. Lint should never block on engine state.
+      }
+    }
+  }
+
+  // Operator literals: always attempt to load (cheap FS read; missing
+  // file is the common case and returns []). Skip when kill-switch
+  // is on or junk patterns explicitly disabled to match the assessor's
+  // own bypass logic exactly.
+  const operator_literals = cs?.disabled === true || cs?.junk_patterns_enabled === false
+    ? []
+    : loadOperatorLiterals();
+
+  if (typePack === undefined) {
+    try {
+      typePack = (await loadActivePack({ cfg: base, remote: false })).manifest;
+    } catch {
+      typePack = null;
+    }
+  }
+
+  return {
+    contentSanity: { ...cs, operator_literals },
+    typePack,
+  };
+}
+
+/**
+ * Directories never containing knowledge pages, skipped by default.
+ * Deliberately tiny: only vendored dependency trees qualify. Anything
+ * more opinionated (README.md, CHANGELOG.md, test/) is repo policy —
+ * callers opt in via `--exclude` / `LintOpts.exclude`. Dot- and
+ * underscore-prefixed entries are already skipped by the walk.
+ */
+const DEFAULT_LINT_EXCLUDE_DIRS = new Set(['node_modules']);
+
+/** Collect markdown files from a directory */
+function collectPages(dir: string, extraExcludes: string[] = []): string[] {
+  const extra = new Set(extraExcludes);
+  const pages: string[] = [];
+  function walk(d: string) {
+    for (const entry of readdirSync(d)) {
+      if (entry.startsWith('.') || entry.startsWith('_')) continue;
+      const full = join(d, entry);
+      if (lstatSync(full).isDirectory()) {
+        if (DEFAULT_LINT_EXCLUDE_DIRS.has(entry) || extra.has(entry)) continue;
+        walk(full);
+      } else if (entry.endsWith('.md')) {
+        if (extra.has(entry)) continue;
+        pages.push(full);
+      }
+    }
+  }
+  walk(dir);
+  return pages.sort();
+}
+
+export interface LintOpts {
+  target: string;
+  fix?: boolean;
+  dryRun?: boolean;
+  /** v0.41: optional pre-resolved content-sanity opts. When omitted,
+   *  `runLintCore` resolves via the file/env/DB chain. Tests inject
+   *  this directly to bypass the FS + engine layers. */
+  contentSanity?: LintContentOpts['contentSanity'];
+  /** #5626: optional pre-resolved pack vocabulary (null disables the
+   *  `type-undeclared` rule). When omitted, resolved with content sanity. */
+  typePack?: LintTypePack | null;
+  /** issue #1678: a live, already-connected engine to REUSE for the
+   *  content-sanity DB-plane config lift. Callers with a shared engine (the
+   *  cycle lint phase, Minion lint handlers) MUST pass it so lint doesn't
+   *  create + disconnect a competing module-style engine that nulls the
+   *  shared db singleton mid-cycle. */
+  engine?: BrainEngine;
+  /**
+   * #5180: source id for the coordinator write path. On a managed brain
+   * (persistence enabled) fixes are published through the persistence
+   * coordinator for this source instead of written to the worktree, which
+   * the managed filesystem guard refuses. Defaults to 'default'.
+   */
+  sourceId?: string;
+  /**
+   * #1972: cooperative-abort signal. lint's per-page work is synchronous, so
+   * without a periodic yield the event loop can't deliver an abort and a
+   * very large lint would block past the worker's 30s force-evict. The loop
+   * yields + checks this every 200 pages.
+   */
+  signal?: AbortSignal;
+  /**
+   * #2649: extra dir/file basenames to skip while collecting pages, in
+   * addition to node_modules and dot/underscore entries. For mixed-content
+   * repos (knowledge pages alongside software trees). Ignored for
+   * single-file targets.
+   */
+  exclude?: string[];
+  /**
+   * W0 fix-wave (Tier-1 #14): per-page hook fired for every page WITH
+   * issues, after this run's fix attempt for that page — fixedCount is the
+   * number of fixes just applied (0 when --fix is off or nothing was
+   * fixable). The CLI passes a printer so human detail and the aggregate
+   * counts come from ONE scan — pre-fix, runLint ran its own full
+   * read+lint+fix loop and THEN called runLintCore for the summary, linting
+   * every page twice and reporting "0 auto-fixed" because the second pass
+   * saw already-fixed files.
+   */
+  onPageIssues?: (relPath: string, issues: LintIssue[], fixedCount: number) => void;
+  /** Companion to onPageIssues: per-page progress tick (CLI progress bar). */
+  onPageScanned?: () => void;
+  /**
+   * Fired once with the collected page count before scanning starts, so the
+   * CLI can size its progress bar without walking the tree a second time.
+   */
+  onPagesCollected?: (count: number) => void;
+}
+
+export interface LintResult {
+  pages_scanned: number;
+  pages_with_issues: number;
+  total_issues: number;
+  /** #3958: how many of total_issues are fixable — the CLI's "Run with
+   *  --fix" hint only prints when this is non-zero, so an all-unfixable
+   *  report can't send the operator on a no-op --fix run. */
+  total_fixable: number;
+  total_fixed: number;
+  dryRun: boolean;
+  applied_fix: boolean;
+  /** #5180: where fixes went — the worktree (legacy), the persistence
+   *  coordinator (managed brain), or nowhere (report-only / dry-run). */
+  write_path: 'filesystem' | 'coordinator' | 'none';
+  /** Fixes not applied this run: a managed brain could not publish them (#5180:
+   *  no indexed page, or the page changed mid-scan; `managed-write-pending`),
+   *  or the file refused the write (`fix-not-writable`). Each is a non-fixable
+   *  issue and is retried on the next run. */
+  fix_pending: number;
+  /** The first MAX_PENDING_ISSUES of those issues with their code, reason and fix. */
+  pending_issues: LintIssue[];
+}
+
+const MAX_PENDING_ISSUES = 50;
+const MANAGED_LINT_DOCS = 'docs/guides/concurrent-writes.md#lint-repairs-waiting-on-a-managed-brain';
+
+function pendingIssue(file: string, slug: string, reason: string, error: OperationError | null, message?: string): LintIssue {
+  const envelope = error ? toAgentError(error, { transport: 'cli', command: 'lint', render: cliRenderContext() }) : null;
+  return { file, line: 1, rule: 'managed-write-pending', fixable: false, code: 'managed_write_pending', reason,
+    message: message ?? `fix not applied: ${slug}: ${envelope!.message}`,
+    ...(envelope?.fix ? { fix: envelope.fix } : {}), docs: docsUrl(MANAGED_LINT_DOCS) };
+}
+
+/** A file the scan listed was gone by its scan read (deleted or renamed concurrently); the rest of the run continues. */
+function removedDuringScanIssue(file: string, target: string): LintIssue {
+  return { file, line: 1, rule: 'file-removed-during-scan', fixable: false, code: 'file_removed_during_scan',
+    message: `${file} was removed after lint listed it and before lint read it, so it was not linted. Re-run lint to check the files that exist now.`,
+    fix: renderAction({ argv: ['gbrain', 'lint', target], consent: [], actor: 'agent', requires_exclusive: false,
+      why: 'Lists the tree again and lints the files present now.' }, cliRenderContext()),
+    docs: docsUrl(ERROR_CATALOGUE.file_removed_during_scan.docs) };
+}
+
+const UNWRITABLE_CODES: ReadonlySet<string> = new Set(['EACCES', 'EPERM', 'EROFS']);
+
+/**
+ * Write one filesystem lint fix. A file the process may not write (EACCES,
+ * EPERM, EROFS: permissions or a read-only mount) is left unchanged and
+ * returned as a non-fixable `fix-not-writable` issue so the rest of the tree
+ * is still linted; any other write error propagates.
+ */
+function writeLintFixOrRefusal(page: string, relPath: string, fixed: string): LintIssue | null {
+  try {
+    writeSourceFileSync(page, fixed);
+    return null;
+  } catch (e) {
+    const errno = (e as NodeJS.ErrnoException | null)?.code;
+    if (typeof errno !== 'string' || !UNWRITABLE_CODES.has(errno)) throw e;
+    const envelope = toAgentError(opError('fix_not_writable', `fix not applied: ${relPath} is not writable (${errno}); the file was left unchanged.`,
+      'Make the file writable by the user running gbrain, or pass its directory or file name to `gbrain lint --exclude` (for the cycle, add it to `cycle.lint_exclude` with `gbrain config set`), then lint again.', {
+        why: 'Lint repairs files in place, and this file refused the write (its permissions or a read-only mount).',
+        fix: { consent: [], actor: 'user', requires_exclusive: false, why: 'Only the file owner can change its permissions or mount.',
+          user_message: `Make ${relPath} writable for gbrain, or exclude it from lint.` },
+      }), { transport: 'cli', command: 'lint', render: cliRenderContext() });
+    return { file: relPath, line: 1, rule: 'fix-not-writable', fixable: false, code: 'fix_not_writable', reason: errno.toLowerCase(),
+      message: envelope.message, ...(envelope.fix ? { fix: envelope.fix } : {}), docs: docsUrl(ERROR_CATALOGUE.fix_not_writable.docs) };
+  }
+}
+
+function refusalReason(error: OperationError): string {
+  if (error.code === 'revision_conflict') return 'revision_changed';
+  if (heldFileDiagnostic(error.message)) return 'held_file';
+  return error.detail ?? writeFailureDiagnostic(error.code, error.message).reason;
+}
+
+function changedWhileLinting(sourceId: string, slug: string): OperationError {
+  return opError('revision_conflict', 'The page changed while lint ran.',
+    `Page ${slug} in '${sourceId}' changed after lint read it, so its repair was not submitted; the next cycle lints the current revision.`,
+    { fix: readFix(`Shows page ${slug} in source ${sourceId} as it is now, with its revision.`, { argv: ['gbrain', 'get', '--source', sourceId, '--', slug] }) });
+}
+
+/**
+ * #5180: publish one lint repair through the persistence coordinator, the
+ * only writer a managed brain's worktree accepts. Resolves the page's slug
+ * the way sync does and reads its revision BEFORE the bytes the repair is
+ * built from, so the repair only ever replaces what it read: the file must
+ * hold that revision (the coordinator's own canonical comparison) and the
+ * repair is admitted against it. Returns 'published' once the coordinator
+ * committed it (DB row and file in one guarded write), null when the file
+ * no longer needs a repair, or a non-fixable issue when the repair must
+ * wait: the file is not an indexed page of the source, the file diverged
+ * from the database (the coordinator's refusal travels unchanged: its reason
+ * and its fix), or the page changed between scan and admission. Any other
+ * failure propagates and fails the run.
+ */
+async function publishLintFix(engine: BrainEngine, authority: MaintenanceAuthority, root: string, page: string,
+  activePack: ParseOpts['activePack']): Promise<LintIssue | 'published' | null> {
+  const relPath = relative(root, page);
+  const slug = pathToSlug(relPath);
+  const sourceId = authority.writer.sourceId;
+  const snapshot = await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
+  if (!snapshot || snapshot.page.deleted_at) {
+    return pendingIssue(relPath, slug, 'not_indexed', null,
+      `fix not applied: ${slug} is not an indexed page of source ${sourceId} (a managed brain only rewrites indexed pages)`);
+  }
+  const scanned = existsSync(page) ? readSourceFileSync(page, 'utf-8') : null;
+  const fixed = scanned === null ? null : fixContent(scanned);
+  if (scanned === null ? !authority.binding : fixed === scanned) return null;
+  const importPath = async () => scannerSourcePath(root, page, await scannerSlugRootMode(engine, sourceId, root));
+  if (authority.binding && (scanned === null || !await fileMatchesSnapshot(engine, slug, scanned, snapshot, importPath, activePack))) {
+    const current = await engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
+    if (current?.revision !== snapshot.revision) return pendingIssue(relPath, slug, 'revision_changed', changedWhileLinting(sourceId, slug));
+    try {
+      await prepareFileTarget(engine, { source_id: sourceId, worktree_id: authority.binding.worktree_id, slug }, snapshot, fixed, undefined, { activePack });
+    } catch (e) {
+      if (e instanceof OperationError) return pendingIssue(relPath, slug, refusalReason(e), e);
+      throw e;
+    }
+    // No refusal: the file now holds the scanned revision again (or the page has no file to repair).
+    return scanned === null ? null : pendingIssue(relPath, slug, 'revision_changed', changedWhileLinting(sourceId, slug));
+  }
+  try {
+    await publishMaintenancePage(engine, authority, slug, fixed!, { expectedRevision: snapshot.revision });
+    return 'published';
+  } catch (e) {
+    // An admitted request the coordinator refused at its own file or revision check; a source-level
+    // refusal before admission (no receipt) still fails the run.
+    if (e instanceof OperationError && (e.code === 'revision_conflict' || e.code === 'source_changed' && e.writeRequest)) {
+      return pendingIssue(relPath, slug, refusalReason(e), e);
+    }
+    throw e;
+  }
+}
+
+/**
+ * Library-level lint. Throws on validation errors (missing target, target
+ * not found); lints otherwise. Does NOT print human-readable details (the
+ * CLI wrapper handles that) — returns counts so Minions handlers can
+ * report structured results. Safe from the worker — no process.exit.
+ */
+export async function runLintCore(opts: LintOpts): Promise<LintResult> {
+  if (!opts.target) {
+    throw new Error('lint: target (dir|file.md) required');
+  }
+  if (!existsSync(opts.target)) {
+    throw new Error(`Not found: ${opts.target}`);
+  }
+
+  // #5180: a managed brain's worktree belongs to the persistence coordinator —
+  // the legacy filesystem lock (and its writer guard) would refuse the whole
+  // run, so lint reads the tree lock-free there and publishes fixes through
+  // the coordinator below. Unmanaged brains keep the lock + direct writes.
+  const managed = !!opts.engine && await isManagedBrain(opts.engine);
+  if (!managed && opts.engine && opts.fix && !opts.dryRun && !hasSourceFilesystemLock(opts.target)) {
+    return withSourceFilesystemLock(opts.engine, opts.target, () => runLintCore(opts), { signal: opts.signal });
+  }
+
+  const isSingleFile = statSync(opts.target).isFile();
+  const pages = isSingleFile ? [opts.target] : collectPages(opts.target, opts.exclude ?? []);
+  opts.onPagesCollected?.(pages.length);
+
+  // Resolve content-sanity config and the active pack once for this lint
+  // run (D1: lift DB config when reachable). Callers can pre-pass both
+  // (opts.contentSanity + opts.typePack) to bypass the engine probe.
+  const runtime = opts.contentSanity !== undefined && opts.typePack !== undefined
+    ? null
+    : await resolveLintContentSanity(opts.engine);
+  const lintOpts: LintContentOpts = {
+    contentSanity: opts.contentSanity ?? runtime?.contentSanity,
+    typePack: opts.typePack !== undefined ? opts.typePack : runtime?.typePack ?? null,
+  };
+
+  // Durability-hardened brains (`gbrain sources harden`) promise every write
+  // is committed AND pushed. An uncommitted lint repair would otherwise sit
+  // as drift the cycle's sync phase flags and the post-commit hook never
+  // pushes. Same gate + path-limited helper as put_page write-through
+  // (#2426); covers the cycle, the lint/lint-fix minion handlers and the CLI
+  // alike. Known ceiling: one commit + one backgrounded hook spawn per
+  // repaired page on a large first run (the hook's flock coalesces pushes on
+  // Linux; on macOS a losing concurrent push can log a spurious LOCAL-ONLY
+  // line even though the later push landed) — a single end-of-run
+  // multi-path commit would need a new helper.
+  const repoProbe = isSingleFile ? dirname(opts.target) : opts.target;
+  const applyFixes = !!opts.fix && !opts.dryRun;
+  // #5180: on a managed brain the coordinator commits what it publishes, so
+  // the durability commit stays on the legacy path only.
+  const commitFixes = applyFixes && !managed && isDurabilityHardened(repoProbe);
+  // #5180: the maintenance authority for coordinator writes, resolved once per
+  // run like the synthesize/patterns phases. Throws `owner_unavailable` when
+  // the managed source has no active canonical owner, which the cycle reports
+  // as the phase's failure instead of a per-page filesystem refusal.
+  const maintenance: MaintenanceAuthority | null = applyFixes && managed
+    ? await maintenancePreflight(opts.engine!, opts.sourceId ?? 'default', isSingleFile ? undefined : opts.target)
+    : null;
+  // #5180: a single-file target on a managed brain derives its slug from the owned worktree root.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal -- local_path/relative_path are the operator's own worktree binding rows (persistence_host_bindings / persistence_source_bindings) that maintenancePreflight just validated with assertPhysicalRoot; the join reproduces the binding root the coordinator itself uses (prepared-maintenance.ts) and only feeds relative() for slug derivation — no filesystem operation
+  const managedRoot = !isSingleFile ? opts.target : maintenance?.binding?.local_path ? join(maintenance.binding.local_path, maintenance.binding.relative_path) : dirname(opts.target);
+
+  let totalIssues = 0;
+  let totalFixable = 0;
+  let totalFixed = 0;
+  let pagesWithIssues = 0;
+  let fixPending = 0;
+  const pendingIssues: LintIssue[] = [];
+  // The coordinator parses files with the source's active pack; the divergence check must too.
+  const activePack = maintenance?.binding
+    ? (await loadActivePackForEngine(opts.engine!, { remote: false, sourceId: maintenance.writer.sourceId }).catch(() => null))?.manifest
+    : undefined;
+
+  for (let idx = 0; idx < pages.length; idx++) {
+    assertSourceFilesystemActive();
+    const page = pages[idx];
+    // #1972: every 200 pages, yield to the event loop and honor abort. The
+    // yield is what lets the abort signal actually fire (the rest of the loop
+    // is synchronous); the break returns a valid partial LintResult since each
+    // page is independently read + written.
+    if (idx > 0 && idx % 200 === 0) {
+      if (isAborted(opts.signal)) break;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    const relPath = isSingleFile ? page : relative(opts.target, page);
+    let content: string;
+    try {
+      content = readSourceFileSync(page, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      // #5180: a managed --fix run asks the coordinator, which reports the page's missing canonical file as pending.
+      const pending = maintenance ? await publishLintFix(opts.engine!, maintenance, managedRoot, page, activePack) : null;
+      const issue = pending && pending !== 'published' ? pending : removedDuringScanIssue(relPath, opts.target);
+      opts.onPageScanned?.();
+      pagesWithIssues++;
+      totalIssues++;
+      if (issue.code === 'managed_write_pending') {
+        fixPending++;
+        if (pendingIssues.length < MAX_PENDING_ISSUES) pendingIssues.push(issue);
+      }
+      opts.onPageIssues?.(relPath, [issue], 0);
+      continue;
+    }
+    const issues = lintContent(content, relPath, lintOpts);
+    opts.onPageScanned?.();
+    if (issues.length === 0) continue;
+    pagesWithIssues++;
+    totalIssues += issues.length;
+    totalFixable += issues.filter(i => i.fixable).length;
+
+    let fixCount = 0;
+    if (opts.fix && issues.some(i => i.fixable)) {
+      const fixed = fixContent(content);
+      if (fixed !== content) {
+        const fixable = issues.filter(i => i.fixable).length;
+        if (!applyFixes) {
+          fixCount = fixable;
+        } else if (maintenance) {
+          // #5180: managed brain — the coordinator rewrites the page (DB row
+          // and worktree file together) or says why the repair must wait.
+          const outcome = await publishLintFix(opts.engine!, maintenance, managedRoot, page, activePack);
+          if (outcome === 'published') {
+            fixCount = fixable;
+          } else if (outcome) {
+            issues.push(outcome);
+            totalIssues++;
+            fixPending++;
+            if (pendingIssues.length < MAX_PENDING_ISSUES) pendingIssues.push(outcome);
+          }
+        } else {
+          assertSourceFilesystemActive();
+          const unwritable = writeLintFixOrRefusal(page, relPath, fixed);
+          if (unwritable) {
+            issues.push(unwritable);
+            totalIssues++;
+            fixPending++;
+            if (pendingIssues.length < MAX_PENDING_ISSUES) pendingIssues.push(unwritable);
+          } else {
+            if (commitFixes) commitWriteThroughFile(repoProbe, page, relative(repoProbe, page).replace(/\.md$/u, ''));
+            fixCount = fixable;
+          }
+        }
+        totalFixed += fixCount;
+      }
+    }
+    opts.onPageIssues?.(relPath, issues, fixCount);
+  }
+
+  return {
+    pages_scanned: pages.length,
+    pages_with_issues: pagesWithIssues,
+    total_issues: totalIssues,
+    total_fixable: totalFixable,
+    total_fixed: totalFixed,
+    dryRun: !!opts.dryRun,
+    applied_fix: !!opts.fix,
+    write_path: !applyFixes ? 'none' : maintenance ? 'coordinator' : 'filesystem',
+    fix_pending: fixPending,
+    pending_issues: pendingIssues,
+  };
+}
+
+export async function runLint(args: string[]) {
+  // #2649: --exclude=a,b or --exclude a,b — extra basenames to skip.
+  const extraExcludes: string[] = [];
+  const skipIdx = new Set<number>();
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('--exclude=')) {
+      extraExcludes.push(...a.slice('--exclude='.length).split(',').map(s => s.trim()).filter(Boolean));
+    } else if (a === '--exclude' && i + 1 < args.length) {
+      extraExcludes.push(...args[i + 1].split(',').map(s => s.trim()).filter(Boolean));
+      skipIdx.add(i + 1);
+    }
+  }
+  const target = args.find((a, i) => !a.startsWith('--') && !skipIdx.has(i));
+  const doFix = args.includes('--fix');
+  const dryRun = args.includes('--dry-run');
+
+  if (!target) {
+    console.error('Usage: gbrain lint <dir|file.md> [--fix] [--dry-run] [--exclude a,b]');
+    console.error('  --fix      Auto-fix fixable issues (LLM preambles, code fences)');
+    console.error('  --dry-run  Preview fixes without writing');
+    console.error('  --exclude  Comma-separated dir/file basenames to skip (in addition to node_modules)');
+    process.exit(1);
+  }
+
+  if (!existsSync(target)) {
+    console.error(`Not found: ${target}`);
+    process.exit(1);
+  }
+
+  // W0 fix-wave (Tier-1 #14): ONE scan. Pre-fix this function ran its own
+  // full read+lint+fix loop for human output and THEN called runLintCore for
+  // the summary — every page linted twice, and with --fix the second pass
+  // saw already-fixed files so the summary reported "0 auto-fixed" after
+  // fixing N. Human detail now streams from runLintCore's per-page hooks
+  // and the counts come from the same single pass.
+  // Progress on stderr. Stdout keeps the per-issue human output it always had.
+  // Ship-review perf catch: the tree is walked ONCE — runLintCore reports the
+  // collected count via onPagesCollected (pre-fix the CLI ran its own
+  // collectPages just to size the progress bar, a second full readdir/stat
+  // walk on every directory lint).
+  const { createProgress } = await import('../core/progress.ts');
+  const { getCliOptions, cliOptsToProgressOptions } = await import('../core/cli-options.ts');
+  const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
+
+  const result = await runLintCore({
+    target,
+    fix: doFix,
+    dryRun,
+    exclude: extraExcludes,
+    onPagesCollected: (count) => progress.start('lint.pages', count),
+    onPageScanned: () => progress.tick(1),
+    onPageIssues: (relPath, issues, fixedCount) => {
+      console.log(`\n${relPath}:`);
+      for (const issue of issues) {
+        const fixLabel = issue.fixable ? ' [fixable]' : '';
+        console.log(`  L${issue.line} ${issue.rule}: ${issue.message}${fixLabel}`);
+        if (issue.fix?.command) console.log(`    Fix: ${issue.fix.command}`);
+        if (issue.docs) console.log(`    Docs: ${issue.docs}`);
+      }
+      if (fixedCount > 0) {
+        console.log(`  ${dryRun ? '(dry run) ' : ''}Fixed ${fixedCount} issue(s)`);
+      }
+    },
+  });
+
+  progress.finish();
+  console.log(`\n${result.pages_scanned} pages scanned. ${result.total_issues} issue(s) in ${result.pages_with_issues} page(s).`);
+  if (doFix) {
+    console.log(`${dryRun ? '(dry run) ' : ''}${result.total_fixed} auto-fixed.`);
+  } else if (result.total_fixable > 0) {
+    // #3958: only advertise --fix when at least one finding is actually
+    // fixable — an all-unfixable report used to send operators on a no-op
+    // `--fix` run that changed nothing.
+    console.log(`Run with --fix to auto-fix ${result.total_fixable} fixable issue(s).`);
+  }
+}

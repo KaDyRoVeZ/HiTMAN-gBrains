@@ -1,0 +1,80 @@
+name: Semgrep
+
+# Static analysis (SAST) with Semgrep Community Edition (#2272). Tokenless:
+# uses the public registry rulesets, needs zero secrets.
+# - Pull requests (job `semgrep`, read-only): fail only on findings new since
+#   the merge base.
+# - Weekly schedule and dispatch (job `semgrep-full`): full-tree scan, report
+#   only, uploaded as SARIF to code scanning (Security -> Code scanning), so
+#   the findings land somewhere a reviewer reads them. Only this job holds
+#   security-events: write.
+
+on:
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: '30 7 * * 1'  # weekly, Monday 07:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Event parity (docs/TESTING.md#event-parity): grouping only.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    # Named exception (docs/TESTING.md#event-parity): pull requests gate on findings
+    # new since the merge base; the weekly full-tree scan below covers the rest.
+    if: github.event_name == 'pull_request'
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 20
+    container:
+      image: semgrep/semgrep:1.170.0@sha256:c98f8829eea377274ee4b10656458b078b88232469b2ff913f091c2317347c9d
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          # Full history so --baseline-commit can diff against the PR base;
+          # a shallow clone would not contain the base commit.
+          fetch-depth: 0
+      # Graduated from advisory: on a PR, fail only on findings NEW since the PR
+      # base (semgrep --baseline-commit), so legacy findings never block an
+      # unrelated PR and no full-tree triage is required.
+      - name: Semgrep scan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # The container user differs from checkout's owner. Trust only this
+          # workspace so our merge-base lookup works before Semgrep starts.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # Diff against the MERGE BASE, not the base-branch head captured at
+          # event time: the checkout is the merge ref against current master,
+          # so a finding master landed after the event would otherwise be
+          # attributed to this PR. merge-base is the true common ancestor.
+          BASELINE="$(git merge-base "$BASE_SHA" HEAD || echo "$BASE_SHA")"
+          echo "PR scan — failing only on findings new since $BASELINE"
+          semgrep scan --config p/default --config p/typescript --error --baseline-commit "$BASELINE"
+
+  semgrep-full:
+    # Named exception (docs/TESTING.md#event-parity): the weekly schedule and dispatch.
+    if: github.event_name != 'pull_request'
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: semgrep/semgrep:1.170.0@sha256:c98f8829eea377274ee4b10656458b078b88232469b2ff913f091c2317347c9d
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Semgrep full-tree scan (report-only, SARIF)
+        run: |
+          semgrep scan --config p/default --config p/typescript --sarif-output=semgrep.sarif || true
+          test -s semgrep.sarif || { echo "::error::semgrep wrote no SARIF. Why: the scan crashed before reporting. Fix: rerun with gh workflow run semgrep.yml and read the scan log above."; exit 1; }
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2  # v4.38.2
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep

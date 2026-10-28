@@ -1,0 +1,167 @@
+/**
+ * check-key-files-current-state.test.ts — coverage of the anti-disease guard.
+ *
+ * The guard is the structural backstop that keeps CLAUDE.md from re-bloating:
+ * it bans bolded `**v0.<digit>` release markers in the reference docs and caps
+ * CLAUDE.md size. If the guard is broken, the append-only-history disease can
+ * silently return. This suite pins its contract against fixtures.
+ */
+
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+const SCRIPT = resolve(import.meta.dir, "..", "..", "scripts/check-key-files-current-state.sh");
+
+let root: string;
+
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), "doc-guard-"));
+  mkdirSync(join(root, "docs/architecture"), { recursive: true });
+});
+afterEach(() => {
+  rmSync(root, { recursive: true, force: true });
+});
+
+function writeDoc(rel: string, content: string) {
+  const abs = join(root, rel);
+  mkdirSync(resolve(abs, ".."), { recursive: true });
+  writeFileSync(abs, content);
+}
+
+function run(extraEnv: Record<string, string> = {}) {
+  return spawnSync("bash", [SCRIPT], {
+    encoding: "utf8",
+    env: { ...process.env, GBRAIN_DOC_GUARD_ROOT: root, ...extraEnv },
+  });
+}
+
+// A minimal clean repo shape the guard is happy with.
+function seedClean() {
+  writeDoc("CLAUDE.md", "# CLAUDE.md\n\norientation only\n");
+  writeDoc(
+    "docs/architecture/KEY_FILES.md",
+    "# Key files\n\n- `src/core/db.ts` — connection management. Pinned by `test/db.test.ts`.\n",
+  );
+  writeDoc("docs/architecture/thin-client.md", "# Thin-client\n\nrouting seam\n");
+  writeDoc("docs/TESTING.md", "# Testing\n\ntiers\n");
+}
+
+describe("check-key-files-current-state.sh", () => {
+  it("passes on a clean current-state repo", () => {
+    seedClean();
+    const r = run();
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("ok");
+  });
+
+  it("FAILS when a reference doc carries a bolded release-clause marker", () => {
+    seedClean();
+    writeDoc(
+      "docs/architecture/KEY_FILES.md",
+      "# Key files\n\n- `src/core/db.ts` — connection mgmt. **v0.41.2 (#9):** added pool reconnect.\n",
+    );
+    const r = run();
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("bolded release-clause");
+    expect(r.stderr).toContain("KEY_FILES.md");
+  });
+
+  it("PASSES on a legitimate non-bolded version mention (no false positive)", () => {
+    seedClean();
+    writeDoc(
+      "docs/architecture/KEY_FILES.md",
+      "# Key files\n\n- `src/core/db.ts` — requires pgvector 0.7; on Postgres 11+ the ADD COLUMN is metadata-only.\n",
+    );
+    const r = run();
+    expect(r.status).toBe(0);
+  });
+
+  it("FAILS when CLAUDE.md exceeds the size cap", () => {
+    seedClean();
+    writeDoc("CLAUDE.md", "x".repeat(200_000));
+    const r = run({ GBRAIN_CLAUDE_MD_MAX_BYTES: "90000" });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("over the");
+  });
+
+  it("size cap is configurable via env", () => {
+    seedClean();
+    writeDoc("CLAUDE.md", "x".repeat(5_000));
+    expect(run({ GBRAIN_CLAUDE_MD_MAX_BYTES: "1000" }).status).toBe(1);
+    expect(run({ GBRAIN_CLAUDE_MD_MAX_BYTES: "10000" }).status).toBe(0);
+  });
+
+  it("FAILS when docs/TESTING.md exceeds its ratchet cap, naming file, size, cap and the trimming rule", () => {
+    seedClean();
+    writeDoc("docs/TESTING.md", "# Testing\n\n" + "x".repeat(5_000) + "\n");
+    const over = run({ GBRAIN_TESTING_MD_MAX_BYTES: "1000" });
+    expect(over.status).toBe(1);
+    expect(over.stderr).toContain("docs/TESTING.md is 5012 bytes, over the 1000 cap");
+    expect(over.stderr).toContain("move subsystem detail next to its code");
+    expect(run({ GBRAIN_TESTING_MD_MAX_BYTES: "10000" }).status).toBe(0);
+  });
+
+  it("soft-warns (non-fatal) on prose history markers", () => {
+    seedClean();
+    writeDoc(
+      "docs/TESTING.md",
+      "# Testing\n\nThe tier set, then v0.26.7 added the parallel loop (pre-fix it was serial).\n",
+    );
+    const r = run();
+    expect(r.status).toBe(0); // warn, not fail
+    expect(r.stderr).toContain("WARN");
+  });
+
+  it("FAILS when KEY_FILES.md carries two bullets for the same src file", () => {
+    seedClean();
+    writeDoc(
+      "docs/architecture/KEY_FILES.md",
+      "# Key files\n\n- `src/core/db.ts` — connection management.\n- `src/core/db.ts` — connection management + pool reconnect.\n",
+    );
+    const r = run();
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("more than one bullet");
+    expect(r.stderr).toContain("src/core/db.ts");
+  });
+
+  it("catches the marker in any of the three reference docs (thin-client)", () => {
+    seedClean();
+    writeDoc("docs/architecture/thin-client.md", "# Thin-client\n\n**v0.36.3:** added cross-modal.\n");
+    expect(run().status).toBe(1);
+  });
+
+  it("checks history markers in subsystem references", () => {
+    seedClean();
+    writeDoc("docs/architecture/key-files/engines.md", "# Engines\n\n**v0.40.0:** changed behavior.\n");
+    const result = run();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("key-files/engines.md");
+  });
+
+  it("detects duplicate entries across different subsystems", () => {
+    seedClean();
+    writeDoc("docs/architecture/key-files/engines.md", "- `src/core/example.ts` — one current truth.\n");
+    writeDoc("docs/architecture/key-files/runtime.md", "- `src/core/example.ts` — another current truth.\n");
+    const result = run();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("more than one bullet");
+    expect(result.stderr).toContain("src/core/example.ts");
+  });
+
+  it.each([
+    ["README.md", 45000],
+    ["docs/architecture/KEY_FILES.md", 10000],
+    ["docs/architecture/key-files/engines.md", 60000],
+  ] as const)("bounds %s without rejecting the exact cap", (path, cap) => {
+    seedClean();
+    writeDoc(path, "x".repeat(cap));
+    expect(run().status).toBe(0);
+    writeDoc(path, "x".repeat(cap + 1));
+    const result = run();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`over the ${cap} cap`);
+  });
+});

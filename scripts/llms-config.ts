@@ -1,0 +1,495 @@
+/**
+ * llms-config — single source of truth for llms.txt + llms-full.txt.
+ *
+ * Consumed by scripts/build-llms.ts (emits llms.txt, llms-full.txt) and
+ * test/build-llms.test.ts (asserts paths resolve, content contract holds).
+ *
+ * Adding a doc? Add it here and run `bun run build:llms`. The drift-detection
+ * test fails CI if you forget.
+ *
+ * Fork-friendliness: `rawBaseUrl` reads from `LLMS_REPO_BASE` so forks can
+ * regenerate without manual URL rewrites:
+ *   LLMS_REPO_BASE=https://raw.githubusercontent.com/fork-org/gbrain/main bun run build:llms
+ */
+import { repoBaseOrThrow } from '../src/core/repo-base.ts';
+
+export type DocEntry = {
+  title: string;
+  description: string;
+  path: string;
+  includeInFull?: boolean;
+};
+
+export type DocSection = {
+  heading: string;
+  optional?: boolean;
+  entries: DocEntry[];
+};
+
+export const PROJECT = {
+  name: "GBrain",
+  summary:
+    "GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable engines (PGLite default, Postgres+pgvector for scale), contract-first operations, fat-markdown skills, and one agent operator contract for every error and recommendation. Teaches agents brain ops, ingestion, enrichment, scheduling, identity, and access control.",
+  repoUrl: "https://github.com/garrytan/gbrain",
+  rawBaseUrl: repoBaseOrThrow(process.env.LLMS_REPO_BASE, "https://raw.githubusercontent.com/garrytan/gbrain/master"),
+};
+
+export const SECTIONS: DocSection[] = [
+  {
+    heading: "Choose your agent setup",
+    entries: [
+      { title: "Use your brain from anywhere over MCP", path: "docs/guides/remote-mcp.md", description: "`gbrain mcp expose`: publish serve --http on your Tailscale tailnet (Funnel explicit for cloud agents), user service, admin token file, grant/connect/verify hand-off, --status/--remove, troubleshooting, security posture, ngrok and cloud-host alternatives." },
+      { title: "Grok Bot", path: "docs/guides/grok-bot.md", description: "Recommended: keep the brain on your computer, publish it with `gbrain mcp expose --funnel`, grant the Bot a client and install the thin CLI; local in-Bot memory as the no-host alternative. Native skill activation, shared-computer trust and dated evidence." },
+      { title: "Muse personal agent", path: "docs/guides/muse.md", description: "Verify durable storage first; connect Muse to your published brain (`gbrain mcp expose --funnel` + thin CLI) or add local explicit memory with provenance alongside Muse's native memory; distinguish Muse Code and unverified native MCP." },
+      { title: "Inside an existing agent", path: "docs/guides/in-agent-setup.md", description: "Isolated setup, absolute launcher, receipts, keyless maintenance, complete private backup and safe restoration." },
+      { title: "Memory boundaries", path: "docs/guides/memory-boundaries.md", description: "Durable shared preferences versus harness state; remote graph maintenance, provider text disclosure, authorization and full-backup limits.", includeInFull: false },
+      { title: "Brain versus session memory", path: "docs/guides/brain-vs-memory.md", description: "Route durable facts and preferences to shared memory, configuration to the harness, and temporary work to session state.", includeInFull: false },
+      { title: "Connect a hosted brain", path: "docs/guides/hosted-harness-access.md", description: "Getting the HTTPS endpoint (`gbrain mcp expose`, admin token file), host-side grants, private credential handoff, harness installation, profile repair, delegation limits and honest verification." },
+      { title: "Harness adapter reference", path: "docs/guides/harness-adapters.md", description: "Registry-generated transport, authentication lifetime and configuration facts.", includeInFull: false },
+      { title: "Harness validation evidence", path: "docs/guides/harness-validation.md", description: "Local lifecycle and HTTP/worker proof, reproducible tests, and the remaining actual-harness acceptance checks.", includeInFull: false },
+    ],
+  },
+  {
+    heading: "Core entry points",
+    entries: [
+      {
+        title: "AGENTS.md",
+        description:
+          "Start here if you are not Claude Code. Install order, the agent operator quick contract, trust boundary, skill resolver, config/debug/migration pointers.",
+        path: "AGENTS.md",
+      },
+      {
+        title: "CLAUDE.md",
+        description:
+          "Orientation + resolver. North Star, two axes, architecture + cross-cutting invariants, the reference map pointing at on-demand docs, and the inline ship IRON RULES.",
+        path: "CLAUDE.md",
+      },
+      {
+        title: "docs/architecture/KEY_FILES.md",
+        description:
+          "Bounded navigation index for subsystem references: find a source file's current behavior, invariants, and test evidence without loading the entire reference corpus.",
+        path: "docs/architecture/KEY_FILES.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/architecture/thin-client.md",
+        description:
+          "The thin-client / remote-MCP / cross-modal routing seam: isThinClient detection, callRemoteTool, SSRF-hardened URL validation, per-command routing.",
+        path: "docs/architecture/thin-client.md",
+        includeInFull: false,
+      },
+      {
+        title: "INSTALL_FOR_AGENTS.md",
+        description: "Step-by-step agent installation (steps 0-9): install, keyless init, the first-run decision bundle, harness wiring, verification and upgrades.",
+        path: "INSTALL_FOR_AGENTS.md",
+      },
+      {
+        title: "docs/protocol/AGENT_OPERATOR_v1.md",
+        description:
+          "The agent operator contract: read `code`, follow `fix.next` (run / ask_user / tell_user_to_run / wait / report), run `fix.verify`. Error envelope, notices and mute, effects/actor/next table, consent and preapproval, exit codes, marker grammar, compatibility policy, first run, and how to make gbrain work better for your user.",
+        path: "docs/protocol/AGENT_OPERATOR_v1.md",
+      },
+      {
+        title: "skills/RESOLVER.md",
+        description: "Skill dispatcher. Read first for any task.",
+        path: "skills/RESOLVER.md",
+      },
+      {
+        title: "README.md",
+        description: "Project overview, benchmarks, 30-minute setup.",
+        path: "README.md",
+      },
+    ],
+  },
+  {
+    heading: "Configuration",
+    entries: [
+      {
+        title: "docs/guides/multi-hop.md",
+        description: "Multi-hop relationship questions: typed hop chains over links (search planner + traverse_graph hops), evidence edges, refusals, notices, settings.",
+        path: "docs/guides/multi-hop.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/ENGINES.md",
+        description: "PGLite vs Postgres trade-off and when to migrate.",
+        path: "docs/ENGINES.md",
+      },
+      {
+        title: "docs/guides/move-to-postgres.md",
+        description:
+          "Move a PGLite brain to Postgres with its history: --url-env target setup, plan (exit 3) then --yes --expect, status/resume/rollback, what moves vs stays on this computer, recovery by error code.",
+        path: "docs/guides/move-to-postgres.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/GBRAIN_RECOMMENDED_SCHEMA.md",
+        description:
+          "MECE directory structure (people/, companies/, concepts/).",
+        path: "docs/GBRAIN_RECOMMENDED_SCHEMA.md",
+        // v0.40.6.0: 64KB reference doc. Web index entry stays; the single-fetch
+        // bundle gets the README + setup guides instead. Keeps llms-full.txt
+        // under the 600KB budget as CLAUDE.md grows with each release.
+        includeInFull: false,
+      },
+      {
+        // Link-only: the bundle reached FULL_SIZE_BUDGET; this value-explainer is
+        // the least operational inlined doc, so it gives way to protocol docs.
+        title: "docs/what-schemas-unlock.md",
+        description:
+          "Why schemas matter: 7 killer use cases (4000 invisible meetings, founder ops brain, research brain, legal brain, team brain, agent-as-co-curator) + the structural argument for typed page kinds. Read this before pitching schema authoring.",
+        path: "docs/what-schemas-unlock.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/schema-author-tutorial.md",
+        description:
+          "5-minute walkthrough: fork the bundled pack, add a custom `researcher` type, backfill existing pages via `gbrain schema sync --apply`, prove the T1.5 wiring via `gbrain whoknows`.",
+        path: "docs/schema-author-tutorial.md",
+      },
+      {
+        title: "docs/guides/system-one.md",
+        description:
+          "System One decision support (TypeSafe Jev or an llm: provider): every slot off or on, executed quickstart (`gbrain decide probe`, `probe --query`, `enable --recommended`, `status`), each slot in plain words, calibration and qualification, fail directions, egress rules, reading status/doctor, receipts, troubleshooting by refusal reason.",
+        path: "docs/guides/system-one.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/retrieval-feedback.md",
+        description:
+          "Use-attributed retrieval feedback: answer ids, `rate_answer` / `gbrain rate` (whole answer or single pages), how ratings move page weights and ranking (bounded ±λ), citation learning, revision handling, who may teach the brain, `gbrain feedback status|reset`, config keys and every refusal code.",
+        path: "docs/guides/retrieval-feedback.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/pinned-questions.md",
+        description:
+          "Pinned questions: cited answers kept current from your notes (`gbrain questions pin|list|status|refresh|unpin`, `questions_*` MCP tools), read-time staleness, receipts and blocked reasons, owner-private visibility, consent for paid refresh, the standing_questions phase and the dream.auto_think migration.",
+        path: "docs/guides/pinned-questions.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/live-sync.md",
+        description: "Incremental markdown sync setup.",
+        path: "docs/guides/live-sync.md",
+      },
+      {
+        title: "docs/guides/on-commit-sync.md",
+        description: "Opt-in on-commit sync in gbrain serve (sync.on_commit) and the per-source commit→searchable/embedded latency.",
+        path: "docs/guides/on-commit-sync.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/shared-checkout-git.md",
+        description:
+          "Committing and pushing when several agents share one brain checkout: `gbrain git commit-push` / `scripts/brain-commit-push.sh` (writer lock, path-scoped commit, in-memory merge, fast-forward-only advance), the outcome table, conflict resolution with --resolve, recovering a stuck rebase, the lock contract for host daemons, and the git commands never to run there.",
+        path: "docs/guides/shared-checkout-git.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/sync-unblock-runbook.md",
+        description: "Operator-agent loop for a managed catch-up on a live checkout: gbrain sync status --json (cursor, committed_last_10m, each hold and the last error with class / safe_actions / needs_human), gbrain sync unblock --apply, and the decision table (page / connection / systemic) behind them.",
+        path: "docs/guides/sync-unblock-runbook.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/cron-schedule.md",
+        description: "Recurring job scheduling.",
+        path: "docs/guides/cron-schedule.md",
+      },
+      {
+        title: "docs/guides/minions-deployment.md",
+        description:
+          "Deploying the gbrain jobs worker: crontab + watchdog, inline --follow, systemd/Procfile/fly.toml, upgrade checklist.",
+        path: "docs/guides/minions-deployment.md",
+        // v0.41.8.0: 13KB deployment runbook. Web index entry stays;
+        // single-fetch bundle drops it to keep under FULL_SIZE_BUDGET
+        // (CLAUDE.md grew past 600KB once master's v0.41.2-v0.41.6 +
+        // this wave's annotations landed). Operators read this once;
+        // agents rarely need it in context.
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/quiet-hours.md",
+        description: "Notification hold + timezone-aware delivery.",
+        path: "docs/guides/quiet-hours.md",
+        // Linked, not inlined: the Wave B PR 2 master merge put llms-full.txt over FULL_SIZE_BUDGET.
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/scaling-skills.md",
+        description:
+          "Three-tier architecture for agents with 300+ skills: always-loaded, resolver-routed, and dormant. Per-turn token math, the compact list-format resolver, and the `gbrain doctor` safety net. 306 skills, ~21K tokens freed per turn, zero capability loss.",
+        path: "docs/guides/scaling-skills.md",
+        // Linked, not inlined: the operator-lessons wave (cron wrapper, managed checkout, identity) put llms-full.txt over FULL_SIZE_BUDGET.
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/life-chronicle.md",
+        description:
+          "Life Chronicle automatic event extraction (on by default): what qualifies, per-page cost and daily ceiling, privacy, the receipt -> `gbrain dream --phase chronicle` -> `gbrain day` check, skip/failure codes with fixes, opt-out `gbrain config set auto_chronicle false`, history backfill.",
+        path: "docs/guides/life-chronicle.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/dream-patterns.md",
+        description:
+          "Dream patterns phase: settings (min_evidence, subagent timeouts), in-cycle budget sizing from the recorded `dream.patterns.last_run` (first batch, timeout halving, `insufficient_cycle_budget` skip, probe after 3 skips), reset with `gbrain config unset dream.patterns.last_run`.",
+        path: "docs/guides/dream-patterns.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/facts-drain.md",
+        description:
+          "Automatic facts drain on PGLite (on by default): queued facts-absorb jobs run inside gbrain serve, serve --http and the facts_drain cycle phase with no command; per-run, daily and job-count caps, deferrals that never drop work, doctor facts_drain, opt-out `gbrain config set facts.extraction_enabled false`.",
+        path: "docs/guides/facts-drain.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/push-context.md",
+        description:
+          "Push-based context: the brain volunteers confidence-gated pages from the rolling conversation window. Three channels (ambient reflex, volunteer_context op, gbrain watch), config knobs, and the volunteered-vs-used feedback loop.",
+        path: "docs/guides/push-context.md",
+        // Linked, not inlined: same budget trim as scaling-skills.md.
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/time-aware-recall.md",
+        description:
+          "Time-aware recall in `gbrain think`: the current date in brain.timezone (or `--reference-date`) and content dates on each page block, with the measured accuracy gain.",
+        path: "docs/guides/time-aware-recall.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/evidence-delivery.md",
+        description:
+          "Evidence delivery (`return_unit`): window / section / page / auto evidence instead of chunks on search, query, recall and think, packed into a token budget; response fields, fallback codes, authorization guarantees, latency, and the frozen-hit `assemble_evidence` interface for evals.",
+        path: "docs/evidence-delivery.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/github-source.md",
+        description:
+          "Mirror GitHub issues, PRs, comments, reviews and CI checks as brain pages. One key + one registration command to a searchable mirror; webhook-driven instant refresh, poll-sweep fallback, daily reconcile, App-credential option.",
+        path: "docs/guides/github-source.md",
+      },
+      {
+        title: "docs/mcp/DEPLOY.md",
+        description: "MCP server deployment.",
+        path: "docs/mcp/DEPLOY.md",
+        // Fix wave 12: 42KB operator deployment runbook. Web index entry
+        // stays; the single-fetch bundle drops it to stay under
+        // FULL_SIZE_BUDGET (wave 12's onboard, dream and memory-verb doc
+        // additions passed 800KB). Operators read it once when deploying;
+        // agents follow the llms.txt link when they need it.
+        includeInFull: false,
+      },
+      {
+        title: "docs/protocol/MEMORY_VERBS_v1.md",
+        description:
+          "The frozen memory-verb protocol (recall/remember/entity/synthesize/forget plus context_pack and delta): response envelopes, error contract, additive-forever versioning, surface modes, conformance certification, per-harness installs.",
+        path: "docs/protocol/MEMORY_VERBS_v1.md",
+      },
+    ],
+  },
+  {
+    heading: "AI providers",
+    entries: [
+      {
+        title: "docs/ai-providers/google.md",
+        description:
+          "Google Gemini: GOOGLE_GENERATIVE_AI_API_KEY (GEMINI_API_KEY alias), GOOGLE_GENERATIVE_AI_BASE_URL override for chat, expansion and embeddings (metering proxies, regional gateways), provider_base_urls.google.",
+        path: "docs/ai-providers/google.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/ai-providers/llama-server-reranker.md",
+        description:
+          "Local reranker via llama.cpp --reranking: Qwen3-Reranker, --alias setup, gbrain config keys, cold-start timeout, budget-cap interaction.",
+        path: "docs/ai-providers/llama-server-reranker.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/ai-providers/typesafe.md",
+        description:
+          "TypeSafe Jev: TYPESAFE_API_KEY (JEV_TYPESAFE_API_KEY alias), pinned vs alias models, Jev search reranker setup (#5178), pricing, limits, data handling and what never leaves the machine.",
+        path: "docs/ai-providers/typesafe.md",
+        includeInFull: false,
+      },
+    ],
+  },
+  {
+    heading: "Debugging",
+    entries: [
+      {
+        title: "docs/GBRAIN_VERIFY.md",
+        description:
+          "Post-setup verification checks for the capabilities you enabled. When a gbrain call fails or something feels off, start with docs/protocol/AGENT_OPERATOR_v1.md, then run these checks.",
+        path: "docs/GBRAIN_VERIFY.md",
+      },
+      {
+        title: "docs/guides/troubleshooting.md",
+        description:
+          "Symptom table with who acts, consent and a read-only verify step per row, then the long-form fixes.",
+        path: "docs/guides/troubleshooting.md",
+      },
+      {
+        title: "docs/guides/error-codes.md",
+        description:
+          "Generated: every error code with meaning, why, next step, who acts and consent, verify, exit code and retryability. Offline: `gbrain errors <code>`.",
+        path: "docs/guides/error-codes.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/exit-codes.md",
+        description: "Exit statuses (3 = confirmation_required only, 10 pending write, 11 resumable budget stop) and what the agent does on each.",
+        path: "docs/guides/exit-codes.md",
+      },
+      {
+        title: "docs/guides/minions-fix.md",
+        description: "Troubleshooting the Minions job queue.",
+        path: "docs/guides/minions-fix.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/repair.md",
+        description:
+          "`gbrain repair <kind>`: dry run vs --apply, --source/--limit/--json, resume, capacity stop, thin-client refusal, what each kind fixes and costs; held files walkthrough (sync holds a broken file, `gbrain repair frontmatter` two-pass preview and apply).",
+        path: "docs/guides/repair.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/write-refusals.md",
+        description:
+          "Refusal reasons (file_database_drift, ambiguous_source_path, physical_root_device_changed, cursor_processing_options_conflict, take_row_collision, invalid_source_uri, queue_capacity, parked effects) and held-file content refusals (invalid_frontmatter and its reasons, frontmatter_slug_conflict, file_too_large, content_rejected, rename_held, sync_parser_regression) with the exact recovery command. Every refusal's `docs` field links its row directly.",
+        path: "docs/guides/write-refusals.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/guides/fence-format.md",
+        description:
+          "Facts and takes fence format, generated from the parser: markers, columns and layouts, allowed values, holders, row-number rules, one valid example per fence, what gbrain fixes by itself and what it never guesses, and the repair gates.",
+        path: "docs/guides/fence-format.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/integrations/reliability-repair.md",
+        description: "Data integrity recovery.",
+        path: "docs/integrations/reliability-repair.md",
+      },
+    ],
+  },
+  {
+    heading: "Migrations",
+    entries: [
+      {
+        title: "docs/UPGRADING_DOWNSTREAM_AGENTS.md",
+        description:
+          "Patches for downstream agent skill forks. One section per release.",
+        path: "docs/UPGRADING_DOWNSTREAM_AGENTS.md",
+        // Excluded from inlined bundle (v0.41.7.0): 25KB of release-by-release
+        // migration patches that are valuable as a reference but don't need
+        // to ride along in every llms-full.txt fetch. Pushes the bundle back
+        // under FULL_SIZE_BUDGET after the v0.41.7.0 scaling-skills guide
+        // landed.
+        includeInFull: false,
+      },
+      {
+        title: "skills/migrations/",
+        description:
+          "Per-version agent-executable migration instructions and post-upgrade verification.",
+        path: "skills/migrations/",
+      },
+      {
+        title: "CHANGELOG.md",
+        description:
+          "Release-summary voice + itemized changes + self-repair block per version.",
+        path: "CHANGELOG.md",
+        includeInFull: false,
+      },
+    ],
+  },
+  {
+    heading: "Contributing",
+    optional: true,
+    entries: [
+      {
+        title: "docs/TESTING.md",
+        description:
+          "Test command tiers, the test-isolation lint (R1-R4), the canonical PGLite block, withEnv, the E2E DB lifecycle, and the file taxonomy. Maintainer-facing.",
+        path: "docs/TESTING.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/RELEASING.md",
+        description:
+          "Full release + contributor process: pre-ship test requirements, the CHANGELOG voice + release-summary template, the 'To take advantage of vX' block, version migrations, GitHub Actions SHA refresh, PR conventions, community-PR-wave. (Ship IRON RULES stay inline in CLAUDE.md.)",
+        path: "docs/RELEASING.md",
+        includeInFull: false,
+      },
+    ],
+  },
+  {
+    heading: "Philosophy",
+    optional: true,
+    entries: [
+      {
+        title: "docs/ethos/THIN_HARNESS_FAT_SKILLS.md",
+        description: "Why skills live in markdown.",
+        path: "docs/ethos/THIN_HARNESS_FAT_SKILLS.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/ethos/MARKDOWN_SKILLS_AS_RECIPES.md",
+        description: "Homebrew for Personal AI.",
+        path: "docs/ethos/MARKDOWN_SKILLS_AS_RECIPES.md",
+        includeInFull: false,
+      },
+    ],
+  },
+  {
+    heading: "Optional",
+    optional: true,
+    entries: [
+      {
+        title: "docs/designs/",
+        description: "Forward-looking designs.",
+        path: "docs/designs/",
+        includeInFull: false,
+      },
+      {
+        title: "docs/architecture/infra-layer.md",
+        description: "Shared infra patterns.",
+        path: "docs/architecture/infra-layer.md",
+        includeInFull: false,
+      },
+      {
+        title: "docs/memorable-agents.md",
+        description:
+          "Optional Memorable procedural-memory integration: the session-end receipt, the config gate and kill switch, the consent model, and exactly what leaves the machine.",
+        path: "docs/memorable-agents.md",
+        includeInFull: false,
+      },
+    ],
+  },
+];
+
+export const INLINE_TIPS = [
+  "`gbrain doctor [--json] [--fast] [--fix]` - built-in health checks.",
+  "`gbrain orphans [--json]` - pages with zero inbound wikilinks.",
+  "`gbrain repair-jsonb [--dry-run]` - repair v0.12.0 double-encoded JSONB rows.",
+  "`gbrain repair [<kind>] [--apply]` - preview, then fix timeline, visibility and safe-chunk damage doctor reports.",
+  "`gbrain upgrade` runs post-upgrade + apply-migrations.",
+  "`gbrain errors <code> [--json]` - explain any error code offline; follow its `fix.next`.",
+];
+
+// Target ~800KB so llms-full.txt fits in ~200k-token contexts with room to spare.
+// Bumped 600KB→700KB in v0.41.9.0, then 700KB→750KB once CLAUDE.md crossed 700KB,
+// then 750KB→800KB in v0.42.10.0 when the #972 global-basename Key Files annotation
+// (landing alongside master's #1696/#1699 waves) crossed the 750KB line. CLAUDE.md
+// is ~540KB+ (the bulk of the bundle) and grows ~5-15KB per release with each
+// feature's Key Files annotation. CLAUDE.md is the whole point of the one-fetch
+// bundle, so it stays inlined; the budget tracks its legitimate growth. Still fits
+// comfortably in 200k+ context models.
+// Generator prints a WARN if exceeded; ship with includeInFull=false exclusions.
+export const FULL_SIZE_BUDGET = 800_000;

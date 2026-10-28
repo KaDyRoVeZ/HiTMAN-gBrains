@@ -1,0 +1,470 @@
+/**
+ * Wave checks: the doctor checks that report residual state from the managed
+ * persistence waves, each with a stable id and a declared resolution. One
+ * table feeds four consumers so they can never disagree:
+ *
+ *   - the local doctor (checks registered here rather than inline in doctor.ts),
+ *   - the remote doctor's sanitized host-action lines (report-remote.ts),
+ *   - `gbrain doctor --remediate` finding classification,
+ *   - the `gbrain post-upgrade` banner.
+ *
+ * `resolution` says how a non-ok finding clears: `repair` (a registered
+ * `gbrain repair` kind names this check in its `checks`), `operator` (a named
+ * manual action on the brain host), or `unsupported` (no command can clear it
+ * yet; it is reported, never hidden). Add a check by appending one entry.
+ */
+import type { BrainEngine } from '../../core/engine.ts';
+import type { Check } from '../doctor.ts';
+import { repairForCheck } from '../../core/repair/registry.ts';
+
+export type WaveResolution = 'repair' | 'operator' | 'unsupported';
+
+export interface WaveScope {
+  /** Remote source scope; undefined means brain-wide (local trusted callers). */
+  sourceIds?: string[];
+}
+
+export interface WaveCheckSpec {
+  id: string;
+  resolution: WaveResolution;
+  /** Count-free, path-free impact line safe for remote callers. */
+  impact: string;
+  /** The named instruction for an operator-required or unsupported finding. */
+  instruction?: string;
+  /** Where the local doctor runs it: inline in doctor.ts, or from this table. */
+  registration: 'doctor.ts' | 'wave';
+  /** Reason the check is not offered to remote callers, if any. */
+  hostOnly?: string;
+  /** Items behind a finding, read from the check's details (host-side banners only). */
+  count(details: Record<string, any>): number;
+  /**
+   * The banner's parenthetical when the finding's details change it: `how` is the
+   * default from the resolution, `source` the one source the finding names.
+   */
+  bannerHow?(details: Record<string, any>, how: string, source?: string): string;
+  run(engine: BrainEngine, scope: WaveScope): Promise<Check>;
+}
+
+/**
+ * #6188 (D7): what clears malformed fences, from a check's `auto_repair` detail: the next maintenance run while
+ * one is active and `fences.repair.enabled` is on, otherwise the preview `command`: the content lane for held files (#6377), `gbrain repair fences`
+ * for malformed fences stored pages carry (whose preview prints the apply command).
+ */
+function fenceRepairHow(details: Record<string, any>, source: string | undefined, command: 'fences' | 'content'): string {
+  const preview = `preview with: gbrain repair ${command}${source ? ` --source ${source}` : ''}`;
+  const auto = details.auto_repair as { active?: boolean; enabled?: boolean } | undefined;
+  if (auto && auto.active === false) return `not repaired automatically (${auto.enabled === false ? 'fences.repair.enabled is false' : 'no maintenance run is active'}); ${preview}`;
+  const manual = Array.isArray(details.sources) ? details.sources.reduce((sum: number, c: { by_tier?: { manual?: number } }) => sum + Number(c.by_tier?.manual ?? 0), 0) : 0;
+  return `repaired automatically by the next maintenance run${manual ? `, except ${manual} that need a manual edit` : ''}; ${preview}`;
+}
+
+/** Checks that take one optional source id: run once brain-wide, or once per scoped source and merged. */
+async function perSource(scope: WaveScope, run: (sourceId?: string) => Promise<Check>): Promise<Check> {
+  if (!scope.sourceIds) return run();
+  const checks = await Promise.all(scope.sourceIds.map(id => run(id)));
+  const worst = checks.find(c => c.status === 'fail') ?? checks.find(c => c.status === 'warn') ?? checks[0];
+  return worst ?? { name: '', status: 'ok', message: '' };
+}
+
+export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
+  {
+    id: 'timeline_history', resolution: 'repair', registration: 'doctor.ts',
+    count: d => Number(d.materializable_rows ?? 0),
+    impact: 'Some timeline rows exist only in the database and are missing from their pages',
+    run: async (engine, scope) => { const { timelineHistoryCheck } = await import('./checks/timeline-history.ts'); return perSource(scope, id => timelineHistoryCheck(engine, id)); },
+  },
+  {
+    id: 'derived_visibility', resolution: 'repair', registration: 'doctor.ts',
+    count: d => Number(d.unstamped_atoms ?? 0) + Number(d.unstamped_concepts ?? 0) + Number(d.looser_atoms ?? 0) + Number(d.looser_concepts ?? 0),
+    impact: 'Some derived pages have no explicit visibility or are stored looser than their origin',
+    run: async (engine, scope) => { const { derivedVisibilityCheck } = await import('./checks/derived-visibility.ts'); return perSource(scope, id => derivedVisibilityCheck(engine, id)); },
+  },
+  {
+    id: 'safe_index_pending', resolution: 'repair', registration: 'wave',
+    count: d => Number(d.pages_pending ?? 0),
+    impact: 'Some pages are below the safe-chunk index version and are withheld from remote search',
+    run: async (engine, scope) => (await import('./checks/safe-index.ts')).safeIndexPendingCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'credential_projection_pending', resolution: 'operator', registration: 'wave',
+    count: d => Number(d.pages_pending ?? 0) + Number(d.kept_pages ?? 0),
+    impact: 'Some pages holding a private key are withheld from search until their credential-safe re-chunk completes',
+    instruction: 'Run `gbrain apply-migrations --yes --no-autopilot-install` on the brain host (no provider calls), then `gbrain embed --stale` when ready; re-import code pages without a recorded source path.',
+    run: async (engine, scope) => (await import('./checks/credential-projection.ts')).credentialProjectionPendingCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'connector_checkpoints', resolution: 'repair', registration: 'wave',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some connector checkpoint rows can no longer be loaded by any connector source',
+    run: async engine => (await import('./checks/connector-checkpoints.ts')).checkConnectorCheckpoints(engine),
+  },
+  {
+    id: 'persistence_request_indexes', resolution: 'repair', registration: 'wave',
+    count: d => Number(d.count ?? 0),
+    impact: 'A managed sync request index is missing or INVALID, so sync checkpoints can time out on a large request table',
+    run: async engine => (await import('./checks/persistence-requests.ts')).requestIndexesCheck(engine),
+  },
+  {
+    id: 'persistence_request_growth', resolution: 'operator', registration: 'wave',
+    count: d => (d.scopes ?? []).filter((scope: { days_to_exhaustion?: number | null }) => scope.days_to_exhaustion != null && scope.days_to_exhaustion < 90).length,
+    impact: 'At its current admission rate a writer exhausts its lifetime request IDs within 90 days',
+    instruction: 'Raise the named limit with the `gbrain config set persistence.limits.<limit> <value>` command doctor prints, on the brain host (docs/guides/repair.md#request-growth).',
+    run: async engine => (await import('./checks/persistence-requests.ts')).requestGrowthCheck(engine),
+  },
+  {
+    id: 'persistence_write_stall', resolution: 'operator', registration: 'wave',
+    count: d => Number(d.count ?? 0),
+    hostOnly: 'Request ids, roots and the owning process are brain-host persistence state outside any source scope.',
+    impact: 'A write request has held its claim past persistence.max_claim_ms, so later writes on its root wait behind it',
+    instruction: 'Inspect it with `gbrain sources writer status --source <id> --json`, then restart the `gbrain serve` that owns the root (docs/guides/troubleshooting.md#persistence-write-stall).',
+    run: async engine => (await import('./checks/persistence-requests.ts')).writeStallCheck(engine),
+  },
+  {
+    id: 'lost_caller_writes', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Replaying refused caller writes is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some caller writes (remember, put_page, add_timeline_entry) were refused at publication and never landed; the caller saw an error and the fact or edit was dropped',
+    run: async (engine, scope) => (await import('./checks/persistence-requests.ts')).lostCallerWritesCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'persistence_terminal_failures', resolution: 'operator', registration: 'doctor.ts',
+    hostOnly: 'Request ids, roots and recovery records are brain-host persistence state outside any source scope.',
+    count: d => Number(d.count ?? 0),
+    impact: 'A write receipt that did not commit blocks work now (a recovery record or a checkpoint blocker), or an unresolved receipt is a gbrain-defect class',
+    instruction: 'Run the fix doctor prints, then drill down with `gbrain sources writer failures <source> --group-by category --json` on the brain host (docs/guides/troubleshooting.md#terminal-write-failures).',
+    run: async (engine, scope) => (await (await import('./checks/persistence-requests.ts')).terminalFailuresCheck(engine, scope.sourceIds))!,
+  },
+  {
+    id: 'persistence_session_timeouts', resolution: 'operator', registration: 'wave',
+    count: d => d.reason === 'session_timeouts_not_applied' ? 1 : 0,
+    hostOnly: 'The connection URL and its pooler are brain-host configuration outside any source scope.',
+    impact: 'A transaction-mode pooler drops the configured session statement_timeout, so autocommit statements outside a transaction have no server-side bound',
+    instruction: 'Set the default on the role instead: `ALTER ROLE <gbrain role> SET statement_timeout = \'5min\'` (docs/guides/troubleshooting.md#session-timeouts-not-applied).',
+    run: async engine => (await import('./checks/persistence-requests.ts')).sessionTimeoutsCheck(engine),
+  },
+  {
+    id: 'connector_held_items', resolution: 'operator', registration: 'wave',
+    count: d => Number(d.held ?? 0),
+    impact: 'Some connector items are held after repeated failures and are not imported',
+    instruction: 'Inspect them with `gbrain sources status <source>`, fix the cause, then run `gbrain sources retry-held <source>` and `gbrain sync --source <source>` (docs/guides/repair.md#connector-held-items).',
+    run: async (engine, scope) => (await import('./checks/connector-holds.ts')).connectorHeldItemsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'git_held_files', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Held file paths are host-local; remote callers see held counts on sync results, get_page and search.',
+    count: d => Number(d.held ?? 0),
+    impact: 'Some Git source files are held instead of imported, so their pages are missing or keep an older revision',
+    bannerHow: (d, how, source) => !d.fences ? how : d.fences >= Number(d.held ?? 0) ? `fence holds: ${fenceRepairHow(d, source, 'content')}` : `${how}; fence holds: ${fenceRepairHow(d, source, 'content')}`,
+    run: async (engine, scope) => (await import('./checks/git-holds.ts')).gitHeldFilesCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'fence_integrity', resolution: 'repair', registration: 'doctor.ts',
+    count: d => Number(d.total ?? 0),
+    impact: 'Some facts or takes fences are malformed and wait for repair; none of them blocks a sync',
+    bannerHow: (d, _how, source) => fenceRepairHow(d, source, 'fences'),
+    run: async (engine, scope) => (await import('./checks/fence-integrity.ts')).fenceIntegrityCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'frontmatter_repairable', resolution: 'repair', registration: 'doctor.ts',
+    hostOnly: 'The scan reads source checkouts on the brain host, and the frontmatter repair rewrites files there (explicit-only).',
+    count: d => Number(d.repairable ?? 0),
+    impact: 'Some source files have frontmatter gbrain reads only by quoting or interpreting it',
+    run: async (engine, scope) => { const { frontmatterRepairableCheck } = await import('./checks/frontmatter-repairable.ts'); return perSource(scope, id => frontmatterRepairableCheck(engine, id)); },
+  },
+  {
+    id: 'frontmatter_hook', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Pre-commit hooks live in the source checkouts on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'An installed frontmatter pre-commit hook predates this release and checks working-tree files instead of staged content',
+    instruction: 'Refresh it on the brain host with `gbrain frontmatter install-hook --force` (add `--source <id>` for one source); only the gbrain hook script is rewritten.',
+    run: async (engine, scope) => (await import('./checks/frontmatter-hook.ts')).frontmatterHookCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'orphan_persistence_bindings', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Bindings of removed sources are brain-wide persistence bookkeeping outside any source scope.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some persistence source bindings belong to a removed source or an earlier source incarnation',
+    run: async engine => (await import('./checks/orphan-bindings.ts')).checkOrphanBindings(engine),
+  },
+  {
+    id: 'foreign_ownership_marker', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Ownership markers are private files beside the source checkouts on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'An ownership marker beside a source checkout names another brain or an unknown worktree, so claiming that checkout refuses recovery_required',
+    instruction: 'Confirm with the user that the recorded brain is retired, then remove exactly the marker file doctor names on the brain host and claim again (docs/guides/write-refusals.md#foreign-ownership-marker); never remove a marker of a brain still in use.',
+    run: async engine => (await import('./checks/orphan-bindings.ts')).checkForeignOwnershipMarkers(engine),
+  },
+  {
+    id: 'coordination_lock_location', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Coordination lock reservations are private files beside the source checkouts on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'GBRAIN_COORDINATION_HOME names another directory than a checkout\'s recorded coordination lock, which stays in use',
+    instruction: 'Make the recorded lock directory doctor names survive container recreation and unset GBRAIN_COORDINATION_HOME for that checkout if it was meant to move the lock (docs/architecture/topologies.md#coordination-home-ignored); never edit or delete the reservation.',
+    run: async engine => (await import('./checks/coordination-lock.ts')).checkCoordinationLockLocation(engine),
+  },
+  {
+    id: 'unbound_source', resolution: 'operator', registration: 'wave',
+    count: d => (d.sources ?? []).filter((source: { bound?: boolean }) => source.bound).reduce((sum: number, source: { pages?: number }) => sum + Number(source.pages ?? 0), 0),
+    impact: 'Some pages written database-only while their source was unbound now sit outside canonical files',
+    instruction: 'Keep them database-only, or for a page whose slug already has a canonical file preview both sides with `gbrain sources reconcile <source> <slug> --brain <brain> --preview` and apply the agreed resolution (docs/guides/write-refusals.md#unbound-sources-on-postgres).',
+    run: async engine => (await import('./checks/unbound-source.ts')).checkUnboundSource(engine),
+  },
+  {
+    id: 'persistence_capacity', resolution: 'operator', registration: 'doctor.ts',
+    count: d => (d.resources ?? []).length,
+    impact: 'A cumulative managed-write limit is at or above 80%',
+    instruction: 'Raise the named journal limit with the `gbrain config set` command doctor prints, on the brain host.',
+    run: async engine => (await import('./checks/persistence-capacity.ts')).checkPersistenceCapacity(engine),
+  },
+  {
+    id: 'persistence_compaction', resolution: 'operator', registration: 'doctor.ts',
+    count: d => (d.live_consumers ?? 0) > 0 ? 1 : 0,
+    impact: 'A resident consumer has not compacted write receipts within its staleness window, so receipt bytes are not coming back',
+    instruction: 'Check the consumer with `gbrain sources writer status --json`; preview an on-demand pass with `gbrain repair receipt-compaction --json` and apply it after the user agrees.',
+    run: async engine => (await import('./checks/persistence-compaction.ts')).checkPersistenceCompaction(engine),
+  },
+  {
+    id: 'persistence_counter_drift', resolution: 'operator', registration: 'doctor.ts',
+    count: d => (d.drift ?? []).length,
+    impact: 'Receipt-bytes counters differ from the receipts they account for',
+    instruction: 'Report the drift with `gbrain doctor --only persistence_counter_drift --json`; the check changes nothing.',
+    run: async engine => (await import('./checks/persistence-compaction.ts')).checkPersistenceCounterDrift(engine),
+  },
+  {
+    id: 'parked_effects', resolution: 'operator', registration: 'doctor.ts',
+    count: d => Number(d.parked_effects ?? 0),
+    impact: 'Some Git or withdrawal effects are parked after repeated failures',
+    instruction: 'Fix the cause, then run the `gbrain sources writer retry-effects <source> --request-id <id>` command doctor prints (preview with --dry-run first).',
+    run: async (engine, scope) => (await import('./checks/parked-effects.ts')).checkParkedEffects(engine, scope.sourceIds),
+  },
+  {
+    id: 'dream_paid_loop', resolution: 'operator', registration: 'doctor.ts',
+    count: d => (d.keys ?? []).length,
+    impact: 'A dream synthesis key keeps dying and was paid for on each attempt',
+    instruction: 'Fix the cause, then reset the breaker with the command doctor prints.',
+    run: async engine => (await import('./checks/dream-breaker.ts')).dreamPaidLoopCheck(engine),
+  },
+  {
+    id: 'writer_version', resolution: 'operator', registration: 'wave',
+    impact: 'A writer older than this release admitted or published a recent write',
+    instruction: 'Run `gbrain upgrade` on each host doctor names (by host UUID), then restart its gbrain processes; an older writer may still delete database-only timeline rows.',
+    count: d => Number(d.count ?? 0),
+    run: async engine => (await import('./checks/writer-version.ts')).writerVersionCheck(engine),
+  },
+  {
+    id: 'segmented_storage', resolution: 'operator', registration: 'wave',
+    impact: 'A recent writer older than this release keeps segmented page storage off, so pages over 1 MiB are written inline up to 24 MiB',
+    instruction: 'Run `gbrain upgrade` on each host doctor names (by host UUID), then restart its gbrain processes; the hold clears seven days after that writer\'s last request.',
+    count: d => (Array.isArray(d.blockers) ? d.blockers.length : 0),
+    run: async engine => (await import('./checks/segmented-storage.ts')).segmentedStorageCheck(engine),
+  },
+  {
+    id: 'self_capture', resolution: 'operator', registration: 'wave',
+    count: d => Number(d.classified ?? 0),
+    impact: 'The session corpus still holds files captured from gbrain\'s own model sessions',
+    instruction: 'Quarantine the listed corpus files by hand with the commands in docs/guides/repair.md#quarantine-self-captured-corpus-files; nothing is deleted automatically.',
+    run: async engine => (await import('./checks/self-capture.ts')).selfCaptureCheck(engine),
+  },
+  {
+    id: 'vector_plan', resolution: 'operator', registration: 'wave',
+    count: d => (d.outcome === 'index_unused' || d.outcome === 'legacy_guard' ? 1 : 0),
+    impact: 'Vector search on the active embedding column does not use its HNSW index, so vector candidates can time out and hybrid search falls back to keyword hits',
+    instruction: 'Upgrade gbrain on the brain host and rerun `gbrain doctor`; check the HNSW index state doctor reports; remove `search.vector_legacy_guard` / GBRAIN_VECTOR_LEGACY_GUARD unless it rolled back a regression, then restart the owning service (docs/guides/troubleshooting.md#hybrid-search-returns-only-keyword-hits).',
+    run: async engine => (await import('./checks/vector-plan.ts')).vectorPlanCheck(engine),
+  },
+  {
+    id: 'keyword_plan', resolution: 'operator', registration: 'wave',
+    count: d => (d.outcome === 'canary_timed_out' || d.outcome === 'canary_slow' ? 1 : 0),
+    impact: 'The commonest keyword term on this brain cannot be counted inside the keyword statement bound, so broad keyword queries time out and hybrid search answers from the vector arm alone',
+    instruction: 'Read the canary doctor reports (one term is not workload coverage); raise `search.keyword_statement_timeout_ms` on the brain host only to buy time (1000-60000 ms, then restart the serving process), narrow broad queries to one source (`gbrain search --source-id <id>`, MCP `source_id`), and follow #6495 for the bounded candidate set (docs/guides/troubleshooting.md#keyword-search-times-out-on-a-large-postgres-brain).',
+    run: async engine => (await import('./checks/keyword-plan.ts')).keywordPlanCheck(engine),
+  },
+  {
+    id: 'stale_embedding_effects', resolution: 'repair', registration: 'wave',
+    count: d => Number(d.stale_effects ?? 0),
+    impact: 'A committed write still has a stale queued or failed embedding effect that blocks compaction and activation',
+    run: async (engine, scope) => (await import('./checks/stale-embedding-effects.ts')).staleEmbeddingEffectsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'google_file_modes', resolution: 'repair', registration: 'wave',
+    hostOnly: 'File permissions and directory paths on the brain host are host-local filesystem state.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some files gbrain wrote under a Google source directory outside ~/.gbrain are readable by other local users',
+    run: async (engine, scope) => (await import('./checks/google-file-modes.ts')).checkGoogleFileModes(engine, scope.sourceIds),
+  },
+  {
+    id: 'google_calendar_readable', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Connector state and the account address live on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'A Google source is configured with a calendar its account cannot read, so it imports no events',
+    instruction: 'List the readable calendars with `gbrain google calendars --account <email>`, then `gbrain sources set-calendar <source> <calendar-id>` and `gbrain sync --source <source>` (docs/guides/google-connect.md#unreadable-calendar).',
+    run: async (engine, scope) => (await import('./checks/google-calendar.ts')).googleCalendarReadableCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'google_api_access', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Connector state, the account address and the Google Cloud project live on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'A Google source could not reach a service because its API is disabled for the OAuth project or its scope was not granted, so that service imports nothing',
+    instruction: 'Enable each named API at the console link in the finding (or run `gbrain google connect --reauth <email>` for a missing scope), then confirm with `gbrain google status --json` and run `gbrain sync --source <source>` (docs/guides/google-connect.md#api-access).',
+    run: async (engine, scope) => (await import('./checks/google-api-access.ts')).googleApiAccessCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'atom_provenance_drift', resolution: 'repair', registration: 'doctor.ts',
+    hostOnly: 'Retiring stale atoms is a host-side, explicit-only repair.',
+    count: d => Number(d.drifted ?? 0),
+    impact: 'Some atoms reference a source page that is gone or was edited, and still surface in search with a quote no current page contains',
+    run: async engine => (await import('./checks/extraction-sync.ts')).computeAtomProvenanceDriftCheck(engine),
+  },
+  {
+    id: 'atom_retirements_restorable', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring atoms an empty re-extraction retired is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some atoms were retired when a re-extraction returned no atoms, and the purge removes them once their hold ends',
+    run: async (engine, scope) => (await import('./checks/atom-retirements.ts')).atomRetirementsRestorableCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'generation_retirements', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring a derived generation is a host-side, explicit-only repair.',
+    count: d => Number(d.items ?? 0),
+    impact: 'Live generations retired derived items inside the restore window; they stay restorable until the purge hold ends',
+    run: async (engine, scope) => (await import('./checks/generations.ts')).generationRetirementsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'generation_held', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Releasing a held derived generation is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some derived results were held instead of published, so their keys keep the previous generation',
+    run: async (engine, scope) => (await import('./checks/generations.ts')).generationHeldCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'generation_pending', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Pending generation members and orphan candidates are host-side state of managed derived writers.',
+    count: d => Number(d.pending ?? 0) + Number(d.orphans ?? 0),
+    impact: 'Some activated generations still wait on member requests, or pages were written for an activation that never happened',
+    run: async (engine, scope) => (await import('./checks/generations.ts')).generationPendingCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'extractor_facts_expired', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring expired extractor facts is a host-side, explicit-only repair.',
+    count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
+    impact: 'Some conversation-extractor facts were expired by the pre-v0.60.11.0 canonical projection and recall no longer returns them',
+    run: async (engine, scope) => (await import('./checks/extractor-facts.ts')).extractorFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'conversation_label_facts', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Retiring label-misattributed conversation facts is a host-side, explicit-only repair.',
+    count: d => Number(d.evidenced ?? 0),
+    impact: 'Some conversation facts were extracted from meeting-note labels read as speakers by an older parser, and recall still returns them',
+    run: async (engine, scope) => (await import('./checks/conversation-outcomes.ts')).conversationLabelFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'conversation_outcomes_stale', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Re-extracting conversation facts spends model calls on the brain host.',
+    instruction: 'Preview re-extracting a page the check names with gbrain extract-conversation-facts --source-id <id> --slug <slug> --force --dry-run, then run it without --dry-run after the user agrees to the spend.',
+    count: d => Number(d.stale ?? 0),
+    impact: 'Some conversation pages keep an extraction outcome recorded by an older conversation parser, which is never reopened automatically',
+    run: async (engine, scope) => (await import('./checks/conversation-outcomes.ts')).conversationOutcomesStaleCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'captured_facts_active', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Classifying captured facts reads harness transcripts and the session corpus on the brain host; the repair is explicit-only.',
+    count: d => Number(d.evidenced ?? 0) + Number(d.ambiguous ?? 0),
+    impact: 'Some active facts were captured from gbrain\'s own model sessions or from pasted text before v0.60.30.0',
+    run: async (engine, scope) => (await import('./checks/captured-facts.ts')).capturedFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'facts_redaction_marker', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring redacted fact text reads the facts\' source pages and versions on the brain host; the repair is explicit-only.',
+    count: d => Number(d.affected ?? 0),
+    impact: 'Some active facts lost words to the pre-fix prompt sanitizer and hold a [redacted] marker in their stored text',
+    run: async (engine, scope) => (await import('./checks/facts-redaction-marker.ts')).factsRedactionMarkerCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'fact_bulk_dates', resolution: 'repair', registration: 'wave',
+    count: d => Array.isArray(d.days) ? d.days.reduce((sum: number, day: { facts?: number }) => sum + Number(day.facts ?? 0), 0) : 0,
+    impact: 'Some sources hold a large share of facts dated with the day a bulk load ran, which records when they were loaded, not when they happened',
+    run: async (engine, scope) => (await import('./checks/fact-bulk-dates.ts')).factBulkDatesCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'loop_facts_drift', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Retiring closed-loop commitment facts is a host-side, explicit-only repair.',
+    count: d => Number(d.drifted ?? 0),
+    impact: 'Some closed commitment loops still have an active commitment fact, so recall keeps the finished promise',
+    run: async (engine, scope) => (await import('./checks/loop-facts.ts')).loopFactsDriftCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'ontology_facts_fenced', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Restoring fenced ontology observations is a host-side, explicit-only repair.',
+    count: d => Number(d.fenced ?? 0) + Number(d.retired ?? 0),
+    impact: 'Some ontology observations were moved onto an entity page\'s Facts table, and ontology_get no longer returns the ones a later page write retired',
+    run: async (engine, scope) => (await import('./checks/ontology-facts.ts')).ontologyFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'stale_frontmatter_keys', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Sweeping stored frontmatter keys is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some pages store a parser-reserved frontmatter key (type, title, tags, slug) left by an older import; writes compare around it, the sweep is hygiene',
+    run: async (engine, scope) => (await import('./checks/frontmatter-keys.ts')).staleFrontmatterKeysCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'maintenance_write_drift', resolution: 'repair', registration: 'wave',
+    hostOnly: 'The live file check reads the canonical checkout on the brain host; resolving drift is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0) + Number(d.concept_skips ?? 0),
+    impact: 'Some pages have a canonical file that differs from the database, so every coordinated write to them refuses source_changed until someone resolves them',
+    run: async (engine, scope) => (await import('./checks/maintenance-drift.ts')).maintenanceWriteDriftCheck(engine, scope.sourceIds),
+  },
+];
+
+/** A check that could not run reports unknown, never ok. */
+export function checkHealthUnknown(check: Check): boolean {
+  return check.details?.health === 'unknown' || check.details?.count === 'unknown';
+}
+
+export interface WaveFinding { spec: WaveCheckSpec; check: Check; state: 'ok' | 'finding' | 'unknown' }
+
+/** Run wave checks; a throwing check becomes an unknown finding instead of aborting the rest. */
+export async function runWaveChecks(engine: BrainEngine, opts: WaveScope & { only?: WaveCheckSpec['registration']; remote?: boolean } = {}): Promise<WaveFinding[]> {
+  const specs = WAVE_CHECKS.filter(spec => (!opts.only || spec.registration === opts.only) && (!opts.remote || !spec.hostOnly));
+  const findings: WaveFinding[] = [];
+  for (const spec of specs) {
+    let check: Check;
+    try { check = await spec.run(engine, { sourceIds: opts.sourceIds }); }
+    catch (error) {
+      check = { name: spec.id, status: 'warn', message: `${spec.id} could not run: ${error instanceof Error ? error.message : String(error)}. Health is unknown.`,
+        details: { health: 'unknown' } };
+    }
+    check = { ...check, name: spec.id };
+    findings.push({ spec, check, state: checkHealthUnknown(check) ? 'unknown' : check.status === 'ok' ? 'ok' : 'finding' });
+  }
+  return findings;
+}
+
+/** The one source a finding names (`details.source_ids` of length 1), so its repair command can say `--source <id>`. */
+export function findingSource(finding: Pick<WaveFinding, 'check'>): string | undefined {
+  const ids = finding.check.details?.source_ids;
+  return Array.isArray(ids) && ids.length === 1 && typeof ids[0] === 'string' ? ids[0] : undefined;
+}
+
+/** The repair kind that clears a wave finding, when its resolution is `repair`. */
+export function waveRepairKind(spec: WaveCheckSpec) {
+  return spec.resolution === 'repair' ? repairForCheck(spec.id)?.kind : undefined;
+}
+
+export const REMOTE_HOST_ACTION = 'host operator action required: on the brain host run `gbrain doctor --remediation-plan`';
+
+/**
+ * Remote doctor lines: one per remotely offered wave check, with a stable id,
+ * the count-free impact summary and the on-host preview command. No host
+ * paths, row contents, SQL, account emails or installation ids.
+ */
+export async function remoteWaveHandoff(engine: BrainEngine, sourceIds?: string[]): Promise<Check[]> {
+  const findings = await runWaveChecks(engine, { sourceIds, remote: true });
+  return findings.map(({ spec, check, state }) => {
+    const host_action = { check_id: spec.id, state: state === 'finding' ? 'action_required' : state, preview_command: 'gbrain doctor --remediation-plan' };
+    if (state === 'ok') return { name: spec.id, status: 'ok' as const, message: 'No host action needed.', details: { host_action },
+      ...(check.severity ? { severity: check.severity } : {}), ...(check.readiness_state ? { readiness_state: check.readiness_state } : {}) };
+    if (state === 'unknown') return { name: spec.id, status: 'warn' as const, details: { host_action },
+      message: `Unknown: this check could not run for the remote caller; ${REMOTE_HOST_ACTION}.` };
+    return { name: spec.id, status: 'warn' as const, details: { host_action }, message: `${spec.impact}; ${REMOTE_HOST_ACTION}.` };
+  });
+}

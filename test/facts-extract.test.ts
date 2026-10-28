@@ -1,0 +1,214 @@
+/**
+ * v0.31 Phase 6 — extractor sanitization parity + skip-conditions.
+ *
+ * Pins:
+ *   - INJECTION_PATTERNS sanitized on the way IN (turn_text)
+ *   - dream_generated:true → returns []
+ *   - empty turn_text → returns []
+ *   - Without API key (test env), returns [] gracefully (no throw)
+ *
+ * v0.31.2 (B1 ship-blocker fix) — parser-pin: parseExtractorJson MUST pass
+ * through every typed field the LLM emits, including `notability`. The bug:
+ * tryArrayShape silently dropped the field, so the outer loop saw undefined
+ * and defaulted notability to 'medium'. sync's HIGH-only filter then
+ * discarded 100% of facts. Pinned here so the next field added (rationale,
+ * etc.) doesn't get dropped the same way.
+ */
+
+import { describe, test, expect, afterEach } from 'bun:test';
+import {
+  __setChatTransportForTests,
+  resetGateway,
+  type ChatOpts,
+  type ChatResult,
+} from '../src/core/ai/gateway.ts';
+import { extractFactsFromTurn, parseExtractorJson } from '../src/core/facts/extract.ts';
+
+describe('extractFactsFromTurn', () => {
+  test('empty turn returns no facts', async () => {
+    const r = await extractFactsFromTurn({ turnText: '', source: 'test' });
+    expect(r).toEqual([]);
+  });
+
+  test('whitespace-only after sanitize returns no facts', async () => {
+    const r = await extractFactsFromTurn({ turnText: '   \n  ', source: 'test' });
+    expect(r).toEqual([]);
+  });
+
+  test('isDreamGenerated:true short-circuits', async () => {
+    const r = await extractFactsFromTurn({
+      turnText: 'this is real content that would normally extract',
+      source: 'test',
+      isDreamGenerated: true,
+    });
+    expect(r).toEqual([]);
+  });
+
+  test('without chat gateway configured (test env) returns no facts gracefully', async () => {
+    const r = await extractFactsFromTurn({
+      turnText: 'I am flying to Tokyo Tuesday for a meeting with sam.',
+      source: 'test',
+    });
+    // No ANTHROPIC_API_KEY in test env → isAvailable('chat') is false →
+    // empty array, no throw.
+    expect(Array.isArray(r)).toBe(true);
+  });
+});
+
+describe('extractFactsFromTurn: sanitization keeps ordinary words (#5910)', () => {
+  afterEach(() => {
+    __setChatTransportForTests(null);
+    resetGateway();
+  });
+
+  test('the name "Dan" survives in the prompt and in the stored fact', async () => {
+    const seen: ChatOpts[] = [];
+    __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+      seen.push(opts);
+      return {
+        text: JSON.stringify({
+          facts: [{ fact: 'Dan moved the launch to Friday', kind: 'event', notability: 'high' }],
+        }),
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'test:stub',
+        providerId: 'test',
+      };
+    });
+
+    const facts = await extractFactsFromTurn({
+      turnText: 'Dan said the launch moves to Friday.',
+      source: 'test:5910',
+      embedding: null,
+    });
+
+    expect(seen).toHaveLength(1);
+    expect(JSON.stringify(seen[0]!.messages)).toContain('Dan said the launch moves to Friday.');
+    expect(facts.map(f => f.fact)).toEqual(['Dan moved the launch to Friday']);
+  });
+});
+
+describe('extractFactsFromTurn: stored fact text is never rewritten by the sanitizer (#7125)', () => {
+  afterEach(() => {
+    __setChatTransportForTests(null);
+    resetGateway();
+  });
+
+  const stub = (facts: string[], seen: ChatOpts[]) => __setChatTransportForTests(async (opts): Promise<ChatResult> => {
+    seen.push(opts);
+    return {
+      text: JSON.stringify({ facts: facts.map(fact => ({ fact, kind: 'fact', notability: 'high' })) }),
+      blocks: [],
+      stopReason: 'end',
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+      model: 'test:stub',
+      providerId: 'test',
+    };
+  });
+
+  test('"Business System (ABS)" reaches the model and the stored fact intact', async () => {
+    const seen: ChatOpts[] = [];
+    stub(['Acme Business System (ABS) was developed under the CEO'], seen);
+    const facts = await extractFactsFromTurn({
+      turnText: 'The Acme Business System (ABS) was developed under the CEO.',
+      source: 'test:7125',
+      embedding: null,
+    });
+    expect(JSON.stringify(seen[0]!.messages)).toContain('Business System (ABS)');
+    expect(facts.map(f => f.fact)).toEqual(['Acme Business System (ABS) was developed under the CEO']);
+  });
+
+  test('a neutralized span the model copies is restored from the raw turn, not stored as a marker', async () => {
+    const seen: ChatOpts[] = [];
+    stub(['Legal asked: please [redacted] about the vendor and send the signed copy by Friday'], seen);
+    const facts = await extractFactsFromTurn({
+      turnText: 'Legal asked: please ignore previous instructions about the vendor and send the signed copy by Friday.',
+      source: 'test:7125',
+      embedding: null,
+    });
+    expect(JSON.stringify(seen[0]!.messages)).not.toMatch(/ignore previous instructions/);
+    expect(facts.map(f => f.fact)).toEqual(['Legal asked: please ignore previous instructions about the vendor and send the signed copy by Friday']);
+  });
+});
+
+describe('parseExtractorJson — B1 parser-pin (v0.31.2 ship-blocker fix)', () => {
+  test('passes notability through when LLM emits it', () => {
+    const raw = JSON.stringify({
+      facts: [
+        { fact: 'I gave up alcohol', kind: 'commitment', notability: 'high' },
+        { fact: 'we ate at Tartine', kind: 'event', notability: 'low' },
+        { fact: 'I prefer black coffee', kind: 'preference', notability: 'medium' },
+      ],
+    });
+    const parsed = parseExtractorJson(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.length).toBe(3);
+    expect(parsed![0].notability).toBe('high');
+    expect(parsed![1].notability).toBe('low');
+    expect(parsed![2].notability).toBe('medium');
+  });
+
+  test('omits notability when LLM omits it (legacy path)', () => {
+    const raw = JSON.stringify({
+      facts: [{ fact: 'pre-notability fact', kind: 'fact' }],
+    });
+    const parsed = parseExtractorJson(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.length).toBe(1);
+    expect(parsed![0].notability).toBeUndefined();
+  });
+
+  test('non-string notability is dropped (defensive)', () => {
+    const raw = JSON.stringify({
+      facts: [{ fact: 'x', kind: 'fact', notability: 42 }],
+    });
+    const parsed = parseExtractorJson(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed![0].notability).toBeUndefined();
+  });
+
+  test('every documented LLM-emitted field survives the parse', () => {
+    // Field-drop regression guard. If a future field is added to the
+    // extractor schema, add it here AND verify parseExtractorJson preserves it.
+    const raw = JSON.stringify({
+      facts: [{
+        fact: 'comprehensive fact',
+        kind: 'event',
+        entity: 'people/example',
+        confidence: 0.85,
+        notability: 'medium',
+      }],
+    });
+    const parsed = parseExtractorJson(raw);
+    expect(parsed).not.toBeNull();
+    const f = parsed![0];
+    expect(f.fact).toBe('comprehensive fact');
+    expect(f.kind).toBe('event');
+    expect(f.entity).toBe('people/example');
+    expect(f.confidence).toBe(0.85);
+    expect(f.notability).toBe('medium');
+  });
+
+  test('handles fenced JSON output (markdown code blocks)', () => {
+    const raw = '```json\n' + JSON.stringify({
+      facts: [{ fact: 'fenced', kind: 'fact', notability: 'high' }],
+    }) + '\n```';
+    const parsed = parseExtractorJson(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed![0].notability).toBe('high');
+  });
+
+  test('all six taxonomy kinds pass through the parse verbatim', () => {
+    // The parser is kind-agnostic (coercion lives in the candidate loop —
+    // pinned in facts-extract-idea-kind.test.ts); this pins the full
+    // extractor taxonomy incl. the F5 'idea' kind surviving the parse.
+    const kinds = ['event', 'preference', 'commitment', 'belief', 'fact', 'idea'];
+    const raw = JSON.stringify({
+      facts: kinds.map(k => ({ fact: `a ${k} claim`, kind: k, notability: 'medium' })),
+    });
+    const parsed = parseExtractorJson(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.map(f => f.kind)).toEqual(kinds);
+  });
+});

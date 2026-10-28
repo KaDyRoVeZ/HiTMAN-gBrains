@@ -1,0 +1,1270 @@
+import type { BrainEngine, ReservedConnection } from '../engine.ts';
+import type { GBrainConfig } from '../config.ts';
+import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, syncGroup, floorPreparationAttempts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues, independentGroup, sweepSegmentStorage, yieldToEventLoop } from './journal.ts';
+import { connectionCapFailure, finishPreparationStalled, finishUnpublishedFailure, preparationAbortReason, recoverPublication, transientDatabaseFailure, type PreparedMutation } from './coordinator.ts';
+import { localHostId } from './identity.ts';
+import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
+import { preparationConfigView } from './config-snapshot.ts';
+import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, holdClaimForPublication, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
+import { claimOwnerProvablyDead, claimPhaseStamp, claimStateOf, claimTripleText, EXPIRED_PREPARING_CHARGE_SQL, enterClaimPhase, startClaimPhase, type ClaimPhaseClock, type WaitingOn } from './claim-phase.ts';
+import { DEFAULT_PREPARATION_POLICY, preparationBudgetMs, preparationKind, startPreparation, type PreparationPolicy } from './preparation-budget.ts';
+import { isTerminal, type WriteRequest } from './model.ts';
+import { ownerExceptionLogText } from './publication-failure.ts';
+import { refreshManagedFilesystemRoots } from './filesystem-guard.ts';
+import { PROJECTION_RETRY_READY_SQL, rebuildPendingPageProjections } from '../page-state/projections.ts';
+import { advanceProjectionCursor, residentProjectionCursor, residentWindowCtes } from '../page-state/projection-window.ts';
+import { rebuildPendingSegmentedProjections } from '../page-body/projection.ts';
+import { publicationConcurrency } from './pool-capacity.ts';
+import { claimedHeadOrder } from './sync-window.ts';
+import { laneClaim, laneOf, laneRoots, laneTask } from './sync-lanes.ts';
+import { runPersistenceEffects } from './effects.ts';
+import { settleNoopEmbeddingEffects, type NoopSettleCursor } from './embedding-noop-settle.ts';
+import { runCompactionPass } from './compaction-pass.ts';
+import { claimHousekeepingTurn, completeHousekeepingTurn, housekeepingIntervalMs } from './housekeeping-turn.ts';
+import { currentEmbeddingSignature } from '../embedding.ts';
+import { isPersistenceDeclaration, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
+import { isWriteErrorCode } from './types.ts';
+import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
+import { OperationError } from '../ops/contract.ts';
+import type { ReservedTransactions } from '../postgres-engine/reserved-transactions.ts';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
+import { maybeRefreshPlannerStats } from '../planner-stats.ts';
+import { refreshFenceClear } from './worktree-refresh-schema.ts';
+import { faultPoint } from './fault-points.ts';
+import { EFFECT_OWNER_KEY_SQL, releaseAbandonedClaims } from './effect-journal.ts';
+import { readWriteSwitchSnapshot, writeSwitchOn } from './switches.ts';
+import { consumerConnectionRoute, consumerStatementEngine, poolerExposureLine } from './consumer-lane.ts';
+import { isConnectionLoss } from '../retry-matcher.ts';
+import { INSPECT_OWNER_RETRY_MS } from './health.ts';
+import { lockOpenOsError } from './native-lock.ts';
+import { boundPublication, publicationLeaseMs, readPublicationCeilingMs, type PublicationBound } from './publication-deadline.ts';
+
+type PhaseObservation = { name: string; started_at: string; deadline_exceeded: boolean; attempt: number; first_conn_ms?: number };
+/** #5373: set by a task that abandons a still-running preparation after losing its claim; its root is freed only once `until` settles. */
+type RootHold = { until?: Promise<void>; retryAfterMs?: number };
+/** #6278: the budgets and switch in effect for this tick's claims; a test may pin them through `opts.preparationBudgets`. */
+export type EffectivePreparationPolicy = PreparationPolicy & { deadlines: boolean };
+/** #6278: an abandoned preparation that outlived the hard ceiling; it pins whatever its await holds until it settles. */
+export interface AbandonedPreparation { request_id: string; operation: string; step: string | null; waiting_on: WaitingOn; claimed_at: string; abandoned_at: string; outlived_ceiling_at: string }
+/** #6278: how long stop() waits on abandoned preparations after their abort before closing the engine. */
+export const ABANDONED_STOP_GRACE_MS = 5_000;
+/** GBRA-156: how long a one-shot command's shutdown waits for its housekeeping tick (`runOneShotHousekeeping`). */
+export const ONE_SHOT_HOUSEKEEPING_BOUND_MS = 5_000;
+/** #6278: abandoned preparations past the ceiling this process tolerates before it stops claiming and reports `restart_required`. */
+export const DEFAULT_ZOMBIE_CAP = 1;
+/** An effects drain running this long names itself on stderr (serve), then again at this cadence. */
+const DRAIN_NOTICE_AFTER_MS = 5_000;
+const DRAIN_NOTICE_EVERY_MS = 10_000;
+/** #6712 (convergence mode f): how long a pass whose connection died keeps trying to release its unpublished claims. */
+const CONNECTION_LOSS_RELEASE_MS = 30_000;
+/** #6650: how often a consumer looks for claims held by an owner it can prove dead. */
+export const DEAD_OWNER_SCAN_MS = 5_000;
+/** When this process started; on PGLite no claim written earlier can belong to a live owner. */
+const PROCESS_STARTED_AT = new Date(performance.timeOrigin);
+/** #5801: the phase a connection checkout belongs to, carried through its async chain. */
+const phaseScope = new AsyncLocalStorage<{ observation: PhaseObservation; startedAt: number }>();
+
+/** #5233: one-line, redacted, length-capped error text for the consumer's stderr line. */
+/** #5929: the failed receipt's message plus, for an owner exception, its class, errno and gbrain frame (this log is owner-side). */
+function failureLogText(row: WriteRequest): string | undefined {
+  const extra = ownerExceptionLogText(row.error_detail);
+  return row.error_message || extra ? `${row.error_message ?? ''}${extra}`.replaceAll('"', "'") : undefined;
+}
+
+/** #6543 F1: the identity of the request a consumer line is about; control characters, spaces and quotes become `_`. */
+function requestLogFields(row: Pick<WriteRequest, 'request_id' | 'operation' | 'source_id' | 'slug' | 'principal_kind' | 'created_at'>): string {
+  const clean = (value: unknown) => String(value ?? '').replace(/[\x00-\x20"\x7f-\x9f]/g, '_').slice(0, 200);
+  const elapsed = Date.now() - new Date(row.created_at).getTime();
+  return ` request_id=${clean(row.request_id)} operation=${clean(row.operation)} source=${clean(row.source_id)} slug=${clean(row.slug)}`
+    + ` principal=${clean(row.principal_kind)}${Number.isFinite(elapsed) ? ` elapsed_ms=${Math.max(0, elapsed)}` : ''}`;
+}
+
+function errorDetail(error: unknown): string | undefined {
+  const message = (error as { message?: unknown } | null)?.message;
+  if (typeof message !== 'string' || !message.trim()) return undefined;
+  return redactConnectionInfo(message).replace(/\s+/g, ' ').replaceAll('"', "'").trim().slice(0, 200);
+}
+
+/** #6278: the token of the stamp the previous claim left, so `claimStateOf` reads its last step. */
+function previousToken(stamp: unknown): string | null {
+  const raw = typeof stamp === 'string' ? (() => { try { return JSON.parse(stamp) as unknown; } catch { return null; } })() : stamp;
+  const token = raw && typeof raw === 'object' ? (raw as { token?: unknown }).token : undefined;
+  return typeof token === 'string' ? token : null;
+}
+
+/**
+ * #5401: one resident projection invocation takes up to this many pages and
+ * starts no new page once the budget has passed since it began. When a write is
+ * claimable at its start it takes the small batch, so the drain never delays
+ * queued writes by more than about two page rebuilds.
+ */
+export const RESIDENT_PROJECTION_PAGES = 100;
+export const RESIDENT_PROJECTION_BUDGET_MS = 250;
+export const WRITE_WAITING_PROJECTION_PAGES = 2;
+/** #7106: projection builds a consumer runs after replying (new pages over SEGMENTED_CREATE_SEAL_MAX_BYTES) at once; more wait in order. */
+export const DETACHED_PROJECTION_BUILDS = 1;
+
+export async function runResidentProjectionInvocation(engine: BrainEngine, hostId: string, excludeRoots: string[],
+  now: () => number = Date.now, signal?: AbortSignal) {
+  // Advisory and bounded by the caller's signal: a probe that cannot answer
+  // (for example behind a table lock) counts as a waiting write.
+  const writesWaiting = publicationConcurrency(engine) > 0 && await hasClaimableWrite(engine, hostId, excludeRoots, signal).catch(() => true);
+  const pages = writesWaiting ? WRITE_WAITING_PROJECTION_PAGES : RESIDENT_PROJECTION_PAGES;
+  // Wave B: queued segmented pages are rebuilt first, through their own route (one segment batch at a time).
+  const startedAt = now();
+  await rebuildPendingSegmentedProjections(engine, pages, { deadlineMs: RESIDENT_PROJECTION_BUDGET_MS, now });
+  return rebuildPendingPageProjections(engine, pages, { deadlineMs: Math.max(0, RESIDENT_PROJECTION_BUDGET_MS - (now() - startedAt)), now, retryCooldown: true,
+    window: residentProjectionCursor(engine) });
+}
+
+const PARKED_WORKER: Promise<void> = Promise.resolve();
+/** `onLane`'s answer when the lane cannot be lent: the caller runs on the pool instead. */
+export const LANE_BUSY = Symbol('gbrain.laneBusy');
+
+/** `clock` (#6278): the claim's phase clock, for `enterClaimStep` at the preparer's await boundaries. */
+export type PrepareMutation = (engine: BrainEngine, row: WriteRequest, config: GBrainConfig, signal?: AbortSignal, clock?: ClaimPhaseClock) => Promise<PreparedMutation>;
+/** #6278: a consumer phase ended by its own deadline (server cancel or client-side discard), never a storage fault. */
+export class PhaseDeadlineError extends Error {
+  readonly code = 'deadline_exceeded';
+  constructor(readonly phase: string, cause: unknown) {
+    super(`Consumer phase ${phase} did not finish within its deadline.`, { cause });
+    this.name = 'PhaseDeadlineError';
+  }
+}
+/** A server-honoured cancel (57014) keeps its SQLSTATE as before; only a connection the engine had to discard is reclassified. */
+const PHASE_DEADLINE_CODES = new Set(['CONNECTION_DESTROYED', 'CONNECTION_CLOSED']);
+function isPhaseDeadlineOutcome(error: { name?: unknown; code?: unknown } | null): boolean {
+  return !!error && typeof error.code === 'string' && PHASE_DEADLINE_CODES.has(error.code);
+}
+
+/** What `status()` always carries; the full consumer adds its sampled phases and preparations. */
+export interface ConsumerStatus extends Record<string, unknown> { accepting: boolean; active_preparations: number; active_worktrees: number; restart_required: boolean }
+/**
+ * #6317: the consumer's whole external surface, as `service.ts` and every
+ * `awaitWrite` caller use it. `PersistenceConsumer` is the full consumer;
+ * `WaiterOnlyConsumer` (consumer-election.ts) is the same surface for a
+ * process that defers to a live owner on its host and claims nothing.
+ */
+export interface PersistenceConsumerLike {
+  readonly engine: BrainEngine;
+  readonly config: GBrainConfig;
+  start(): void;
+  /** Mandatory barrier: engine.close must be sequenced AFTER this promise. */
+  stop(): Promise<void>;
+  wake(ownAdmission?: boolean): void;
+  /** One tick now (single-flight); tests drive the consumer with it. */
+  tick(afterProgress?: boolean): Promise<void>;
+  holds(id: string): boolean;
+  foregroundCompletions(worktreeId: string): number;
+  onLane<T>(run: (transaction: <R>(fn: (tx: BrainEngine) => Promise<R>) => Promise<R>) => Promise<T>): Promise<T | typeof LANE_BUSY>;
+  status(): ConsumerStatus;
+  restartRequired(): boolean;
+}
+export class PersistenceConsumer implements PersistenceConsumerLike {
+  private stopping = false;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private tickPromise: Promise<void> | undefined;
+  private wakeRequested = false;
+  private fullTickRequested = true;
+  private idleDelayMs = 0;
+  private timerDueAt = 0;
+  private nextDelayMs: number | undefined;
+  private topologyRetryAfter = new Map<string, number>();
+  private idleLane: { conn: ReservedConnection; release: () => Promise<void> } | undefined;
+  /** #6352 (P4.6): the one lane reservation in flight; concurrent callers await it instead of reserving again. */
+  private idleLanePending: Promise<ReservedConnection | undefined> | undefined;
+  private idleLaneRetryAt = 0;
+  /** Phase 4.4: a single write is publishing or admitting on the idle lane's connection. */
+  private laneInUse = false;
+  /** An idle probe is running on the lane; it is not lent until the probe settles. */
+  private probeOnLane = false;
+  private active = new Set<Promise<void>>();
+  /** #5373: preparations and renewals that outlived their claim; stop() drains them before the engine closes. */
+  private outlived = new Set<Promise<void>>();
+  /** #6278: preparations whose claim the budget (or a lost claim, with the switch on) released, by the claim start they block their root from; stop() gives them ABANDONED_STOP_GRACE_MS. */
+  private abandoned = new Map<Promise<void>, number>();
+  /** #6278: abandoned preparations past the ceiling, by request row id. */
+  private zombies = new Map<string, AbandonedPreparation>();
+  /** #6288 (P2.3): publications past the ceiling, its grace and the settle window; any one makes this owner report restart_required. */
+  private stuckPublications = new Map<string, { request_id: string; stuck_at: string }>();
+  private policy: EffectivePreparationPolicy = { ...DEFAULT_PREPARATION_POLICY, deadlines: true };
+  private activeRoots = new Set<string>();
+  /** #5984 Phase 4.5: active roots whose only task is a foreground write publishing beside this process's lane groups. */
+  private besideLanes = new Set<string>();
+  /** #5984 lanes: running lane tasks per worktree. */
+  private laneTasks = new Map<string, number>();
+  /** #6278: roots an abandoned preparation still holds, by the number of holds; nothing on them is claimed until each settles or passes the ceiling. */
+  private barredRoots = new Map<string, number>();
+  private foregroundCounts = new Map<string, number>();
+  /** #5984 Phase 4.5: the newest sequence when this process last claimed a head of each lane run (one head per foreground commit). */
+  private laneHeadSeen = new Map<string, string>();
+  /** The newest sequence when this process last claimed a sync head on each worktree, FIFO or lane (one FIFO sync head per foreground commit). */
+  private syncHeadSeen = new Map<string, string>();
+  /** #5984 Phase 4.5: roots where a foreground write this consumer claimed ahead of queued sync rows committed since it last claimed a sync row there. */
+  private owesSyncTurn = new Set<string>();
+  /** Requests this consumer claimed ahead of a queued sync row of their root. */
+  private passedSync = new Set<string>();
+  private rootRetryAfter = new Map<string, number>();
+  private deadOwnerScanAt = 0;
+  /** #6650: the dead owners (`deadOwnerClaims`) an idle tick found, handed to that tick's expired-claim reclaim. */
+  private deadOwnersSeen: string[] | null = null;
+  /** GBRA-133: the dead owners the last `deadOwnerClaims` scan found, handed to every effect pass until the next scan. */
+  private deadOwnerKeys: string[] = [];
+  private projectionWorker: Promise<unknown> | undefined;
+  private effectsWorker: Promise<void> | undefined;
+  private draining: { since: number; settled: number; ran: number; noticedAt: number } | undefined;
+  private settleCursor: NoopSettleCursor | undefined;
+  private topologyWorker: Promise<unknown> | undefined;
+  private maintenanceWorker: Promise<unknown> | undefined;
+  private nextMaintenance = 0;
+  private publishedSinceMaintenance = 0;
+  private maintenanceVolume = 50;
+  private lastScan = 0;
+  private progressWake = false;
+  /** Phase 4.3: this process admitted a write since the last tick; that tick claims before any scan. */
+  private ownAdmission = false;
+  private lastError: { code: string; at: string; phase?: string } | undefined;
+  private abort = new AbortController();
+  private phaseObservation: PhaseObservation | undefined;
+  private phaseStartedAt = 0;
+  private lastPhaseTiming: string | undefined;
+  private loopDelay: IntervalHistogram | null | undefined;
+  private unobserveCheckout: (() => void) | undefined;
+  private phaseAttempts = 0;
+  private lastLog: { key: string; at: number } | undefined;
+  private readonly requestLogs = new Map<string, number>();
+  private lastPhaseError: string | undefined;
+  private preparationAttempts = 0;
+  private preparing = new Map<string, { request_id: string; started_at: string; deadline_exceeded: boolean; attempt: number }>();
+  private executing = new Set<string>();
+  private detachedBuilds = 0;
+  private detachedQueue: Array<() => void> = [];
+  private abandonedReleased = false;
+  /** GBRA-156: when this one-shot consumer last asked for the host's housekeeping turn, and whether it holds the turn now. */
+  private housekeepingAskedAt = -Infinity;
+  private housekeepingTurn = false;
+  /** GBRA-156: this tick took the host's turn from the database; it is marked done once the upkeep it started settles. */
+  private turnClaimed = false;
+  private turnDone: Promise<void> | undefined;
+  /** GBRA-156: the one-shot shutdown tick runs housekeeping only and claims no write. */
+  private housekeepingOnly = false;
+  /** GBRA-156: ends the effect drain where `stop()` would have, before the one-shot shutdown's housekeeping tick. */
+  private effectsStop = new AbortController();
+  /** #6317: the engine the tick's own statements run through (the direct route when the engine has one; consumer-lane.ts). */
+  private readonly statements: BrainEngine;
+  private routeLogged = false;
+  readonly hostId: string;
+  constructor(readonly engine: BrainEngine, readonly config: GBrainConfig, readonly prepare: PrepareMutation,
+    private opts: { hostId?: string; concurrency?: number; pollMs?: number; idleMaxMs?: number; phaseMs?: number; preparationMs?: number;
+      /** Claim renewal cadence (default 10 s); each renewal runs under the `phaseMs` deadline. */
+      renewalIntervalMs?: number;
+      /** Claim lease length for single-request claims (default 30 s). A test seam, like the timings above. */
+      claimLeaseMs?: number; onError?: (error: unknown) => void;
+      onSettled?: (row: WriteRequest) => void;
+      /** Engine graduation drain: claim, recover and publish requests only; effect, projection, topology and maintenance workers never start. */
+      requestsOnly?: boolean;
+      /** #6278 test seam: pins budgets, ceiling, attempt limit or the switch over the brain's config. */
+      preparationBudgets?: Partial<EffectivePreparationPolicy>;
+      /** #6278: abandoned preparations past the ceiling before this process stops claiming (default DEFAULT_ZOMBIE_CAP). */
+      zombieCap?: number;
+      /** Write the long-drain progress line on stderr (serve; never a CLI command that may print --json). */
+      drainNotice?: boolean;
+      /**
+       * GBRA-156: the consumer of a one-shot command (`put`, `cli`, `import`, ...). While `waiting` says a caller in this
+       * process awaits a write, it runs only what that write's claim can depend on; housekeeping (recovery and topology scans,
+       * compaction, queue upkeep, the projection pass) waits until no write is awaited and then runs at most once per
+       * interval across this host's processes (housekeeping-turn.ts).
+       */
+      oneShot?: { waiting: () => boolean } } = {}) {
+    this.hostId = opts.hostId ?? localHostId();
+    this.statements = consumerStatementEngine(engine);
+  }
+  private get checkoutObservable(): ((listener: () => void) => () => void) | undefined {
+    const engine = this.engine as { onCheckout?: unknown };
+    return typeof engine.onCheckout === 'function' ? (engine.onCheckout as (listener: () => void) => () => void).bind(this.engine) : undefined;
+  }
+  start(): void {
+    this.stopping = false; this.abort = new AbortController(); this.effectsStop = new AbortController(); this.fullTickRequested = true; this.idleDelayMs = this.pollMs;
+    // #6317: one loud line when every round-trip of this consumer goes through a transaction-mode pooler with no direct route.
+    const exposure = poolerExposureLine(consumerConnectionRoute(this.engine));
+    if (exposure && !this.routeLogged && !this.opts.onError) { this.routeLogged = true; process.stderr.write(`${exposure}\n`); }
+    if (this.opts.requestsOnly) this.projectionWorker = this.effectsWorker = this.topologyWorker = this.maintenanceWorker = PARKED_WORKER;
+    this.schedule(0);
+  }
+  /**
+   * Work admitted by this process: tick now instead of waiting out the idle
+   * backoff. Like a completed publication, it claims at once and leaves scans
+   * to at most one pass per poll interval. `ownAdmission` (the waiter of a
+   * write this process just admitted) makes that tick skip the scans and
+   * claim directly; the scans keep their own cadence, and recovery records
+   * still block the claim (claimableWriteSql).
+   */
+  wake(ownAdmission = false): void {
+    if (ownAdmission) this.ownAdmission = true;
+    this.progressWake = true; this.idleDelayMs = this.pollMs; this.schedule(0);
+  }
+  private get pollMs(): number { return this.opts.pollMs ?? 250; }
+  private get idleMaxMs(): number { return Math.max(this.pollMs, this.opts.idleMaxMs ?? 5000); }
+  private schedule(ms: number): void {
+    if (this.stopping) return;
+    if (ms === 0) this.fullTickRequested = true;
+    if (ms === 0 && this.tickPromise) { this.wakeRequested = true; return; }
+    if (this.timer && ms !== 0 && this.timerDueAt <= Date.now() + ms) return;
+    if (this.timer) clearTimeout(this.timer);
+    this.timerDueAt = Date.now() + ms;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      const afterProgress = this.progressWake;
+      this.progressWake = false;
+      void this.tick(afterProgress).finally(() => { const next = this.nextDelayMs ?? this.pollMs; this.nextDelayMs = undefined; this.schedule(next); });
+    }, ms);
+    this.timer.unref?.();
+  }
+  /**
+   * GBRA-156: recovery, expired-claim, dead-owner and topology scans. A one-shot consumer runs them while a caller in this
+   * process awaits a write that may be blocked behind them (except on the direct claim of its own admission), and otherwise
+   * only in the host's housekeeping turn (housekeeping-turn.ts).
+   */
+  private async sweepAllowed(direct: boolean): Promise<boolean> {
+    if (!this.opts.oneShot) return true;
+    return this.opts.oneShot.waiting() ? !direct : this.housekeepingTurnNow();
+  }
+  /** GBRA-156: compaction, queue upkeep and the projection pass; a one-shot consumer runs them only in the host's housekeeping turn. */
+  private async upkeepAllowed(): Promise<boolean> {
+    return !this.opts.oneShot || !this.opts.oneShot.waiting() && this.housekeepingTurnNow();
+  }
+  /** Whether this tick holds the host's housekeeping turn; asked at most once per interval per process, granted when the claim cannot be read. */
+  private async housekeepingTurnNow(): Promise<boolean> {
+    if (this.housekeepingTurn) return true;
+    const interval = housekeepingIntervalMs();
+    if (interval === 0) return true;
+    if (Date.now() - this.housekeepingAskedAt < interval) return false;
+    this.housekeepingAskedAt = Date.now();
+    const claimed = await this.phase('housekeeping_turn', signal => claimHousekeepingTurn(this.statements, this.hostId, interval, signal)).catch(() => null);
+    this.turnClaimed ||= claimed === true;
+    this.housekeepingTurn = claimed !== false;
+    return this.housekeepingTurn;
+  }
+  /**
+   * GBRA-156: a turn this tick took is marked done once the upkeep it started (compaction, projection, topology recovery)
+   * settles; a tick that failed, or a stop that aborted that upkeep, leaves the turn to its lease.
+   */
+  private settleTurn(): void {
+    if (!this.turnClaimed) return;
+    this.turnClaimed = false;
+    const upkeep = [this.maintenanceWorker, this.projectionWorker, this.topologyWorker];
+    this.turnDone = Promise.allSettled(upkeep).then(async () => {
+      if (!this.stopping) await completeHousekeepingTurn(this.statements, this.hostId);
+    }).catch(error => this.report(error));
+  }
+  /**
+   * GBRA-156: a one-shot command's consumer, at shutdown (after the command's reply), runs one housekeeping tick when no
+   * write is awaited and the host's turn is this process's (taken now when it is due): the scans, compaction and the
+   * projection pass, no write claim and no effect drain. It waits up to `boundMs` for that upkeep, so a brain with no
+   * resident process still compacts and recovers; without the turn it returns at once.
+   */
+  async runOneShotHousekeeping(boundMs = ONE_SHOT_HOUSEKEEPING_BOUND_MS): Promise<void> {
+    if (!this.opts.oneShot || this.stopping || this.opts.oneShot.waiting()) return;
+    this.effectsStop.abort();
+    this.housekeepingOnly = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bound = new Promise<void>(resolve => { timer = setTimeout(resolve, boundMs); });
+    try {
+      await Promise.race([(async () => {
+        await this.tickPromise;
+        if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+        if (this.stopping || !await this.upkeepAllowed()) return;
+        this.fullTickRequested = true;
+        this.nextMaintenance = 0;
+        await this.tick(false);
+        await Promise.allSettled([this.maintenanceWorker, this.projectionWorker, this.topologyWorker]);
+        await this.turnDone;
+      })(), bound]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  private backoff(): number {
+    this.idleDelayMs = Math.min(Math.max(this.idleDelayMs, this.pollMs) * 2, this.idleMaxMs);
+    return this.idleDelayMs;
+  }
+  /**
+   * One statement on one connection that mirrors the selection predicates of
+   * every worker a full tick fans out to. Rows those workers would skip
+   * (retrying roots, capacity-blocked requests, failed projection jobs within
+   * their retry window, topology recoveries that just failed to finish) do not
+   * count, so unprocessable rows back off instead of pinning the fan-out.
+   */
+  private async hasWork(): Promise<boolean> {
+    const now = Date.now();
+    const excluded = [...this.activeRoots, ...this.barredRoots.keys(), ...[...this.rootRetryAfter].filter(([, at]) => at > now).map(([root]) => root)];
+    for (const [id, at] of this.topologyRetryAfter) if (at <= now) this.topologyRetryAfter.delete(id);
+    const retryingTopologies = [...this.topologyRetryAfter.keys()];
+    // On the direct route the probe needs no reserved pool lane: the direct pool is small and keeps its connections.
+    const direct = consumerConnectionRoute(this.engine).lane === 'direct';
+    // #6803: inline projection rows are probed through the resident's bounded window (projection-window.ts), which this
+    // probe advances; segmented rows keep their own probe over the whole queue, as their selector reads it.
+    const cursor = residentProjectionCursor(this.engine);
+    const params: unknown[] = [this.hostId, excluded, publicationConcurrency(this.engine) > 0, retryingTopologies, [...this.laneTasks.keys()]];
+    const windowCtes = residentWindowCtes(cursor, params, PROJECTION_RETRY_READY_SQL);
+    const [row] = await this.phase('idle_probe', async signal => this.probeQuery<{ work: boolean; projection_work: boolean; projection_last: { source_incarnation: string; slug: string } | null; high_water: string | null }>(this.laneInUse || direct ? undefined : await this.acquireIdleLane(signal), `WITH ${windowCtes},
+    pwork AS (SELECT EXISTS (SELECT 1 FROM (SELECT source_incarnation,slug FROM recent UNION ALL SELECT source_incarnation,slug FROM win) j
+      CROSS JOIN LATERAL (SELECT s.id FROM sources s WHERE s.incarnation=j.source_incarnation AND NOT s.archived OFFSET 0) s
+      CROSS JOIN LATERAL (SELECT 1 FROM (SELECT p.id FROM pages p WHERE p.source_id=s.id AND p.slug=j.slug OFFSET 0) k
+        JOIN pages p ON p.id=k.id WHERE p.deleted_at IS NULL AND p.page_kind IN ('markdown','code')) p) AS found)
+    SELECT (SELECT found FROM pwork) AS projection_work,
+      (SELECT json_build_object('source_incarnation',source_incarnation,'slug',slug) FROM win ORDER BY ord DESC LIMIT 1) AS projection_last,
+      (SELECT at FROM high_water) AS high_water, (
+      EXISTS (SELECT 1 FROM persistence_requests r LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
+        WHERE ${claimableWriteSql(foregroundPrioritySql(), '$5::text[]')}
+        AND ($3::boolean OR r.blocked_reason IS DISTINCT FROM 'writer_pool_capacity'))
+      OR EXISTS (SELECT 1 FROM persistence_requests r JOIN persistence_worktrees w ON w.id=r.worktree_id
+        WHERE w.owner_host_id=$1::uuid AND r.recovery IS NOT NULL AND NOT (r.worktree_id::text=ANY($2::text[])))
+      OR EXISTS (SELECT 1 FROM persistence_requests r WHERE r.state='running' AND r.recovery IS NULL
+        AND r.publication_started=false AND r.claim_expires_at<now()
+        AND (r.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=r.worktree_id AND w.owner_host_id=$1::uuid)))
+      OR EXISTS (SELECT 1 FROM persistence_effects e LEFT JOIN persistence_worktrees w ON w.id=e.worktree_id
+        WHERE (e.state='queued' OR e.state='running' AND e.claim_expires_at<now()) AND e.next_attempt_at<=now()
+        AND (e.worktree_id IS NULL OR w.owner_host_id=$1::uuid) AND (e.worktree_id IS NULL OR ${refreshFenceClear('e')}) AND e.recovery IS NULL
+        AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
+        AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked WHERE blocked.worktree_id=e.worktree_id AND blocked.recovery IS NOT NULL)
+        AND (e.kind='withdrawal-mirror' OR NOT EXISTS (SELECT 1 FROM persistence_effects mirror
+          WHERE mirror.request_id=e.request_id AND mirror.kind='withdrawal-mirror' AND mirror.state<>'committed')))
+      OR EXISTS (SELECT 1 FROM persistence_effects e JOIN persistence_worktrees w ON w.id=e.worktree_id
+        WHERE e.recovery IS NOT NULL AND w.owner_host_id=$1::uuid AND e.next_attempt_at<=now())
+      OR (SELECT found FROM pwork)
+      OR EXISTS (SELECT 1 FROM page_projection_jobs j JOIN sources s ON s.incarnation=j.source_incarnation AND NOT s.archived
+        JOIN pages p ON p.source_id=s.id AND p.slug=j.slug AND p.deleted_at IS NULL AND p.body_storage='segmented'
+        WHERE ${PROJECTION_RETRY_READY_SQL})
+      OR EXISTS (SELECT 1 FROM persistence_topology_changes c
+        JOIN persistence_worktrees w ON w.id=(c.recovery->>'worktreeId')::uuid
+        WHERE c.recovery IS NOT NULL AND w.owner_host_id=$1::uuid AND NOT (c.id::text=ANY($4::text[])))
+    ) AS work`, params, signal));
+    // A window holding work stays put, so the tick it wakes reads the same rows.
+    advanceProjectionCursor(cursor, row?.projection_work ? null : row?.projection_last, row?.high_water);
+    return row?.work === true;
+  }
+  /**
+   * postgres.js hands out idle connections first-in-first-out, so a pooled
+   * probe every few seconds would keep ceil(idle_timeout / interval) sockets
+   * alive. Idle probes therefore share one reserved connection; the rest of
+   * the pool drains through idle_timeout. Pools too small to spare a long-hold
+   * permit fall back to pooled probes. The lane always comes from the ordinary
+   * pool (#5233); with a direct/session route configured the probe does not
+   * reserve a lane at all and runs on that route instead (#6317,
+   * consumer-lane.ts), so the whole ordinary pool drains.
+   */
+  private async acquireIdleLane(signal?: AbortSignal, forPublication = false): Promise<ReservedConnection | undefined> {
+    if (this.idleLane) return this.idleLane.conn;
+    if (!this.idleLanePending) {
+      if (this.engine.kind !== 'postgres' || this.stopping || Date.now() < this.idleLaneRetryAt) return undefined;
+      const pool = (this.engine as { getPoolDiagnostics?: () => { poolMax: number | null; tracked: Record<string, number> } | null }).getPoolDiagnostics?.();
+      // Only reserve from an otherwise idle pool: a saturated pool falls back to a cancellable pooled probe.
+      // A single write's publication (Phase 4.4) also reserves it while at least two other connections stay free.
+      const inUse = Object.values(pool?.tracked ?? {}).reduce((sum, count) => sum + Math.max(0, count), 0);
+      if (!pool?.poolMax || pool.poolMax < 3 || (forPublication ? pool.poolMax - inUse < 3 : inUse > 0)) return undefined;
+      // #6352 (P4.6) single flight: a second caller (the probe beside a single write's publication) joins the one
+      // reservation in flight instead of reserving a second connection nobody would track or release.
+      this.idleLanePending = this.reserveIdleLane().finally(() => { this.idleLanePending = undefined; });
+    }
+    const aborted = Promise.withResolvers<undefined>();
+    const onAbort = () => aborted.resolve(undefined);
+    if (signal?.aborted) onAbort(); else signal?.addEventListener('abort', onAbort, { once: true });
+    // An aborted caller falls back to a pooled probe; the reservation stays tracked as the lane and is released by
+    // releaseIdleLane (or stop), never left to a resolver nobody holds.
+    try { return await Promise.race([this.idleLanePending, aborted.promise]); }
+    finally { signal?.removeEventListener('abort', onAbort); }
+  }
+  /** Reserves the lane; the lane is tracked the moment the connection arrives, or released at once when the consumer is stopping. */
+  private async reserveIdleLane(): Promise<ReservedConnection | undefined> {
+    const held = Promise.withResolvers<void>();
+    const reserved = Promise.withResolvers<ReservedConnection>();
+    const done = this.engine.withReservedConnection(async conn => { reserved.resolve(conn); await held.promise; }, { route: 'ordinary' })
+      .catch(error => { reserved.reject(error); });
+    try {
+      const conn = await reserved.promise;
+      const lane = { conn, release: async () => { held.resolve(); await done; } };
+      if (this.stopping) { await lane.release(); return undefined; }
+      this.idleLane = lane;
+      return conn;
+    } catch {
+      this.idleLaneRetryAt = Date.now() + 60_000;
+      return undefined;
+    }
+  }
+  private async releaseIdleLane(): Promise<void> {
+    if (this.laneInUse) return;
+    await this.idleLanePending;
+    const lane = this.idleLane;
+    this.idleLane = undefined;
+    await lane?.release();
+  }
+  /**
+   * Phase 4.4: publishes a single write. On Postgres, with the
+   * `single_write_group` switch on, its group-of-one transaction runs on the
+   * idle lane's reserved connection (taken while at least two other pool
+   * connections stay free, and kept across single-write ticks), so its prepared
+   * statements survive the pool's idle timeout and stay warm from one
+   * foreground write to the next; without the lane it publishes on the pool.
+   */
+  private async publishSingle(row: WriteRequest, prepared: PreparedMutation): Promise<{ done: WriteRequest; settled: boolean }> {
+    // A waiter learns of the commit before the recovery record is cleared (the clear still runs under the worktree lock).
+    // #7106: a new page whose projection is built after commit settles at commit; the build runs through the bounded
+    // detached-build queue and holds neither the reply nor the source's next write.
+    let settled = false;
+    const hooks = { committed: (rows: WriteRequest[]) => { settled = true; this.settled(rows[0]!); },
+      projectionPending: (done: WriteRequest, afterCommit: () => Promise<void>) => { settled = true; this.settled(done); this.detachBuild(afterCommit); } };
+    const published = await this.onLane(transaction => publishSingleWrite(this.engine, row, prepared, this.hostId, hooks, transaction));
+    const done = published === LANE_BUSY ? await publishSingleWrite(this.engine, row, prepared, this.hostId, hooks) : published;
+    return { done, settled: settled && done.state === 'committed' };
+  }
+  /**
+   * Phase 4.4: runs `run` with transactions on the warm lane connection (the
+   * single-write publication's, also lent to this process's own single-write
+   * admission), or returns LANE_BUSY without running it when the lane is in
+   * use, unavailable, or the `single_write_group` switch is off. A failure
+   * that may have broken the connection (not a refusal or an SQL error the
+   * transaction rolled back) gives the lane up for a minute.
+   */
+  async onLane<T>(run: (transaction: <R>(fn: (tx: BrainEngine) => Promise<R>) => Promise<R>) => Promise<T>): Promise<T | typeof LANE_BUSY> {
+    if (this.engine.kind !== 'postgres' || this.stopping || this.laneInUse || !await writeSwitchOn(this.engine, 'single_write_group').catch(() => true)) return LANE_BUSY;
+    const conn = await this.acquireIdleLane(undefined, true) as (ReservedConnection & Partial<ReservedTransactions>) | undefined;
+    if (!conn?.transaction || this.laneInUse || this.probeOnLane || this.idleLane?.conn !== conn) return LANE_BUSY;
+    this.laneInUse = true;
+    // #6355: a lent transaction that lost its session says the lane's backend is gone (a pooler or failover closed it);
+    // the lane is given up whatever `run` makes of the error (admission re-runs on the pool and may still succeed).
+    let lost = false;
+    const lend = async <R>(fn: (tx: BrainEngine) => Promise<R>): Promise<R> => {
+      // GBRA-156: every lent body (single-write admission and publication, no lane order) opens with the declaration.
+      try { return await conn.transaction!(fn, { pipelineFirst: isPersistenceDeclaration }); }
+      catch (error) { if (isConnectionLoss(error)) lost = true; throw error; }
+    };
+    try {
+      return await run(lend);
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (!lost && !(error instanceof OperationError) && !(typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code))) lost = true;
+      throw error;
+    } finally {
+      this.laneInUse = false;
+      if (lost && this.idleLane?.conn === conn) { await this.releaseIdleLane(); this.idleLaneRetryAt = Date.now() + 60_000; }
+    }
+  }
+  private async probeQuery<T>(lane: ReservedConnection | undefined, sql: string, params: unknown[], signal?: AbortSignal): Promise<T[]> {
+    if (!lane) return this.statements.executeRaw<T>(sql, params, { signal });
+    if (this.laneInUse) return this.statements.executeRaw<T>(sql, params, { signal });
+    this.probeOnLane = true;
+    const query = lane.executeRaw<T>(sql, params);
+    void query.then(() => { this.probeOnLane = false; }, () => { this.probeOnLane = false; });
+    if (!signal) return query;
+    const aborted = Promise.withResolvers<never>();
+    const onAbort = () => aborted.reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
+    if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
+    try { return await Promise.race([query, aborted.promise]); }
+    catch (error) {
+      // The reserved query cannot be cancelled: stop using the lane now, return it to the pool once the query settles.
+      const current = this.idleLane?.conn === lane ? this.idleLane : undefined;
+      if (current) this.idleLane = undefined;
+      this.idleLaneRetryAt = Date.now() + 60_000;
+      void query.then(() => current?.release(), () => current?.release());
+      throw error;
+    } finally { signal.removeEventListener('abort', onAbort); }
+  }
+  /**
+   * `afterProgress` marks the wake-up that follows a completed publication
+   * or a local admission. Those ticks claim the next write at once and leave
+   * root refresh and recovery/expiry/topology scans to at most one pass per
+   * poll interval, the same bound an idle owner has.
+   */
+  async tick(afterProgress = false): Promise<void> {
+    if (this.tickPromise) return this.tickPromise;
+    this.tickPromise = this.doTick(afterProgress).then(() => this.settleTurn(), error => { this.turnClaimed = false; this.report(error); }).finally(() => {
+      this.tickPromise = undefined;
+      if (this.wakeRequested) { this.wakeRequested = false; this.schedule(0); }
+    });
+    return this.tickPromise;
+  }
+  private async doTick(afterProgress: boolean): Promise<void> {
+    if (this.stopping) return;
+    if (!this.housekeepingOnly) this.housekeepingTurn = false;
+    const requested = this.fullTickRequested;
+    this.fullTickRequested = false;
+    if (!requested) {
+      let work: boolean;
+      try { work = await this.hasWork(); }
+      catch (error) {
+        if (this.stopping) throw error;
+        // One failure per tick: an unknown answer runs the full fan-out on the next tick.
+        this.report(error);
+        this.fullTickRequested = true;
+        this.nextDelayMs = this.backoff();
+        return;
+      }
+      if (this.stopping) return;
+      // #6650: the idle probe sees only lapsed claims; a live-leased claim of a dead owner is looked for here, on its own cadence.
+      if (!work && await this.sweepAllowed(false)) this.deadOwnersSeen = await this.phase('dead_owner_claims', signal => this.deadOwnerClaims(signal, true));
+      if (!work && !this.deadOwnersSeen?.length) {
+        if (this.active.size > 0) { this.nextDelayMs = this.pollMs; return; }
+        this.nextDelayMs = this.backoff();
+        if (!this.maintenanceWorker && Date.now() >= this.nextMaintenance && await this.upkeepAllowed()) {
+          this.nextMaintenance = Date.now() + 300_000;
+          await this.phase('refresh_roots', signal => refreshManagedFilesystemRoots(this.engine,
+            this.engine.kind === 'pglite' ? this.config.database_path : undefined, signal));
+          // F4b: idle maintenance also refreshes stale PGLite planner statistics (a no-op on Postgres).
+          this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice }).then(yieldToEventLoop).then(() => maybeRefreshPlannerStats(this.engine, 'idle'))
+            .catch(error => this.report(error)).finally(() => { this.maintenanceWorker = undefined; });
+        }
+        return;
+      }
+    }
+    // Lane runs size themselves to the pool's long-hold budget; a single write keeps its warm lane.
+    // The switches are read under the tick's phase deadline, so a saturated pool cannot hold the tick.
+    const fast = await this.phase('switches', signal => readWriteSwitchSnapshot(this.statements, { signal }))
+      .then(snapshot => {
+        this.policy = { ...snapshot.preparation, deadlines: snapshot.switches.preparation_deadlines, ...this.opts.preparationBudgets };
+        return snapshot.switches.single_write_group;
+      }, async error => { await this.releaseIdleLane(); throw error; });
+    if (laneRoots().length || this.engine.kind !== 'postgres' || !fast) await this.releaseIdleLane();
+    this.idleDelayMs = this.pollMs;
+    this.nextDelayMs = this.pollMs;
+    const direct = afterProgress && this.ownAdmission && fast;
+    this.ownAdmission = false;
+    const scan = !direct && (!afterProgress || Date.now() - this.lastScan >= this.pollMs) && await this.sweepAllowed(direct);
+    const upkeep = await this.upkeepAllowed();
+    if (scan) {
+      this.lastScan = Date.now();
+      await this.phase('refresh_roots', signal => refreshManagedFilesystemRoots(this.engine,
+        this.engine.kind === 'pglite' ? this.config.database_path : undefined, signal));
+    }
+    if (this.stopping) return;
+    if (scan && !this.topologyWorker) this.topologyWorker = import('./topology-recovery.ts')
+      .then(({ recoverSourceTopologies }) => recoverSourceTopologies(this.engine, { hostId: this.hostId, limit: 2,
+        onAttempt: (id, recovered) => { if (recovered) this.topologyRetryAfter.delete(id); else this.topologyRetryAfter.set(id, Date.now() + 30_000); } }))
+      .catch(error => this.report(error)).finally(() => { this.topologyWorker = undefined; });
+    if (!this.effectsWorker && !this.housekeepingOnly) this.effectsWorker = this.drainEffects().catch(error => this.report(error))
+      .finally(() => { this.effectsWorker = undefined; });
+    // Queue upkeep also follows publication volume, like autovacuum's scale
+    // factor, so a busy owner never plans against a much smaller queue.
+    if (upkeep && !this.maintenanceWorker && (Date.now() >= this.nextMaintenance || this.publishedSinceMaintenance >= this.maintenanceVolume)) {
+      this.nextMaintenance = Date.now() + 60_000;
+      this.publishedSinceMaintenance = 0;
+      this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice })
+        .then(yieldToEventLoop).then(() => sweepSegmentStorage(this.engine).catch(error => this.report(error)))
+        .then(yieldToEventLoop).then(() => vacuumPersistenceQueues(this.engine))
+        .then(rows => { this.maintenanceVolume = 50 + Math.ceil(rows * 0.2); }).catch(error => this.report(error))
+        .finally(() => { this.maintenanceWorker = undefined; });
+    }
+    if (upkeep && !this.projectionWorker) this.projectionWorker = runResidentProjectionInvocation(this.engine, this.hostId,
+      [...this.activeRoots, ...this.rootRetryAfter.keys()], Date.now, this.engine.kind === 'postgres'
+        ? AbortSignal.any([this.abort.signal, AbortSignal.timeout(this.opts.phaseMs ?? 5000)]) : undefined)
+      .catch(error => this.report(error)).finally(() => { this.projectionWorker = undefined; });
+    // Recover only our owner roots. Kernel exclusion, not elapsed heartbeat,
+    // proves that a previous process can no longer be publishing this root.
+    if (scan && this.engine.kind === 'pglite' && !this.abandonedReleased) {
+      await this.phase('abandoned_claims', () => releaseAbandonedClaims(this.engine, PROCESS_STARTED_AT, this.policy.deadlines));
+      this.abandonedReleased = true;
+    }
+    const now = Date.now();
+    for (const [root, retryAt] of this.rootRetryAfter) if (retryAt <= now) this.rootRetryAfter.delete(root);
+    if (scan) {
+      const excluded = [...this.activeRoots, ...this.rootRetryAfter.keys()];
+      const recovery = await this.phase('recovery_scan', signal => this.statements.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
+        JOIN persistence_worktrees w ON w.id=r.worktree_id
+        WHERE w.owner_host_id=$1::uuid AND r.recovery IS NOT NULL AND NOT(r.worktree_id::text=ANY($2::text[]))
+        AND NOT EXISTS (SELECT 1 FROM persistence_requests earlier WHERE earlier.worktree_id=r.worktree_id
+          AND earlier.recovery IS NOT NULL AND earlier.sequence<r.sequence)
+        ORDER BY r.updated_at,r.sequence LIMIT 16`, [this.hostId, excluded], { signal }));
+      for (const row of recovery) {
+        const root = row.worktree_id!;
+        // Always skip at least the next scheduled poll for an unresolved root.
+        // This preserves its FIFO head while allowing the next root into LIMIT 16.
+        const delay = Math.max(1000, (this.opts.pollMs ?? 250) * 2);
+        this.rootRetryAfter.set(root, Date.now() + delay);
+        try {
+          const recovered = await this.phase('recovery', () => recoverPublication(this.engine, row.id, this.hostId));
+          if (isTerminal(recovered)) this.settled(recovered);
+          if (!recovered.recovery) this.rootRetryAfter.delete(root);
+          else if (recovered.blocked_reason === 'unexpected_file_bytes') this.rootRetryAfter.set(root, Date.now() + Math.max(delay, 30_000));
+        } catch (error) {
+          this.rootRetryAfter.set(root, Date.now() + Math.max(delay, 30_000));
+          this.report(error);
+        }
+      }
+      // #6650: a claim whose stamped owner this process can prove dead is reclaimed now, not when its lease
+      // (up to `publicationLeaseMs`) runs out; the statement below takes it with the same guards as an expired one.
+      const deadOwners = this.deadOwnersSeen?.length ? this.deadOwnersSeen : await this.phase('dead_owner_claims', signal => this.deadOwnerClaims(signal));
+      this.deadOwnersSeen = null;
+      // #6278: a claim that expired while its owner was preparing (the kill case) counts one preparation attempt.
+      await this.phase('expired_claims', signal => this.statements.executeRaw(`WITH expired AS (
+        SELECT r.id FROM persistence_requests r WHERE r.state='running' AND r.recovery IS NULL
+        AND r.publication_started=false AND ${PERSISTENCE_PROTOCOL_PREDICATE}
+        AND (r.claim_expires_at<now() OR r.claim_phase->>'token'=r.execution_token::text
+          AND concat_ws(':',r.claim_phase->'owner'->>'pid',r.claim_phase->'owner'->>'nonce',r.claim_phase->'owner'->>'start')=ANY($3::text[]))
+        AND (r.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=r.worktree_id AND w.owner_host_id=$1::uuid))
+        ORDER BY r.sequence LIMIT 100 FOR UPDATE OF r SKIP LOCKED)
+        UPDATE persistence_requests r SET state='queued',execution_token=NULL,claim_expires_at=NULL,
+          preparation_attempts=r.preparation_attempts+CASE WHEN $2::boolean THEN ${EXPIRED_PREPARING_CHARGE_SQL('r')} ELSE 0 END
+        FROM expired WHERE r.id=expired.id`, [this.hostId, this.policy.deadlines, deadOwners], { signal }));
+    }
+    if (this.housekeepingOnly) return;
+    if (publicationConcurrency(this.engine) === 0) {
+      await this.phase('capacity', signal => this.statements.executeRaw(`UPDATE persistence_requests SET blocked_reason='writer_pool_capacity'
+        WHERE state='queued' AND blocked_reason IS DISTINCT FROM 'writer_pool_capacity' AND ${PERSISTENCE_PROTOCOL_PREDICATE}`, undefined, { signal }));
+      return;
+    }
+    // #6278: at the zombie cap this process claims nothing more; status() says restart_required and the drain ends.
+    if (this.restartRequired()) return;
+    const concurrency = this.opts.concurrency ?? 2;
+    // #5984: on a root whose lane groups run here, only a foreground write is claimed, to publish beside them.
+    const laneRootKeys = [...this.laneTasks.keys()];
+    const attemptedRoots = new Set([...this.activeRoots, ...this.barredRoots.keys(), ...this.rootRetryAfter.keys()]);
+    while (!this.stopping && this.active.size - this.laneTaskCount() < concurrency) {
+      const claimed = laneClaim();
+      try {
+        await faultPoint('consumer:claiming');
+        // A root where lanes run here owes the sync side no FIFO turn: the write publishes beside its groups.
+        const row = await this.phase('claim', () => claimNextWrite(this.engine, this.hostId, this.opts.claimLeaseMs ?? 30_000, [...attemptedRoots],
+          [...this.owesSyncTurn].filter(key => !laneRootKeys.includes(key)), laneRootKeys.filter(key => !attemptedRoots.has(key)), Object.fromEntries(this.syncHeadSeen)));
+        if (!row) break;
+        if (row.worktree_id && row.seen_sequence) this.syncHeadSeen.set(row.worktree_id, row.seen_sequence);
+        if (String(row.intent?.kind ?? '').startsWith('managed_sync_')) this.owesSyncTurn.delete(row.worktree_id ?? `db:${row.source_incarnation}`);
+        else if (row.passed_sync) this.passedSync.add(row.id);
+        if (this.stopping) { await releaseUnpublishedClaim(this.statements, row, 'consumer_stopping'); break; }
+        const key = row.worktree_id ?? `db:${row.source_incarnation}`;
+        attemptedRoots.add(key);
+        // #5984 lanes: the FIFO head of an open lane run runs as the run's first lane.
+        if (laneOf(row)) { this.startLaneTask(row, key); continue; }
+        if (this.activeRoots.has(key)) { await releaseUnpublishedClaim(this.statements, row, 'writer_busy'); break; }
+        this.activeRoots.add(key);
+        // Lane heads keep being claimed beside a foreground write on a lane root (it joins their lease).
+        if (laneRootKeys.includes(key)) this.besideLanes.add(key);
+        this.track(row, () => { this.activeRoots.delete(key); this.besideLanes.delete(key); }, key);
+      } finally { claimed(); }
+    }
+    await this.claimLanes();
+  }
+  /**
+   * #6650: the owners (`pid:nonce:start`) of unexpired running claims on this host's roots that this process can prove dead
+   * (`claimOwnerProvablyDead`: same boot and pid namespace, pid gone or reused). The reclaim takes a claim only while
+   * its stamp of the current token still names such an owner, so a claim re-taken since this scan (a new token and
+   * stamp) is never touched. Only claims the expired-claim reclaim may take at all qualify: no recovery record and no
+   * publication started, so the dead owner's publication transaction either committed (the row is no longer
+   * `running`) or rolled back with its connection. A live owner, however slow, and an owner on another host or
+   * container keep their full lease. Postgres only, at most every `DEAD_OWNER_SCAN_MS`: PGLite admits one process
+   * and releases abandoned claims at start. An `idle` scan runs where the idle probe does (its reserved lane), so an
+   * idle pool still drains. GBRA-133: the owners of running effect claims (no recovery record, stamped `claim_owner` of
+   * their current token) are read in the same statement; the effect passes until the next scan claim their effects.
+   */
+  private async deadOwnerClaims(signal?: AbortSignal, idle = false): Promise<string[]> {
+    if (this.engine.kind !== 'postgres' || Date.now() - this.deadOwnerScanAt < DEAD_OWNER_SCAN_MS) return [];
+    this.deadOwnerScanAt = Date.now();
+    const lane = idle && !this.laneInUse && consumerConnectionRoute(this.engine).lane !== 'direct' ? await this.acquireIdleLane(signal) : undefined;
+    const owners = await this.probeQuery<{ key: string; owner: string }>(lane, `SELECT DISTINCT key,owner FROM (SELECT
+        concat_ws(':',r.claim_phase->'owner'->>'pid',r.claim_phase->'owner'->>'nonce',r.claim_phase->'owner'->>'start') AS key,(r.claim_phase->'owner')::text AS owner
+      FROM persistence_requests r
+      WHERE r.state='running' AND r.recovery IS NULL AND r.publication_started=false AND r.claim_expires_at>=now()
+        AND r.claim_phase->>'token'=r.execution_token::text AND r.claim_phase->'owner'->>'boot_id' IS NOT NULL
+        AND (r.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=r.worktree_id AND w.owner_host_id=$1::uuid))
+      UNION ALL SELECT ${EFFECT_OWNER_KEY_SQL('e')},(e.claim_owner->'owner')::text
+      FROM persistence_effects e
+      WHERE e.state='running' AND e.recovery IS NULL AND e.claim_expires_at>=now()
+        AND e.claim_owner->>'token'=e.execution_token::text AND e.claim_owner->'owner'->>'boot_id' IS NOT NULL
+        AND (e.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=e.worktree_id AND w.owner_host_id=$1::uuid))) o
+      LIMIT 100`, [this.hostId], signal);
+    return this.deadOwnerKeys = owners.filter(row => claimOwnerProvablyDead({ owner: JSON.parse(row.owner) })).map(row => row.key);
+  }
+  /** #5984 lanes: claims the next group heads of every open lane run in this process, up to its effective lane count. */
+  private async claimLanes(): Promise<void> {
+    for (const { worktreeId, run, capacity } of laneRoots()) {
+      if (this.rootRetryAfter.has(worktreeId) || this.barredRoots.has(worktreeId) || this.activeRoots.has(worktreeId) && !this.besideLanes.has(worktreeId)) continue;
+      while (!this.stopping && (this.laneTasks.get(worktreeId) ?? 0) < capacity) {
+        const claimed = laneClaim();
+        try {
+          await faultPoint('consumer:claiming');
+          const row = await this.phase('claim', () => claimNextLaneHead(this.engine, this.hostId, worktreeId, run, undefined, this.laneHeadSeen.get(run) ?? null));
+          if (!row) break;
+          this.laneHeadSeen.set(run, row.seen_sequence);
+          this.syncHeadSeen.set(worktreeId, row.seen_sequence);
+          this.owesSyncTurn.delete(worktreeId);
+          this.startLaneTask(row, worktreeId);
+        } finally { claimed(); }
+      }
+    }
+  }
+  private laneTaskCount(): number { let count = 0; for (const n of this.laneTasks.values()) count += n; return count; }
+  private startLaneTask(row: WriteRequest, key: string): void {
+    this.laneTasks.set(key, (this.laneTasks.get(key) ?? 0) + 1);
+    const state = laneOf(row);
+    const release = state ? laneTask(state) : () => undefined;
+    this.track(row, () => { release(); const n = (this.laneTasks.get(key) ?? 1) - 1; if (n > 0) this.laneTasks.set(key, n); else this.laneTasks.delete(key); }, key);
+  }
+  private track(row: WriteRequest, done: () => void, key: string): void {
+    let progressed = false;
+    const root: RootHold = {};
+    const task = this.executeOrGroup(row, root).then(result => { progressed = result; }).catch(error => this.report(error, row)).finally(() => {
+      if (!progressed) this.rootRetryAfter.set(key, Date.now() + (root.retryAfterMs ?? this.opts.pollMs ?? 250));
+      else { this.progressWake = true; this.publishedSinceMaintenance++; }
+      this.active.delete(task);
+      // The slot is free now; the root waits for an abandoned preparation so nothing on it overtakes that work. A lane task frees
+      // only its own lane slot, so the root is barred from claims too: another lane would claim the abandoned member again.
+      if (root.until) {
+        this.barredRoots.set(key, (this.barredRoots.get(key) ?? 0) + 1);
+        void root.until.then(() => {
+          const holds = (this.barredRoots.get(key) ?? 1) - 1;
+          if (holds > 0) this.barredRoots.set(key, holds); else this.barredRoots.delete(key);
+          done(); this.schedule(0);
+        });
+      } else done();
+      this.schedule(progressed ? 0 : this.opts.pollMs ?? 250);
+    });
+    this.active.add(task);
+  }
+  /**
+   * Effects keep pace with publication: full batches continue without waiting for the next tick. No-op embedding
+   * effects settle in bulk first. Each batch yields to the event loop, so a long drain never holds requests back
+   * (PGLite queries resolve as one microtask chain that would otherwise starve stdin).
+   */
+  private async drainEffects(): Promise<void> {
+    const limit = 20;
+    const signature = currentEmbeddingSignature();
+    const drain = this.draining = { since: Date.now(), settled: 0, ran: 0, noticedAt: 0 };
+    try {
+      const signal = AbortSignal.any([this.abort.signal, this.effectsStop.signal]);
+      for (let done = !signature; !done && !signal.aborted;) {
+        const pass = await settleNoopEmbeddingEffects(this.engine, this.hostId, signature!, this.settleCursor);
+        this.settleCursor = pass.cursor;
+        done = pass.done;
+        drain.settled += pass.settled;
+        this.drainNotice(drain);
+        if (!done) await yieldToEventLoop();
+      }
+      for (let ran = limit; ran >= limit && !signal.aborted;) {
+        ran = await runPersistenceEffects(this.engine, this.config, { hostId: this.hostId, limit, signal, deadOwners: this.deadOwnerKeys });
+        drain.ran += ran;
+        this.drainNotice(drain);
+        if (ran >= limit) await yieldToEventLoop();
+      }
+    } finally {
+      this.draining = undefined;
+      if (drain.noticedAt) this.drainNotice(drain, true);
+    }
+  }
+  /** A drain past DRAIN_NOTICE_AFTER_MS names itself on stderr every DRAIN_NOTICE_EVERY_MS, and once when it ends (serve only). */
+  private drainNotice(drain: NonNullable<PersistenceConsumer['draining']>, done = false): void {
+    const now = Date.now();
+    if (!this.opts.drainNotice || (!done && (now - drain.since < DRAIN_NOTICE_AFTER_MS || now - drain.noticedAt < DRAIN_NOTICE_EVERY_MS))) return;
+    drain.noticedAt = now;
+    process.stderr.write(`[persistence] phase=effects_drain state=${done ? 'done' : 'running'} settled_noop_embeddings=${drain.settled} ran=${drain.ran}`
+      + ` elapsed_s=${Math.round((now - drain.since) / 1000)}; requests are served while it drains; status: gbrain sources writer status --json\n`);
+  }
+  foregroundCompletions(worktreeId: string): number { return this.foregroundCounts.get(worktreeId) ?? 0; }
+  /** CEO-A7: this process holds the claim, so its outcome reaches waiters through `onSettled` without a read. */
+  holds(id: string): boolean { return this.executing.has(id); }
+  private settled(row: WriteRequest): boolean {
+    // #5984 Phase 4.5: after a foreground write that went ahead of queued sync rows commits, this consumer's next
+    // claim on its root is plain FIFO, so a stream of writes cannot starve the sync side.
+    if (isTerminal(row) && this.passedSync.delete(row.id) && row.state === 'committed') this.owesSyncTurn.add(row.worktree_id ?? `db:${row.source_incarnation}`);
+    try { this.opts.onSettled?.(row); } catch (error) { this.report(error); }
+    return isTerminal(row);
+  }
+  /** #6278: abandoned preparations past the ceiling have reached this process's cap; it claims nothing more until it restarts. */
+  restartRequired(): boolean { return this.zombies.size >= (this.opts.zombieCap ?? DEFAULT_ZOMBIE_CAP) || this.stuckPublications.size > 0; }
+  /** #6288 (P2.3): the consumer's side of `boundPublication`: the claim stamp at the ceiling, restart_required past it. */
+  private publicationBound(row: WriteRequest, ceilingMs: number, clock?: ClaimPhaseClock): PublicationBound {
+    return { ceilingMs,
+      onOverdue: () => {
+        if (clock) clock.waitingOn = 'publication_deadline';
+        this.log('publication', 'publication_deadline', `request ${row.request_id}: publishing past the ${ceilingMs} ms ceiling; on Postgres its transaction-local timeouts end it only if the server sees the transaction idle, not when the client connection is wedged`, '', row);
+      },
+      onStuck: settled => {
+        this.stuckPublications.set(row.id, { request_id: row.request_id, stuck_at: new Date().toISOString() });
+        void settled.then(() => { this.stuckPublications.delete(row.id); });
+        this.log('publication', 'restart_required', `request ${row.request_id}: the publication has not settled past the ceiling and its grace; restart this process (its root stays held until then)`, '', row);
+      } };
+  }
+  status() {
+    const drain = this.draining;
+    const { deadlines, syncMs, maintenanceMs, ceilingMs, maxAttempts, transientRetries } = this.policy;
+    return { accepting: !this.stopping, active_preparations: this.active.size, active_worktrees: this.activeRoots.size,
+      sampled_at: new Date().toISOString(), observation_scope: 'current_process_reset_on_restart',
+      preparation_attempts: this.preparationAttempts,
+      phase: this.phaseObservation ? { ...this.phaseObservation, ...this.phaseTiming(this.phaseObservation, this.phaseStartedAt) } : null,
+      preparations: [...this.preparing.values()].map(value => ({ ...value })),
+      // #6278: deadlines in effect, preparations whose claim was released while they still ran, and the zombies past the ceiling.
+      preparation_policy: { deadlines, sync_preparation_ms: syncMs, maintenance_preparation_ms: maintenanceMs, preparation_ceiling_ms: ceilingMs, max_preparation_attempts: maxAttempts, max_transient_retries: transientRetries },
+      abandoned_preparations: this.abandoned.size,
+      outlived_ceiling: [...this.zombies.values()].map(value => ({ ...value })),
+      restart_required: this.restartRequired(),
+      stuck_publications: [...this.stuckPublications.values()].map(value => ({ ...value })),
+      // The effects drain in progress: since when, no-op embedding effects settled in bulk, effects run.
+      ...(drain ? { draining: { since: new Date(drain.since).toISOString(), settled_noop_embeddings: drain.settled, ran: drain.ran } } : {}),
+      // #6317: which connection this consumer's statements take, and whether the ordinary pool is a transaction-mode pooler.
+      connection: consumerConnectionRoute(this.engine),
+      ...(this.lastError ? { last_error: { ...this.lastError } } : {}) };
+  }
+  /**
+   * #5801: connection-wait and event-loop evidence for a phase. A checkout is
+   * observed only after a connection was obtained inside this phase's async
+   * chain; until then the phase reports how long it has been waiting.
+   */
+  private phaseTiming(observation: PhaseObservation, startedAt: number): { checkout?: 'not_observed'; conn_wait_ms?: number; loop_lag_ms?: number } {
+    let lag: number | undefined;
+    try { if (this.loopDelay) lag = Math.round(this.loopDelay.max / 1e6); } catch { /* fail-open */ }
+    return {
+      ...(this.unobserveCheckout && observation.first_conn_ms === undefined
+        ? { checkout: 'not_observed' as const, conn_wait_ms: Math.round(performance.now() - startedAt) } : {}),
+      ...(lag === undefined ? {} : { loop_lag_ms: lag }),
+    };
+  }
+  private timingText(observation: PhaseObservation, startedAt: number): string {
+    const fields: Record<string, unknown> = { first_conn_ms: observation.first_conn_ms, ...this.phaseTiming(observation, startedAt) };
+    return Object.entries(fields).filter(([, value]) => value !== undefined).map(([key, value]) => ` ${key}=${value}`).join('');
+  }
+  private async phase<T>(name: string, run: (signal?: AbortSignal) => Promise<T>): Promise<T> {
+    const observation: PhaseObservation = { name, started_at: new Date().toISOString(), deadline_exceeded: false, attempt: ++this.phaseAttempts };
+    const startedAt = performance.now();
+    this.phaseObservation = observation;
+    this.phaseStartedAt = startedAt;
+    this.unobserveCheckout ??= this.checkoutObservable?.(() => {
+      const scope = phaseScope.getStore();
+      if (scope && scope.observation.first_conn_ms === undefined) scope.observation.first_conn_ms = Math.round(performance.now() - scope.startedAt);
+    });
+    if (this.loopDelay === undefined) {
+      try { this.loopDelay = monitorEventLoopDelay({ resolution: 10 }); this.loopDelay.enable(); } catch { this.loopDelay = null; }
+    }
+    try { this.loopDelay?.reset(); } catch { /* fail-open */ }
+    const abort = new AbortController();
+    const stop = () => abort.abort(this.abort.signal.reason);
+    this.abort.signal.addEventListener('abort', stop, { once: true });
+    if (this.stopping) stop();
+    const timer = setTimeout(() => {
+      observation.deadline_exceeded = true; abort.abort(); this.log(name, 'deadline_exceeded', undefined, this.timingText(observation, startedAt));
+    }, this.opts.phaseMs ?? 5000);
+    try { return await phaseScope.run({ observation, startedAt }, () => run(this.engine.kind === 'postgres' ? abort.signal : undefined)); }
+    catch (error) {
+      const cancelled = error as { name?: unknown; code?: unknown; message?: unknown } | null;
+      if (this.stopping && abort.signal.aborted && abort.signal.reason === this.abort.signal.reason
+        && (error === abort.signal.reason || cancelled?.name === 'AbortError'
+          || cancelled?.code === '57014' && typeof cancelled.message === 'string'
+            && /^(?:57014: )?canceling statement due to user request$/.test(cancelled.message))) {
+        throw this.abort.signal.reason;
+      }
+      this.lastPhaseError = name; this.lastPhaseTiming = this.timingText(observation, startedAt);
+      // #6278: past the phase deadline, the client-side discard of a round-trip a pooler never completed is the
+      // deadline itself: the tick moves on instead of reporting storage_error.
+      if (observation.deadline_exceeded && isPhaseDeadlineOutcome(cancelled)) throw new PhaseDeadlineError(name, error);
+      throw error;
+    }
+    finally { clearTimeout(timer); this.abort.signal.removeEventListener('abort', stop); this.phaseObservation = undefined; }
+  }
+  private report(error: unknown, row?: WriteRequest): void {
+    if (this.stopping && error === this.abort.signal.reason) return;
+    if (error instanceof PhaseDeadlineError) {
+      // The timer already logged deadline_exceeded for this phase: record it under the phase, hand it to onError
+      // (fail-closed scheduling still sees one failure per tick), write no second line, and let the next tick run.
+      this.lastError = { code: 'deadline_exceeded', at: new Date().toISOString(), phase: error.phase };
+      this.lastPhaseError = undefined; this.lastPhaseTiming = undefined;
+      this.opts.onError?.(error);
+      return;
+    }
+    const code = (error as { code?: unknown })?.code;
+    this.lastError = { code: typeof code === 'string' && (/^[A-Z0-9]{5}$/.test(code) || isWriteErrorCode(code)) ? code : 'storage_error', at: new Date().toISOString(),
+      ...(this.lastPhaseError ? { phase: this.lastPhaseError } : {}) };
+    if (this.opts.onError) this.opts.onError(error);
+    // GBRA-133: a pooler's client cap names itself and its fix beside the code the pooler sent.
+    else this.log(this.lastPhaseError ?? 'execution', this.lastError.code, errorDetail(error), this.lastPhaseError ? this.lastPhaseTiming : undefined, row, connectionCapFailure(error));
+    this.lastPhaseError = undefined;
+    this.lastPhaseTiming = undefined;
+  }
+  /** #6543 F1: a line about one request is throttled per request (30 s per phase and code); other lines keep the shared throttle. */
+  private log(phase: string, code: string, detail?: string, timing = '', row?: WriteRequest, poolCap = false): void {
+    const key = `${phase}:${code}`, at = Date.now();
+    if (row) {
+      const requestKey = `${key}:${row.id}`;
+      if (at - (this.requestLogs.get(requestKey) ?? -Infinity) < 30_000) return;
+      if (this.requestLogs.size >= 256) for (const [stale, loggedAt] of this.requestLogs) if (at - loggedAt >= 30_000) this.requestLogs.delete(stale);
+      if (this.requestLogs.size >= 256) return;
+      this.requestLogs.set(requestKey, at);
+    } else {
+      if (this.lastLog && (at - this.lastLog.at < 1000 || this.lastLog.key === key && at - this.lastLog.at < 30_000)) return;
+      this.lastLog = { key, at };
+    }
+    if (!this.opts.onError) process.stderr.write(`[persistence] phase=${phase} reason=${code}${poolCap ? ' cause=pool_exhausted' : ''}${detail ? ` message="${detail}"` : ''}${timing}${row ? requestLogFields(row) : ''}`
+      + '; unfinished work remains tracked; fix: gbrain sources writer status --json'
+      + `${poolCap ? '; pool: every gbrain process on this database shares the pooler\'s client limit, so run fewer long-running ones (share one gbrain serve --http) or raise the limit (docs/ENGINES.md#pool-sizing)' : ''}`
+      + '; docs: docs/ENGINES.md#persistence-consumer-log\n');
+  }
+  /** #5373: tracks work that outlived its claim until it settles; the returned promise never rejects. */
+  /**
+   * #7106: runs a detached projection build (PublicationHooks.projectionPending) at most DETACHED_PROJECTION_BUILDS at
+   * a time, queued builds in order; each is tracked until it ends, so stop() waits for queued and running builds.
+   */
+  private detachBuild(build: () => Promise<void>): void {
+    this.keepUntilSettled(new Promise<void>(resolve => {
+      const start = () => {
+        this.detachedBuilds++;
+        void build().finally(() => { this.detachedBuilds--; resolve(); this.detachedQueue.shift()?.(); });
+      };
+      if (this.detachedBuilds < DETACHED_PROJECTION_BUILDS) start(); else this.detachedQueue.push(start);
+    }));
+  }
+  private keepUntilSettled(work: Promise<unknown>): Promise<void> {
+    const settled = work.then(() => undefined, () => undefined);
+    this.outlived.add(settled);
+    void settled.then(() => { this.outlived.delete(settled); });
+    return settled;
+  }
+  private leaseTiming(): ClaimLeaseTiming {
+    return { everyMs: this.opts.renewalIntervalMs ?? DEFAULT_CLAIM_LEASE_TIMING.everyMs, deadlineMs: this.opts.phaseMs ?? DEFAULT_CLAIM_LEASE_TIMING.deadlineMs };
+  }
+  /**
+   * #6278: tracks a preparation whose claim is gone while it still runs. With
+   * the deadlines switch on it goes to `abandoned` (stop() gives it a short
+   * grace); off, to `outlived` as before (stop() waits for it). The returned
+   * promise never rejects.
+   */
+  private keepAbandoned(work: Promise<unknown>, claimedAt = Date.now()): Promise<void> {
+    if (!this.policy.deadlines) return this.keepUntilSettled(work);
+    const settled = work.then(() => undefined, () => undefined);
+    this.abandoned.set(settled, claimedAt);
+    void settled.then(() => { this.abandoned.delete(settled); });
+    return settled;
+  }
+  /**
+   * #6317: the age, from its claim start, of the oldest abandoned preparation still holding a root barrier (or a zombie past
+   * the ceiling); null when none. The heartbeat row carries it so a waiter-only consumer can see a wedged owner
+   * (a barrier older than `persistence.preparation_ceiling_ms`) that keeps renewing its heartbeat.
+   */
+  oldestRootBarrierAgeMs(now = Date.now()): number | null {
+    let oldest: number | undefined;
+    for (const claimedAt of this.abandoned.values()) if (oldest === undefined || claimedAt < oldest) oldest = claimedAt;
+    for (const zombie of this.zombies.values()) { const at = Date.parse(zombie.claimed_at); if (oldest === undefined || at < oldest) oldest = at; }
+    return oldest === undefined ? null : Math.max(0, now - oldest);
+  }
+  /**
+   * #6278: the #5373 root barrier for an abandoned preparation, bounded by the
+   * hard ceiling measured from the claim. At the ceiling the root is freed, the
+   * request's counter is set to the limit (an overrun proves the await ignored
+   * cancellation, so its next claim fails it `preparation_stalled`) and the
+   * zombie stays tracked here and in status() until it settles.
+   */
+  private abandonedRootBlock(row: WriteRequest, clock: ClaimPhaseClock, settled: Promise<void>): Promise<void> {
+    if (!this.policy.deadlines) return settled;
+    let done = false;
+    void settled.then(() => { done = true; });
+    const remaining = Math.max(0, this.policy.ceilingMs - (Date.now() - clock.claimedAt));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ceiling = new Promise<void>(resolve => { timer = setTimeout(resolve, remaining); timer.unref?.(); });
+    return Promise.race([settled, ceiling]).then(async () => {
+      if (timer) clearTimeout(timer);
+      if (done) return;
+      const at = new Date().toISOString();
+      this.zombies.set(row.id, { request_id: row.request_id, operation: row.operation, step: clock.step, waiting_on: clock.waitingOn,
+        claimed_at: new Date(clock.claimedAt).toISOString(), abandoned_at: at, outlived_ceiling_at: at });
+      void settled.then(() => { this.zombies.delete(row.id); });
+      this.log('preparation', 'ceiling_exceeded', `request ${row.request_id}${claimTripleText(clock)}${this.restartRequired() ? ' restart_required' : ''}`, '', row);
+      await floorPreparationAttempts(this.statements, row.id, this.policy.maxAttempts).catch(error => this.report(error));
+    });
+  }
+  private async execute(row: WriteRequest, root: RootHold): Promise<boolean> {
+    let preparationActive = true;
+    const observation = { request_id: row.request_id, started_at: new Date().toISOString(), deadline_exceeded: false, attempt: ++this.preparationAttempts };
+    this.preparing.set(row.id, observation);
+    this.executing.add(row.id);
+    const policy = this.policy;
+    // #6278: every kind has a budget with the switch on; off, only remember and intent-less put_page/edit_page (#5616) keep the 30 s one.
+    const foregroundMs = this.opts.preparationMs ?? 30_000;
+    const budget = policy.deadlines ? preparationBudgetMs(row, policy, foregroundMs) : preparationKind(row) === 'foreground' ? foregroundMs : undefined;
+    // #6278: the clock carries the preparation's cancellation for `enterClaimStep` and, with the switch on, its deadline for the
+    // server-side bound on lock-prone reads (boundedReads); a query takes the signal only on the foreground path (as before).
+    const cancel = new AbortController();
+    const clock = startClaimPhase(Date.now(), cancel.signal, policy.deadlines ? budget : undefined);
+    // #6278: a request already at the attempt limit (a kill loop charged it at each reclaim) is finished without preparing again.
+    if (policy.deadlines && (row.preparation_attempts ?? 0) >= policy.maxAttempts) {
+      try {
+        const previous = claimStateOf({ state: 'running', claim_phase: row.previous_claim_phase, execution_token: previousToken(row.previous_claim_phase) });
+        const done = await finishPreparationStalled(this.engine, row, { step: previous?.step ?? null, waiting_on: previous?.waiting_on ?? 'unknown', limit: policy.maxAttempts }, false);
+        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText({ step: previous?.step ?? null, waitingOn: previous?.waiting_on ?? 'unknown' })}`, '', row);
+        return this.settled(done);
+      } finally { this.preparing.delete(row.id); this.executing.delete(row.id); }
+    }
+    // GBRA-156: the publication ceiling (a TTL-cached config read that never rejects) is read while the write prepares.
+    const ceiling = readPublicationCeilingMs(this.engine);
+    const prep = startPreparation(async signal => {
+      signal.addEventListener('abort', () => cancel.abort(signal.reason), { once: true });
+      await faultPoint('consumer:preparing', { requestId: row.request_id, writeId: row.id, sourceId: row.source_id, operation: row.operation, signal });
+      // Phase 4.3: a single page write prepares against one config read instead of one per key.
+      return this.prepare(this.engine.kind === 'postgres' && singleWrite(row)
+        && await writeSwitchOn(this.engine, 'single_write_group').catch(() => true) ? await preparationConfigView(this.engine) : this.engine,
+      row, this.config, budget !== undefined && preparationKind(row) === 'foreground' ? signal : undefined, clock);
+    }, budget, { onDeadline: () => { observation.deadline_exceeded = true; this.log('preparation', 'deadline_exceeded', `request ${row.request_id}${claimTripleText(clock)}`, '', row); } });
+    const stop = () => prep.abort({ code: 'consumer_stopping' });
+    this.abort.signal.addEventListener('abort', stop, { once: true });
+    const lease = startClaimLease(
+      signal => renewWriteClaim({ executeRaw: this.engine.executeRawDirect.bind(this.engine) }, row.id, row.execution_token!, this.opts.claimLeaseMs ?? 30_000,
+        this.engine.kind === 'postgres' ? signal : undefined, claimPhaseStamp(clock, row.execution_token)),
+      this.leaseTiming(), () => prep.abort({ code: 'claim_lost' }));
+    const releaseReason = () => !lease.held ? 'claim_lost' : observation.deadline_exceeded ? 'preparation_deadline' : 'consumer_stopping';
+    const stallInfo = () => ({ step: clock.step, waiting_on: clock.waitingOn, limit: policy.maxAttempts });
+    // The budget passed (on the timer, or reported by a bounded read the server ended): the claim is released now, charged,
+    // whether or not the preparer settles; its late result never publishes (#6278).
+    const deadline = async (): Promise<boolean> => {
+      root.until = this.abandonedRootBlock(row, clock, this.keepAbandoned(prep.work, clock.claimedAt));
+      if (!lease.held || this.stopping) { await releaseUnpublishedClaim(this.statements, row, releaseReason()); return false; }
+      if ((row.preparation_attempts ?? 0) + 1 >= policy.maxAttempts) {
+        const done = await finishPreparationStalled(this.engine, row, stallInfo(), true);
+        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText(clock)}`, '', row);
+        return this.settled(done);
+      }
+      await releaseUnpublishedClaim(this.statements, row, 'preparation_deadline', { charge: true });
+      return false;
+    };
+    try {
+      // With the switch on the budget wins the race even against a preparer that ignores its signal; off, the preparer's own settlement decides.
+      const raced = await lease.whileHeld(policy.deadlines ? prep.outcome : prep.work.then(result => ({ result })));
+      if (raced === CLAIM_LOST) {
+        root.until = this.abandonedRootBlock(row, clock, this.keepAbandoned(prep.work, clock.claimedAt));
+        await endLostLease(lease);
+        await releaseUnpublishedClaim(this.statements, row, 'claim_lost');
+        return false;
+      }
+      if ('deadline' in raced) return deadline();
+      const prepared = raced.result;
+      if (budget !== undefined && !prep.signal.aborted && prep.late()) prep.expire();
+      if (!lease.held || this.stopping || prep.signal.aborted) {
+        await releaseUnpublishedClaim(this.statements, row, releaseReason()); return false;
+      }
+      this.preparing.delete(row.id);
+      preparationActive = false;
+      enterClaimPhase(clock, 'publishing');
+      await faultPoint('consumer:prepared', { requestId: row.request_id, writeId: row.id, sourceId: row.source_id, operation: row.operation });
+      const ceilingMs = await ceiling;
+      await holdClaimForPublication(lease, () => renewWriteClaim({ executeRaw: this.engine.executeRawDirect.bind(this.engine) }, row.id, row.execution_token!,
+        publicationLeaseMs(ceilingMs), undefined, claimPhaseStamp(clock, row.execution_token)));
+      const { done, settled } = await boundPublication(() => this.publishSingle(row, prepared), this.publicationBound(row, ceilingMs, clock));
+      if (done.state === 'failed') this.log('publication', done.error_code ?? 'storage_error', failureLogText(done), '', row);
+      if (done.state === 'queued' && done.blocked_reason === 'writer_lock_unavailable') {
+        root.retryAfterMs = INSPECT_OWNER_RETRY_MS;
+        this.log('publication', 'writer_lock_unavailable', `request ${row.request_id}: this process cannot open source ${row.source_id}'s worktree lock${lockOpenOsError(row.worktree_id) ? ` (${lockOpenOsError(row.worktree_id)})` : ''}; left for an owner process`, '', row);
+      }
+      if (done.state === 'committed' && row.worktree_id && !String(row.intent?.kind).startsWith('managed_sync_')) {
+        this.foregroundCounts.set(row.worktree_id, this.foregroundCompletions(row.worktree_id) + 1);
+      }
+      return settled ? isTerminal(done) : this.settled(done);
+    } catch (error) {
+      if (preparationActive && budget !== undefined && prep.late()) observation.deadline_exceeded = true;
+      // #6278: a bounded read the server ended inside the budget (a shorter session lock_timeout) reports the deadline itself.
+      if (preparationActive && policy.deadlines && !prep.signal.aborted && preparationAbortReason(error, prep.signal) === 'preparation_deadline') {
+        prep.expire();
+        return deadline();
+      }
+      // #6278: the preparer's rejection on our own abort (its reason, an AbortError, a cancelled statement) is a release, never a receipt.
+      if (preparationActive && (prep.signal.aborted || observation.deadline_exceeded || preparationAbortReason(error, prep.signal))) {
+        await releaseUnpublishedClaim(this.statements, row, releaseReason());
+        return false;
+      }
+      const current = await getWriteRequestById(this.engine, row.id);
+      if (current && !isTerminal(current) && current.execution_token === row.execution_token && !current.recovery) {
+        const done = await finishUnpublishedFailure(this.engine, current, error, preparationActive ? 'preparation' : 'publication');
+        if (done.state === 'failed') this.log(preparationActive ? 'preparation' : 'publication', done.error_code ?? 'storage_error', failureLogText(done), '', row);
+        return this.settled(done);
+      }
+      throw error;
+    } finally {
+      const renewal = lease.end();
+      if (renewal) this.keepUntilSettled(renewal);
+      this.abort.signal.removeEventListener('abort', stop); this.preparing.delete(row.id); this.executing.delete(row.id);
+    }
+  }
+  /** #5984: a claimed bulk sync head takes its directly following group members along; one row runs the single path. */
+  private async executeOrGroup(row: WriteRequest, root: RootHold): Promise<boolean> {
+    const claimed = [row];
+    try {
+      // #6712: a page publishes whatever its predecessor's fate; a lane group member released mid-group only waits while the
+      // member before it is still unfinished (#6153 class).
+      const lane = laneOf(row);
+      if (await claimedHeadOrder(this.engine, row, lane !== null) === 'wait') { await releaseUnpublishedClaim(this.statements, row, 'group_member_waiting'); return false; }
+      const group = publicationGroupKey(row);
+      // A managed import batch also groups on PGLite: its members share one transaction's guards there too.
+      if (!group || this.engine.kind !== 'postgres' && !group.startsWith('import:')) return this.execute(row, root);
+      // #6007: a put_pages or import batch publishes in groups of at most PAGE_BATCH_GROUP_MAX pages.
+      const charged = (row.transient_interruptions ?? 0) > 0;
+      const followers = charged ? [] : await claimGroupFollowers(this.engine, row, group, syncGroup(group) ? 63 : PAGE_BATCH_GROUP_MAX - 1);
+      if (!followers.length && !lane && !charged) return this.execute(row, root);
+      claimed.push(...followers);
+      const rows = [row, ...followers];
+      for (const member of rows) this.executing.add(member.id);
+      try {
+        return await executeClaimedGroup(this.engine, rows, { hostId: this.hostId, lane,
+          prepare: (member, engine, signal, clock) => this.prepare(engine, member, this.config, signal, clock),
+          lease: this.leaseTiming(), policy: this.policy, foregroundMs: this.opts.preparationMs ?? 30_000,
+          publication: this.publicationBound(row, await readPublicationCeilingMs(this.engine)),
+          leftRunning: (work, blocksRoot, abandoned) => {
+            if (!blocksRoot) { this.keepUntilSettled(work); return; }
+            // #6278: an abandoned member blocks its root until it settles or the ceiling passes; several abandoned members all hold it.
+            const settled = this.keepAbandoned(work, abandoned?.clock.claimedAt);
+            const block = abandoned ? this.abandonedRootBlock(abandoned.row, abandoned.clock, settled) : settled;
+            root.until = root.until ? Promise.all([root.until, block]).then(() => undefined) : block;
+          },
+          settled: done => {
+            this.executing.delete(done.id);
+            if (done.state === 'committed' && done.worktree_id && !String(done.intent?.kind).startsWith('managed_sync_')) {
+              this.foregroundCounts.set(done.worktree_id, this.foregroundCompletions(done.worktree_id) + 1);
+            }
+            this.settled(done);
+          } });
+      } finally { for (const member of rows) this.executing.delete(member.id); }
+    } catch (error) {
+      if (transientDatabaseFailure(error)) await this.releaseAfterConnectionLoss(claimed);
+      throw error;
+    }
+  }
+  /**
+   * #6712 (convergence mode f): a pass whose database connection died (a pooler restart, a dropped connection) gives
+   * back every claim it took that did not commit, as soon as the database answers again, so the drain claims them anew
+   * at once. Left alone they stay `running` under the publication lease this live process holds, and nothing frees
+   * them until it lapses (about six minutes). The release is fenced on the claim's token, no recovery record and
+   * publication not started, so a committed member, a member another consumer took over and one whose files need
+   * recovery are untouched. Gives up after `CONNECTION_LOSS_RELEASE_MS`, leaving the lease to lapse as before.
+   */
+  private async releaseAfterConnectionLoss(rows: WriteRequest[]): Promise<void> {
+    const deadline = Date.now() + CONNECTION_LOSS_RELEASE_MS;
+    for (let attempt = 0; !this.stopping; attempt++) {
+      try {
+        for (const row of rows) await releaseUnpublishedClaim(this.statements, row, 'database_contention');
+        return;
+      } catch (error) {
+        if (!transientDatabaseFailure(error) || Date.now() >= deadline) return;
+      }
+      await new Promise(resolve => setTimeout(resolve, Math.min(2000, 250 * 2 ** attempt)));
+    }
+  }
+  /** Mandatory barrier: engine.close must be sequenced AFTER this promise. */
+  async stop(): Promise<void> {
+    this.stopping = true;
+    this.abort.abort();
+    if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
+    await this.tickPromise;
+    await this.releaseIdleLane();
+    await Promise.allSettled([...this.active]);
+    await this.releaseIdleLane();
+    // #6278: abandoned preparations (their claims are released and their signals aborted) get a short grace, not forever;
+    // renewals and publications in `outlived` keep their bounded waits.
+    if (this.abandoned.size) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([Promise.allSettled([...this.abandoned.keys()]), new Promise<void>(resolve => { timer = setTimeout(resolve, ABANDONED_STOP_GRACE_MS); })]);
+      if (timer) clearTimeout(timer);
+    }
+    while (this.outlived.size) await Promise.all([...this.outlived]);
+    await this.projectionWorker;
+    await this.effectsWorker;
+    await this.topologyWorker;
+    await this.maintenanceWorker;
+    await this.turnDone;
+    this.unobserveCheckout?.();
+    this.unobserveCheckout = undefined;
+    try { this.loopDelay?.disable(); } catch { /* fail-open */ }
+    this.loopDelay = undefined;
+  }
+}

@@ -1,0 +1,644 @@
+import { submitPageMutation } from '../persistence/page-mutations.ts';
+import { recordFunnelEvent } from '../funnel.ts';
+import { MERGE_PRECONDITION_PARAMS, WRITE_REQUEST_PARAM } from '../persistence/params.ts';
+/**
+ * Takes + think operation cluster — pure move from operations.ts (v0.46.x
+ * tranche 1). Op consts stay module-private; `takesOperations` below lists
+ * them in EXACTLY the order they appear in the canonical `operations` array
+ * in ../operations.ts. Never import from '../operations.ts' here (cycle).
+ */
+
+import { opError, type Operation, type OperationContext } from './contract.ts';
+import { MIN_TRUST_PARAM, resolveReadEligibility } from '../eligibility/policy.ts';
+import { stampRowTrust } from '../eligibility/stamp.ts';
+import { opTransport, paramUse } from './op-fix.ts';
+import {
+  readPolicyOpts,
+  readHolders,
+  sourceScopeOpts,
+  thinkSourceScopeOpts,
+  enforceClientSlugFence,
+  validatePageSlug,
+} from './context.ts';
+import { embedQueryWithPrefix } from '../search/query-prefix.ts';
+import { ALL_SOURCES } from '../source-id.ts';
+import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+
+/** Result pages whose takes D2 checks: the page a get_page read returned, or the first distinct pages of a search/query. */
+const HIDDEN_TAKES_PAGE_CAP = 3;
+
+/**
+ * D2: page reads, search and query never show the takes table to an
+ * agent-facing reader. For the pages this result returned, the takes
+ * `takes_list` would list on this connection (same source scope, holder
+ * allow-list and read eligibility), counted, capped at 100 per page. Null
+ * when the result has no page with such takes. Slugs come from the result.
+ */
+export async function takesHiddenFromResult(ctx: OperationContext, op: string, result: unknown): Promise<{ pages: string[]; count: number } | null> {
+  if (ctx.remote === false) return null;
+  const rows = op === 'get_page' ? [result] : (op === 'search' || op === 'query') && Array.isArray(result) ? result : [];
+  const pages = new Map<string, string | undefined>();
+  for (const row of rows) {
+    if (pages.size >= HIDDEN_TAKES_PAGE_CAP) break;
+    const r = row as { slug?: unknown; source_id?: unknown; result_type?: unknown } | null;
+    if (!r || typeof r.slug !== 'string' || (r.result_type !== undefined && r.result_type !== 'page')) continue;
+    const source = typeof r.source_id === 'string' ? r.source_id : undefined;
+    const key = `${source ?? ''}\u0000${r.slug}`;
+    if (!pages.has(key)) pages.set(key, source);
+  }
+  if (pages.size === 0) return null;
+  const eligibility = await resolveReadEligibility(ctx, {});
+  const counted = await Promise.all([...pages].map(async ([key, source]) => {
+    const slug = key.slice(key.indexOf('\u0000') + 1);
+    const policy = await readPolicyOpts(ctx, ...(source ? [{ sourceId: source }] : []));
+    const takes = await ctx.engine.listTakes({ ...policy, page_slug: slug, takesHoldersAllowList: readHolders(ctx), eligibility, limit: 100 });
+    return { slug, count: takes.length };
+  }));
+  const withTakes = counted.filter(c => c.count > 0);
+  if (!withTakes.length) return null;
+  return { pages: [...new Set(withTakes.map(c => c.slug))], count: withTakes.reduce((n, c) => n + c.count, 0) };
+}
+
+// --- v0.28: Takes ---
+
+const takes_list: Operation = {
+  name: 'takes_list',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
+  description: 'List takes (typed/weighted/attributed claims) filtered by holder/kind/active/etc.',
+  scope: 'read',
+  params: {
+    page_slug: { type: 'string', description: 'Filter to this page' },
+    holder: { type: 'string', description: 'Filter to this holder (world|garry|brain|<slug>)' },
+    kind: { type: 'string', description: 'Filter to this kind (fact|take|bet|hunch)' },
+    active: { type: 'boolean', description: 'Active rows only (default true)' },
+    resolved: { type: 'boolean', description: 'true → only resolved bets; false → only unresolved' },
+    sort_by: { type: 'string', description: 'weight | since_date | created_at (default created_at)' },
+    limit: { type: 'number', description: 'Max rows (default 100, cap 500)' },
+    offset: { type: 'number', description: 'Skip first N rows' },
+    min_trust: MIN_TRUST_PARAM,
+  },
+  handler: async (ctx, p) => {
+    const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust });
+    const rows = await ctx.engine.listTakes({
+      // #2200-class: honor federated/source scope (via the take's page.source_id).
+      ...await readPolicyOpts(ctx),
+      page_slug: p.page_slug as string | undefined,
+      holder: p.holder as string | undefined,
+      kind: p.kind as never,
+      active: p.active as boolean | undefined,
+      resolved: p.resolved as boolean | undefined,
+      sortBy: p.sort_by as never,
+      limit: p.limit as number | undefined,
+      offset: p.offset as number | undefined,
+      // Per-token allow-list — server-side filter for MCP-bound calls.
+      // Local CLI callers leave takesHoldersAllowList unset and see all holders.
+      takesHoldersAllowList: readHolders(ctx),
+      eligibility,
+    });
+    return stampRowTrust(ctx.engine, 'takes', rows, r => r.id);
+  },
+  cliHints: { name: 'takes-list' },
+};
+
+const takes_search: Operation = {
+  name: 'takes_search',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
+  description: 'Keyword search across takes (pg_trgm similarity over claim text)',
+  scope: 'read',
+  params: {
+    query: { type: 'string', required: true, description: "Search text matched against take claim text via trigram similarity, e.g. 'valuation cap'. This is the search text param — there is no `text` param." },
+    limit: { type: 'number', description: 'Max results (default 30, cap 100)' },
+    min_trust: MIN_TRUST_PARAM,
+  },
+  handler: async (ctx, p) => {
+    const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust });
+    const hits = await ctx.engine.searchTakes(p.query as string, {
+      ...await readPolicyOpts(ctx),
+      limit: p.limit as number | undefined,
+      takesHoldersAllowList: readHolders(ctx),
+      eligibility,
+    });
+    return stampRowTrust(ctx.engine, 'takes', hits, h => h.take_id);
+  },
+  cliHints: { name: 'takes-search', positional: ['query'] },
+};
+
+/**
+ * v0.30.0 (Slice A1): aggregate calibration scorecard. Pure SQL aggregation.
+ *
+ * Privacy (D4 fail-closed): the engine method REQUIRES the takesHoldersAllowList
+ * param. The handler threads it from the OperationContext so MCP-bound callers
+ * see only their permitted holders' aggregate counts. Local CLI callers
+ * (ctx.takesHoldersAllowList=undefined) get the full scorecard.
+ */
+const takes_scorecard: Operation = {
+  name: 'takes_scorecard',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description: 'Calibration scorecard for resolved bets: counts, accuracy, Brier (correct ∨ incorrect only), partial_rate.',
+  scope: 'read',
+  params: {
+    holder: { type: 'string', description: 'Filter to this holder (world|garry|brain|<slug>)' },
+    domain_prefix: { type: 'string', description: 'Slug prefix (e.g. companies/) to scope the scorecard' },
+    since: { type: 'string', description: 'Window start (YYYY-MM-DD)' },
+    until: { type: 'string', description: 'Window end (YYYY-MM-DD)' },
+    group_by: { type: 'string', enum: ['holder', 'source'], description: 'Trusted local CLI only: per-group journal statistics' },
+    min_n: { type: 'number', description: 'Trusted local CLI only: groups with fewer resolved predictions are flagged low_n (default 10)' },
+  },
+  handler: async (ctx, p) => {
+    // W7: the grouped journal statistics are private. A remote caller that
+    // asks for them is refused, never silently given today's output.
+    const grouped = p.group_by !== undefined || p.min_n !== undefined;
+    if (grouped && ctx.remote !== false) {
+      throw opError('scorecard_group_by_local_only', 'takes_scorecard: group_by and min_n read the private forecast journal and run only from the trusted local CLI.',
+        'Omit group_by and min_n, or ask the brain owner to run gbrain takes scorecard --group-by on the brain host.');
+    }
+    if (grouped && p.group_by !== 'holder' && p.group_by !== 'source') {
+      throw opError('invalid_params', 'takes_scorecard: group_by must be holder or source.', 'Pass group_by: "holder" or "source".');
+    }
+    if (p.min_n !== undefined && !(Number.isSafeInteger(p.min_n) && (p.min_n as number) >= 1)) {
+      throw opError('invalid_params', 'takes_scorecard: min_n must be a positive integer.', 'Pass min_n as a whole number, e.g. 10.');
+    }
+    const card = await ctx.engine.getScorecard(
+      {
+        ...await readPolicyOpts(ctx),
+        holder: p.holder as string | undefined,
+        domainPrefix: p.domain_prefix as string | undefined,
+        since: p.since as string | undefined,
+        until: p.until as string | undefined,
+      },
+      readHolders(ctx),
+    );
+    // [OV8/EV5] Resolver-provenance visibility: remote resolutions are
+    // server-stamped resolved_by='mcp:<client>' (takes_resolve below), and
+    // this coarse count keeps agent-resolved rows segregable from owner
+    // ground truth. Op-layer SQL (plain executeRaw both engines share) —
+    // no engine method added, parity untouched. Unfiltered by the window/
+    // domain params (coarse by design; documented).
+    const base = { ...card, mcp_resolved: await countMcpResolved(ctx) };
+    if (!grouped) return base;
+    const { readForecastJournal, scorecardGroups } = await import('../forecast-journal.ts');
+    const scope = sourceScopeOpts(ctx);
+    const query = {
+      ...(scope.sourceIds?.length ? { sourceIds: scope.sourceIds } : scope.sourceId ? { sourceId: scope.sourceId } : {}),
+      ...(p.holder ? { holder: p.holder as string } : {}), ...(p.domain_prefix ? { about: p.domain_prefix as string } : {}),
+      ...(p.since ? { since: p.since as string } : {}), ...(p.until ? { until: p.until as string } : {}),
+    };
+    return {
+      ...base,
+      groups: await scorecardGroups(ctx.engine, { ...query, groupBy: p.group_by as 'holder' | 'source', ...(p.min_n !== undefined ? { minN: p.min_n as number } : {}) }),
+      journal: (await readForecastJournal(ctx.engine, { ...query, limit: 0 })).totals,
+    };
+  },
+  cliHints: { name: 'takes-scorecard' },
+};
+
+/**
+ * v0.30.0 (Slice A1): calibration curve binned by stated weight. Pure SQL.
+ * Same allow-list contract as takes_scorecard.
+ */
+const takes_calibration: Operation = {
+  name: 'takes_calibration',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description: 'Calibration curve: resolved correct/incorrect bets binned by stated weight; observed vs predicted per bucket.',
+  scope: 'read',
+  params: {
+    holder: { type: 'string', description: 'Filter to this holder' },
+    bucket_size: { type: 'number', description: 'Bucket width in (0,1]; default 0.1' },
+  },
+  handler: async (ctx, p) => {
+    // (The [OV8/EV5] mcp_resolved provenance count lives on takes_scorecard —
+    // this op's wire shape is a bare bucket ARRAY, so decorating it would be
+    // a breaking change; the scorecard is the segregation surface.)
+    return ctx.engine.getCalibrationCurve(
+      {
+        ...await readPolicyOpts(ctx),
+        holder: p.holder as string | undefined,
+        bucketSize: p.bucket_size as number | undefined,
+      },
+      readHolders(ctx),
+    );
+  },
+  cliHints: { name: 'takes-calibration' },
+};
+
+/**
+ * [OV8/EV5] Count of resolved take rows whose resolved_by carries the MCP
+ * server-stamp prefix. Source-scoped + holder-allow-list-scoped like the
+ * aggregates it decorates; unfiltered by window/domain (coarse segregation
+ * signal, not a scorecard dimension).
+ */
+async function countMcpResolved(ctx: OperationContext): Promise<number> {
+  const scope = await readPolicyOpts(ctx);
+  const where: string[] = [`t.resolved_at IS NOT NULL`, `t.resolved_by LIKE 'mcp:%'`];
+  if (scope.excludePrivate) where.push(privatePagesFilterFragment('p'));
+  const params: unknown[] = [];
+  if (scope.sourceIds && scope.sourceIds.length > 0) {
+    params.push(scope.sourceIds);
+    where.push(`p.source_id = ANY($${params.length}::text[])`);
+  } else if (scope.sourceId) {
+    params.push(scope.sourceId);
+    where.push(`p.source_id = $${params.length}`);
+  }
+  const holders = readHolders(ctx);
+  if (holders !== undefined) {
+    params.push(holders);
+    where.push(`t.holder = ANY($${params.length}::text[])`);
+  }
+  try {
+    const rows = await ctx.engine.executeRaw<{ n: string }>(
+      `SELECT count(*)::text AS n FROM takes t JOIN pages p ON p.id = t.page_id WHERE ${where.join(' AND ')}`,
+      params,
+    );
+    return parseInt(rows[0]?.n ?? '0', 10);
+  } catch {
+    // Decoration only — never fail the aggregate over the provenance count.
+    return 0;
+  }
+}
+
+/** runThink names the CLI flag; op callers get the param on their own surface and a caller-class code. */
+function thinkModelError(ctx: OperationContext, e: unknown): unknown {
+  if (e instanceof Error && e.name === 'ReferenceDateError') {
+    return opError('invalid_params', `think: ${e.message}`,
+      `Nothing was synthesized. Pass ${opTransport(ctx) === 'cli' ? paramUse(ctx, 'reference_date') : '`reference_date`'} as a past or current YYYY-MM-DD, or omit it to use today in brain.timezone.`);
+  }
+  if (!(e instanceof Error) || !e.message.startsWith('think: --model ')) return e;
+  const name = opTransport(ctx) === 'cli' ? paramUse(ctx, 'model') : '`model`';
+  return opError('invalid_params',
+    e.message.replace('think: --model ', 'think: model ').replace(' or omit --model.', ' or omit it.'),
+    `Nothing was synthesized. Omit ${name} to use the configured think model (models.think, then models.default), or pass a model id this brain can reach.`);
+}
+
+const think: Operation = {
+  name: 'think',
+  idempotent: false,
+  outputRedaction: 'retrieval',
+  description: 'Multi-hop synthesis across pages + takes + graph. Pulls relevant evidence and produces a cited answer with conflict + gap analysis. Needs a chat-model API key (Anthropic or OpenAI) for the synthesized answer, a paid call; a keyless brain returns the gathered evidence only (a synthesis_keyless notice explains). save/take persist for the local CLI only.',
+  scope: 'read',
+  params: {
+    question: { type: 'string', required: true, description: 'The question to think about' },
+    anchor: { type: 'string', description: 'Pull the entity subgraph around this slug' },
+    rounds: { type: 'number', description: 'Multi-pass: 1 (default). Round-loop scaffolding is in place; gap-driven retrieval ships in v0.29.' },
+    save: { type: 'boolean', description: 'Persist a synthesis page (local-CLI only; ignored for MCP)' },
+    take: { type: 'boolean', description: 'Append a take row to the anchor page (requires anchor)' },
+    model: { type: 'string', description: 'Model override (alias or full id). Falls through models.think → models.default → GBRAIN_MODEL → opus.' },
+    since: { type: 'string', description: 'Start of temporal window (YYYY-MM-DD or YYYY-MM). Omit both bounds and a question naming one explicit date (2026-09-15, 2026-09, September 2026) is bounded to it; the result says window_source.' },
+    until: { type: 'string', description: 'End of temporal window' },
+    reference_date: { type: 'string', description: 'YYYY-MM-DD the question\'s relative time words resolve against (default: today in brain.timezone).' },
+  },
+  // Local CLI can persist with save/take; remote/MCP callers are forced
+  // read-only below before runThink/persistSynthesis sees those flags.
+  mutating: true,
+  handler: async (ctx, p) => {
+    const remote = ctx.remote ?? true;
+    // Codex P1 #7 + privacy: remote callers cannot persist via MCP.
+    const safeSave = remote ? false : Boolean(p.save);
+    const safeTake = remote ? false : Boolean(p.take);
+    // v0.40.2.0: thread source-scope scalars + remote flag for trajectory
+    // injection. `sourceScopeOpts(ctx)` returns the federated array (when
+    // present) OR the scalar; we pass both through to runThink which
+    // forwards to findTrajectory. CLI callers don't go through this op
+    // and get default scope + remote=false from runThink's CLI path.
+    const thinkScope = thinkSourceScopeOpts(ctx);
+    const { runThink, persistSynthesis } = await import('../think/index.ts');
+    const result = await runThink(ctx.engine, {
+      question: String(p.question),
+      // #3734: MCP think must populate the question vector for takes retrieval.
+      embedQuestion: (q) => embedQueryWithPrefix(ctx.engine, q),
+      anchor: p.anchor ? String(p.anchor) : undefined,
+      rounds: typeof p.rounds === 'number' ? (p.rounds as number) : undefined,
+      save: safeSave,
+      take: safeTake,
+      model: p.model ? String(p.model) : undefined,
+      // #1698 (C3): a remote caller that explicitly supplies a model gets the same
+      // hard-error-on-unresolvable behavior as the CLI (loud op error envelope),
+      // instead of silently degrading to a no-LLM stub answer. No model param →
+      // false → configured/default model keeps its graceful path.
+      modelExplicit: !!p.model,
+      since: p.since ? String(p.since) : undefined,
+      until: p.until ? String(p.until) : undefined,
+      ...(typeof p.reference_date === 'string' ? { referenceDate: p.reference_date } : {}),
+      takesHoldersAllowList: readHolders(ctx),
+      ...thinkScope,
+      excludePrivate: (await readPolicyOpts(ctx)).excludePrivate,
+      remote: ctx.remote !== false, // fail-closed: anything not strictly false is untrusted (CLAUDE.md invariant)
+    }).catch((e: unknown) => { throw thinkModelError(ctx, e); });
+    result.answer = result.answer.replace(' or pass `client`', ' on the brain host');
+    // A6: the fallback cause is a provider error line, host posture an HTTP caller is never told.
+    if (ctx.transport === 'http') delete result.fallback_reason;
+    if (ctx.transport === 'http' && (result.synthesis_status === 'no_llm' || result.synthesis_status === 'model_unusable')) {
+      // A6 HTTP view: a remote caller is never told the host's key names or provider posture. The stub
+      // answer and gaps are prose for the operator; synthesis_status and the warning codes stay as data.
+      const { redactForTransport } = await import('../agent-output.ts');
+      result.answer = result.synthesis_status === 'no_llm'
+        ? '(no LLM available on the brain host — the gathered evidence is returned without a synthesized answer)'
+        : redactForTransport(result.answer, 'http');
+      result.gaps = redactForTransport(result.gaps, 'http');
+    }
+
+    // Persist if --save was passed locally
+    let savedSlug: string | undefined;
+    let evidenceInserted = 0;
+    if (safeSave) {
+      const persisted = await persistSynthesis(ctx.engine, result, {
+        // '__all__' is a read scope, not a write destination: an unscoped save keeps the default source.
+        sourceId: ctx.sourceId === ALL_SOURCES ? undefined : ctx.sourceId,
+        ...(thinkScope.allowedSources ? { allowedSources: thinkScope.allowedSources } : {}),
+      });
+      savedSlug = persisted.slug;
+      evidenceInserted = persisted.evidenceInserted;
+      for (const w of persisted.warnings) result.warnings.push(w);
+    }
+
+    // #2556: `take` was gated (safeTake) but never EXECUTED — runThink ignores
+    // opts.take, so a local `take: true` silently persisted nothing. Persist
+    // md-first through the canonical takes write-through; refusals surface as
+    // loud machine-stable warnings + take_row:null. Remote stays blocked above.
+    let takeRow: number | null = null;
+    if (safeTake) {
+      if (!p.anchor) {
+        result.warnings.push('TAKE_REQUIRES_ANCHOR');
+      } else {
+        const { persistTakeFromSynthesis } = await import('../think/persist-take.ts');
+        const persisted = await persistTakeFromSynthesis(ctx.engine, result, {
+          anchor: String(p.anchor),
+          sourceId: ctx.sourceId,
+          lockTimeoutMs: 2000,
+        });
+        takeRow = persisted.take_row;
+        for (const w of persisted.warnings) result.warnings.push(w);
+      }
+    }
+
+    // F8: the explanations the CLI formatter prints, as model-visible notices.
+    const { keylessThinkNotice, thinkNotSavedNotice } = await import('../interop-notices.ts');
+    if (result.synthesis_status === 'no_llm') ctx.emitNotice?.(keylessThinkNotice());
+    if (remote && (Boolean(p.save) || Boolean(p.take))) ctx.emitNotice?.(thinkNotSavedNotice());
+    const { recordThinkAnswer, feedbackMetaFields } = await import('../feedback/record.ts');
+    const feedbackMeta = feedbackMetaFields(await recordThinkAnswer(ctx, 'think', result));
+    delete result.feedback_evidence; delete result.taint_refs;
+    const { persist: _persist, persist_base: _persistBase, ...visible } = result;
+    return {
+      ...visible,
+      ...feedbackMeta,
+      // #1698 (#10): the persist-skip signal returns slug '' — map it (and any
+      // falsy) to null so callers never see an empty-string "slug".
+      saved_slug: savedSlug || null,
+      evidence_inserted: evidenceInserted,
+      take_row: takeRow,
+      remote_persisted_blocked: remote && (Boolean(p.save) || Boolean(p.take)),
+    };
+  },
+  // hidden: 'think' is in CLI_ONLY (src/cli.ts) — the richer runThinkCli
+  // handler owns the CLI surface; a non-hidden hint here is dead (CLI_ONLY
+  // wins at dispatch) and lies to the catalog.
+  cliHints: { name: 'think', positional: ['question'], hidden: true },
+};
+
+
+// ---------------------------------------------------------------------------
+// CLI→MCP gap-closure wave — takes WRITE verbs. Before these, agents could
+// read the predictions ledger (takes_list/search/scorecard) but never record,
+// refine, resolve, or supersede a take. Backed by the same md-canonical
+// write-through core as the CLI (src/core/takes-write.ts): fence-derived row
+// numbers, markdown written first, the DB mirrored with the reconcile
+// primitive — and the markdown write is REQUIRED (no sync.repo_path on the
+// host → 'unavailable' with detail takes_mirror_unavailable), because a
+// DB-only row would be clobbered by the next md→DB reconcile.
+//
+// Trust model (ungated by design — the put_page precedent: writes are
+// consented via scope + the holder fence; publish gates cover owner-content
+// READ surfaces):
+//   - Holder WRITE fence reuses the read allow-list, fail-closed: remote
+//     effective list = ctx.takesHoldersAllowList ?? ['world'] (the stdio
+//     default — stdio agents write world-held takes only; OAuth tokens can
+//     grant more), [] = deny-all. add/supersede check the param holder;
+//     update/resolve/supersede check the TARGET row's holder — and a fenced
+//     row presents as not_found (same shape as a missing row), hiding content
+//     and holder. Existence-by-count is accepted: row numbers are dense per
+//     page, so takes_add's returned row_num reveals how many rows (including
+//     private ones) exist — returning it is functionally required for later
+//     update/resolve, and takes_list's visible-sequence gaps leak the same
+//     count anyway [OV10/EV3].
+//   - resolved_by is SERVER-STAMPED for remote callers (mcp:<clientId>) so
+//     agent-resolved rows stay segregable from owner-resolved ground truth;
+//     scorecard/calibration surface the mcp_resolved count [OV8/EV5].
+//   - A future permissions.takes_write_holders key could split the read/write
+//     axes if field use demands it.
+// ---------------------------------------------------------------------------
+
+const TAKE_KINDS = ['fact', 'take', 'bet', 'hunch'] as const;
+
+const takes_add: Operation = {
+  name: 'takes_add',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Record a take (typed claim) on a page: fact / take / bet / hunch, with a holder (who ' +
+    'holds the belief: world, people/<slug>, companies/<slug>, or brain), weight 0..1, and ' +
+    'optional source/since date. Writes the markdown takes fence first (markdown is ' +
+    'canonical) and mirrors to the DB. Remote callers can only write holders in their ' +
+    'allow-list (stdio default: world).',
+  params: {
+    request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
+    local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
+    slug: { type: 'string', required: true, description: 'Page slug to attach the take to (page must exist).' },
+    claim: { type: 'string', required: true, description: 'The claim text (one line).' },
+    kind: { type: 'string', required: true, enum: [...TAKE_KINDS], description: 'Claim type. Base kinds only; pack-extended kinds are a filed follow-up.' },
+    holder: { type: 'string', required: true, description: "Who HOLDS this belief (said/clearly implied it): world | people/<slug> | companies/<slug> | brain. Remote callers: must be in the caller's takes-holder allow-list." },
+    weight: { type: 'number', required: false, description: 'Confidence 0..1 (default 0.5; clamped server-side).' },
+    source: { type: 'string', required: false, description: 'Where the claim came from (free text).' },
+    since: { type: 'string', required: false, description: "When the belief started ('YYYY-MM' or 'YYYY-MM-DD')." },
+  },
+  scope: 'write',
+  mutating: true,
+  area: 'takes',
+  handler: async (ctx, p) => {
+    const slug = p.slug as string;
+    enforceClientSlugFence(ctx, slug, 'takes_add');
+    validatePageSlug(slug); // defense-in-depth, matching put_page
+    if (ctx.dryRun) return { dry_run: true, action: 'takes_add', slug };
+    return submitPageMutation(ctx, { operation: 'takes_add', params: p });
+  },
+};
+
+const takes_update: Operation = {
+  name: 'takes_update',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Update a take\'s mutable fields (weight, source, since date). Claim/kind/holder are ' +
+    'immutable — supersede instead. Markdown-canonical: the target row must exist in the ' +
+    'page\'s takes fence. Remote callers can only touch rows whose holder is in their ' +
+    'allow-list; other rows present as not_found.',
+  params: {
+    request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
+    local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
+    slug: { type: 'string', required: true, description: 'Page slug.' },
+    row_num: { type: 'number', required: true, description: 'Take row number on the page (from takes_list).' },
+    weight: { type: 'number', required: false, description: 'New confidence 0..1.' },
+    source: { type: 'string', required: false, description: 'New source text.' },
+    since: { type: 'string', required: false, description: "New since date ('YYYY-MM' or 'YYYY-MM-DD')." },
+  },
+  scope: 'write',
+  mutating: true,
+  area: 'takes',
+  handler: async (ctx, p) => {
+    const slug = p.slug as string;
+    enforceClientSlugFence(ctx, slug, 'takes_update');
+    validatePageSlug(slug); // defense-in-depth, matching put_page
+    if (ctx.dryRun) return { dry_run: true, action: 'takes_update', slug, row_num: p.row_num };
+    return submitPageMutation(ctx, { operation: 'takes_update', params: p });
+  },
+};
+
+const takes_supersede: Operation = {
+  name: 'takes_supersede',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Supersede a take with a replacement claim: the old row is struck through (kept for ' +
+    'archaeology), the replacement appends at the next fence row number. Kind/holder inherit ' +
+    'from the target row unless overridden; unset weight decays the target\'s by 0.1. ' +
+    'Markdown-canonical; remote holder fencing as in takes_update.',
+  params: {
+    request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
+    local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
+    slug: { type: 'string', required: true, description: 'Page slug.' },
+    row_num: { type: 'number', required: true, description: 'Row number of the take being superseded.' },
+    claim: { type: 'string', required: true, description: 'The replacement claim text.' },
+    kind: { type: 'string', required: false, enum: [...TAKE_KINDS], description: 'Override kind (default: inherit from the target row).' },
+    holder: { type: 'string', required: false, description: 'Override holder (default: inherit). Remote callers: an override must be in the allow-list.' },
+    weight: { type: 'number', required: false, description: "Replacement confidence 0..1 (default: target's weight - 0.1)." },
+    source: { type: 'string', required: false, description: 'Source for the replacement.' },
+    since: { type: 'string', required: false, description: 'Since date for the replacement.' },
+  },
+  scope: 'write',
+  mutating: true,
+  area: 'takes',
+  handler: async (ctx, p) => {
+    const slug = p.slug as string;
+    enforceClientSlugFence(ctx, slug, 'takes_supersede');
+    validatePageSlug(slug); // defense-in-depth, matching put_page
+    if (ctx.dryRun) return { dry_run: true, action: 'takes_supersede', slug, row_num: p.row_num };
+    const out = await submitPageMutation(ctx, { operation: 'takes_supersede', params: p });
+    recordFunnelEvent('correction');
+    return out;
+  },
+};
+
+const takes_resolve: Operation = {
+  name: 'takes_resolve',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Resolve a take: quality correct / incorrect / partial / unresolvable, with optional ' +
+    'evidence text and measured value/unit. Resolutions feed the calibration scorecard. ' +
+    'Remote callers: resolved_by is SERVER-STAMPED as mcp:<client> (any passed value is ' +
+    'ignored) so agent resolutions stay segregable from owner ground truth; the target row ' +
+    'must be in the caller\'s holder allow-list. Markdown-canonical.',
+  params: {
+    request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
+    local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
+    slug: { type: 'string', required: true, description: 'Page slug.' },
+    row_num: { type: 'number', required: true, description: 'Take row number to resolve.' },
+    quality: { type: 'string', required: true, enum: ['correct', 'incorrect', 'partial', 'unresolvable'], description: 'Resolution verdict.' },
+    evidence: { type: 'string', required: false, description: 'What evidence resolved this (free text).' },
+    value: { type: 'number', required: false, description: 'Measured value, when the claim was quantitative.' },
+    unit: { type: 'string', required: false, description: 'Unit for value (usd | pct | count | ...).' },
+    resolved_by: { type: 'string', required: false, description: 'Resolver identity. Remote callers: SERVER-STAMPED mcp:<client>, client value ignored. Local default: the configured owner holder.' },
+  },
+  scope: 'write',
+  mutating: true,
+  area: 'takes',
+  handler: async (ctx, p) => {
+    const slug = p.slug as string;
+    enforceClientSlugFence(ctx, slug, 'takes_resolve');
+    validatePageSlug(slug); // defense-in-depth, matching put_page
+    if (ctx.dryRun) return { dry_run: true, action: 'takes_resolve', slug, row_num: p.row_num };
+    return submitPageMutation(ctx, { operation: 'takes_resolve', params: p });
+  },
+};
+
+const takes_remove: Operation = {
+  name: 'takes_remove',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description:
+    'Remove one take row from a page\'s takes fence and the takes table together. Local-only. ' +
+    'Other rows keep their numbers. Refuses a resolved row, a row another row cites as "superseded by" it, ' +
+    'and a row whose database copy disagrees with the fence (run `gbrain takes rebuild <slug>` first). ' +
+    'CLI: `gbrain takes remove <slug> --row N`.',
+  params: {
+    request_id: WRITE_REQUEST_PARAM,
+    ...MERGE_PRECONDITION_PARAMS,
+    local_dir: { type: 'string', description: 'Trusted CLI directory hint; must equal the registered source root.' },
+    slug: { type: 'string', required: true, description: 'Page slug.' },
+    row_num: { type: 'number', required: true, description: 'Take row number to remove (from takes_list).' },
+  },
+  scope: 'write',
+  mutating: true,
+  localOnly: true,
+  area: 'takes',
+  handler: async (ctx, p) => {
+    const slug = p.slug as string;
+    validatePageSlug(slug);
+    if (ctx.dryRun) return { dry_run: true, action: 'takes_remove', slug, row_num: p.row_num };
+    return submitPageMutation(ctx, { operation: 'takes_remove', params: p });
+  },
+};
+
+/**
+ * W9F item 8: `gbrain takes rebuild <slug>` as an operation, so the CLI can
+ * delegate it to a resident owner (`gbrain serve` holding PGLite) instead of
+ * waiting on the owner's lock. Same work as the local rebuild: the page's
+ * takes index is rebuilt from its canonical fence (`extractTakes` rebuild;
+ * on a managed brain `reextractCoordinated` publishes it, the integration
+ * point for Lane R's receipted takes intent).
+ */
+const takes_rebuild: Operation = {
+  name: 'takes_rebuild',
+  idempotent: true,
+  outputRedaction: { exempt: 'local-only: rebuild warnings quote malformed takes fence rows to the trusted local CLI owner, as the local rebuild always printed them' },
+  description:
+    'Rebuild one page\'s takes index from the takes fence the page holds. Local-only. ' +
+    'Rows whose number and claim still match keep their resolution; rows the index and the fence disagree on are re-inserted from the fence. ' +
+    'CLI: `gbrain takes rebuild <slug>`.',
+  params: {
+    request_id: WRITE_REQUEST_PARAM,
+    slug: { type: 'string', required: true, description: 'Page slug.' },
+  },
+  scope: 'write',
+  mutating: true,
+  localOnly: true,
+  area: 'takes',
+  handler: async (ctx, p) => {
+    const slug = p.slug as string;
+    validatePageSlug(slug);
+    const sourceId = ctx.sourceId ?? 'default';
+    if (ctx.dryRun) return { dry_run: true, action: 'takes_rebuild', slug, source_id: sourceId };
+    const { extractTakes } = await import('../cycle/extract-takes.ts');
+    return { slug, source_id: sourceId, ...await extractTakes(ctx.engine, { source: 'db', slugs: [slug], sourceId, rebuild: true }) };
+  },
+};
+
+// Ops in EXACTLY the canonical `operations` array order: the v0.28 trio
+// (takes_list, takes_search, think), the v0.30 calibration aggregates, then
+// the gap-closure write verbs.
+export const takesOperations: Operation[] = [
+  takes_list, takes_search, think,
+  takes_scorecard, takes_calibration,
+  takes_add, takes_update, takes_resolve, takes_supersede, takes_remove, takes_rebuild,
+];

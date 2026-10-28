@@ -1,0 +1,86 @@
+{
+  "benchmark": "world-v1 relational dev half (template + paraphrase)",
+  "gbrain": "70ad30e4e9d384df66acad1e9aff7d49eec35c43",
+  "penalties": [
+    1,
+    3,
+    6
+  ],
+  "cost": {
+    "usd": 0.022041
+  },
+  "arms": {
+    "off": {
+      "n": 146,
+      "fire_rate": 0.4795,
+      "ndcg_at_10": 0.6022,
+      "hit_at_3": 0.6918,
+      "recall_all_at_5": 0.6507,
+      "delta_ndcg": 0,
+      "ci95": [
+        0,
+        0
+      ],
+      "hit_at_1_losses": 0,
+      "hit_at_1_wins": 0,
+      "by_form_delta_ndcg": {
+        "template": 0,
+        "paraphrase": 0
+      }
+    },
+    "on@1": {
+      "n": 146,
+      "fire_rate": 0.4795,
+      "ndcg_at_10": 0.6017,
+      "hit_at_3": 0.6918,
+      "recall_all_at_5": 0.6507,
+      "delta_ndcg": -0.0005,
+      "ci95": [
+        -0.0023,
+        0.0006
+      ],
+      "hit_at_1_losses": 0,
+      "hit_at_1_wins": 0,
+      "by_form_delta_ndcg": {
+        "template": 0,
+        "paraphrase": -0.0009
+      }
+    },
+    "on@3": {
+      "n": 146,
+      "fire_rate": 0.4795,
+      "ndcg_at_10": 0.6017,
+      "hit_at_3": 0.6918,
+      "recall_all_at_5": 0.6507,
+      "delta_ndcg": -0.0005,
+      "ci95": [
+        -0.0023,
+        0.0006
+      ],
+      "hit_at_1_losses": 0,
+      "hit_at_1_wins": 0,
+      "by_form_delta_ndcg": {
+        "template": 0,
+        "paraphrase": -0.0009
+      }
+    },
+    "on@6": {
+      "n": 146,
+      "fire_rate": 0.4795,
+      "ndcg_at_10": 0.6017,
+      "hit_at_3": 0.6918,
+      "recall_all_at_5": 0.6507,
+      "delta_ndcg": -0.0005,
+      "ci95": [
+        -0.0023,
+        0.0006
+      ],
+      "hit_at_1_losses": 0,
+      "hit_at_1_wins": 0,
+      "by_form_delta_ndcg": {
+        "template": 0,
+        "paraphrase": -0.0009
+      }
+    }
+  }
+}

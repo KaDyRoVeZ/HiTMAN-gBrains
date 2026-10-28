@@ -1,0 +1,1342 @@
+import { assertManagedFilesystemWrite } from '../core/persistence/filesystem-guard.ts';
+// `gbrain schema` CLI surface.
+//
+// The active schema pack drives type inference, link verbs, expert
+// routing, extractable types, enrichment rubrics, and per-source
+// closure for search. See `src/core/schema-pack/load-active.ts` for
+// the boundary helper that all engines + operations consume.
+//
+// Verbs grouped by lifecycle:
+//   Inspection:           active, list, show, validate, graph, lint,
+//                         stats, explain, usage
+//   Activation:           use, downgrade, reload
+//   Authoring:            init, fork, edit, diff, add-type, remove-type,
+//                         update-type, add-alias, remove-alias,
+//                         add-prefix, remove-prefix, add-link-type,
+//                         remove-link-type, set-extractable,
+//                         set-expert-routing
+//   Discovery + repair:   detect, suggest, review-candidates,
+//                         review-orphans, sync
+
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
+import {
+  addAliasToType,
+  addLinkTypeToPack,
+  addPrefixToType,
+  BUNDLED_PACK_NAMES,
+  addTypeToPack,
+  invalidatePackCache,
+  loadActivePack,
+  loadResolvedPackByName,
+  removeAliasFromType,
+  removeLinkTypeFromPack,
+  removePrefixFromType,
+  removeTypeFromPack,
+  resolveActivePackNameOnly,
+  resolveLoadedPack,
+  loadPackFromFile,
+  parseSchemaPackManifest,
+  runStatsCore,
+  runSyncCore,
+  SchemaPackManifestError,
+  SchemaPackLoaderError,
+  SchemaPackMutationError,
+  setExpertRoutingOnType,
+  setExtractableOnType,
+  UnknownPackError,
+  updateTypeOnPack,
+  __setPackLocatorForTests,
+  _resetPackLocatorForTests,
+} from '../core/schema-pack/index.ts';
+import type { SchemaPackManifest, PackPrimitive } from '../core/schema-pack/manifest-v1.ts';
+import { PACK_PRIMITIVES } from '../core/schema-pack/manifest-v1.ts';
+import { bundledPackPath } from '../core/schema-pack/bundled-assets.ts';
+import { gbrainPath, loadConfig, configPath, toEngineConfig, isThinClient, type GBrainConfig } from '../core/config.ts';
+import { opError } from '../core/ops/contract.ts';
+import { readDbSchemaPack } from '../core/schema-pack/best-effort.ts';
+import { sanitizeTypeForDisplay } from '../core/schema-pack/type-usage.ts';
+import { yamlScalar } from '../core/frontmatter-inference.ts';
+import { ROUTERS, SCHEMA_SUBCOMMANDS, subcommandHelpRequested } from '../cli/subcommands.ts';
+
+export { SCHEMA_SUBCOMMANDS as SUBCOMMANDS } from '../cli/subcommands.ts';
+
+export function printUsage(): void {
+  printHelp();
+}
+
+export async function runSchema(args: string[]): Promise<void> {
+  if (subcommandHelpRequested(args, ROUTERS.schema)) return printHelp();
+  const sub = args[0] as (typeof SCHEMA_SUBCOMMANDS)[number] | undefined;
+  switch (sub) {
+    case 'active':   return runActive(args.slice(1));
+    case 'list':     return runList(args.slice(1));
+    case 'show':     return runShow(args.slice(1));
+    case 'validate': return runValidate(args.slice(1));
+    case 'use':      return runUse(args.slice(1));
+    case 'detect':   return runDetectCmd(args.slice(1));
+    case 'suggest':  return runSuggestCmd(args.slice(1));
+    case 'review-candidates': return runReviewCandidatesCmd(args.slice(1));
+    case 'init':     return runInitCmd(args.slice(1));
+    case 'fork':     return runForkCmd(args.slice(1));
+    case 'edit':     return runEditCmd(args.slice(1));
+    case 'diff':     return runDiffCmd(args.slice(1));
+    case 'graph':    return runGraphCmd(args.slice(1));
+    case 'lint':     return runLintCmd(args.slice(1));
+    case 'explain':  return runExplainCmd(args.slice(1));
+    case 'review-orphans': return runReviewOrphansCmd(args.slice(1));
+    case 'downgrade': return runDowngradeCmd(args.slice(1));
+    case 'usage':    return runUsageCmd(args.slice(1));
+    case 'stats':    return runStatsCmd(args.slice(1));
+    case 'cardinality-preview': return runCardinalityPreviewCmd(args.slice(1));
+    case 'sync':     return runSyncCmd(args.slice(1));
+    case 'reload':   return runReloadCmd(args.slice(1));
+    case 'add-type': return runAddTypeCmd(args.slice(1));
+    case 'remove-type': return runRemoveTypeCmd(args.slice(1));
+    case 'update-type': return runUpdateTypeCmd(args.slice(1));
+    case 'add-alias': return runAddAliasCmd(args.slice(1));
+    case 'remove-alias': return runRemoveAliasCmd(args.slice(1));
+    case 'add-prefix': return runAddPrefixCmd(args.slice(1));
+    case 'remove-prefix': return runRemovePrefixCmd(args.slice(1));
+    case 'add-link-type': return runAddLinkTypeCmd(args.slice(1));
+    case 'remove-link-type': return runRemoveLinkTypeCmd(args.slice(1));
+    case 'set-extractable': return runSetExtractableCmd(args.slice(1));
+    case 'set-expert-routing': return runSetExpertRoutingCmd(args.slice(1));
+    case 'scaffold-extractable': return runScaffoldExtractableCmd(args.slice(1));
+    case undefined:
+      return printHelp();
+    default:
+      console.error(`Unknown schema subcommand: ${sub}`);
+      console.error('Run `gbrain schema --help` for available commands.');
+      process.exit(2);
+  }
+}
+
+function printHelp(): void {
+  console.log(`gbrain schema — active schema pack management
+
+Inspection:
+  active                  Show resolved pack + which tier provided it
+  list                    List installed packs (bundled + ~/.gbrain/schema-packs/)
+  show [<pack>]           Pretty-print a manifest (default: active pack)
+  validate [<pack>]       Validate manifest shape against the v1 schema
+  graph                   Show type/primitive graph with link-verb edges
+  lint [<pack>]           Lint a pack for duplicates, dangling refs, etc.
+  stats [--source <id>]   Per-type page counts + typed-coverage from the DB
+  cardinality-preview [--source <id>]
+                          Pages with several live relationships of a declared single-value type, and what the dream cycle closes (read-only)
+  explain <type>          Print resolved settings for a single type
+  usage [--since N(d|w|m)] CLI invocation telemetry summary
+
+Activation:
+  use <pack>              Activate pack (writes ~/.gbrain/config.json schema_pack)
+  downgrade [--to <pack>] Restore the previous active pack
+  reload [--pack <name>]  Flush the in-process pack cache; --pack scopes
+
+Authoring (v0.40.6.0):
+  init <name>             Scaffold a new pack (extends gbrain-base)
+  fork <src> <new>        Copy a pack to a new editable name
+  edit <name>             Print the on-disk pack file path
+  diff <a> <b>            Compare page_type sets across two packs
+
+  add-type <name> --primitive <p> (--prefix <dir/> | --no-prefix)
+                          [--extractable] [--expert] [--alias <a>]* [--pack <name>]
+  remove-type <name>      [--pack <name>]
+  update-type <name>      [--extractable BOOL] [--expert BOOL] [--primitive P] [--pack <name>]
+  add-alias <type> <alias>      [--pack <name>]
+  remove-alias <type> <alias>   [--pack <name>]
+  add-prefix <type> <prefix>    [--pack <name>]
+  remove-prefix <type> <prefix> [--pack <name>]
+  add-link-type <name> [--inverse <verb>] [--page-type <t>] [--target-type <t>] [--pack <name>]
+  remove-link-type <name>       [--pack <name>]
+  set-extractable <type> <true|false>      [--pack <name>]
+  set-expert-routing <type> <true|false>   [--pack <name>]
+  scaffold-extractable <type> [--pack <name>] [--dims a,b,c] [--force]
+                          v0.42: declare a pack-supplied prompt + fixtures
+                          + eval dimensions for an LLM-backed extractor.
+                          Generates prompts/extract/<type>.md and
+                          fixtures/extract/<type>.jsonl stubs the
+                          pack-author edits, then pairs with
+                          \`gbrain extract benchmark\` for the iteration loop.
+
+Discovery + repair:
+  detect                  Cluster pages by source_path → candidate page_types
+  detect --fields         Per page type: frontmatter keys, fact categories and
+                          relation types in use (100% required, >=25% optional)
+  suggest                 Heuristic refinement on detect output
+  review-candidates       Review disk-derived candidates; promote with --apply
+  review-orphans          List pages with no active-pack type match
+  sync [--apply]          Backfill page.type for rows matching pack prefixes
+                          (dry-run by default; chunked UPDATE on apply)
+
+All new verbs accept --json. Verbs scoped by source accept --source <id>.
+Pass --force to bypass per-pack lock contention on writes.
+
+Resolution chain (7-tier, tier 1 trust-gated):
+  1. Per-call --schema-pack flag (CLI only)
+  2. GBRAIN_SCHEMA_PACK env var
+  3. Per-source DB config schema_pack.source.<id>
+  4. Brain-wide DB config schema_pack
+  5. gbrain.yml schema: section
+  6. ~/.gbrain/config.json schema_pack
+  7. Default: gbrain-base
+`);
+}
+
+/**
+ * DB-plane `schema_pack` (tier 4) for the read-only inspection verbs
+ * (active / show / graph / lint / explain), so they all report the SAME pack
+ * the engine queries with on brains whose active pack was flipped via
+ * `gbrain config set schema_pack` / unify-types (#3792, #4653). Best-effort
+ * AND gated on an actually-configured brain (cfg non-null): an unconfigured
+ * home has no DB plane to consult, and connecting would cold-CREATE a PGLite
+ * data dir as a side effect of a read-only command. No connectable DB →
+ * undefined, so file/env resolution stands.
+ */
+async function readDbSchemaPackConfig(cfg: GBrainConfig | null): Promise<string | undefined> {
+  if (!cfg) return undefined;
+  try {
+    return await withConnectedEngine((engine) => readDbSchemaPack(engine));
+  } catch {
+    return undefined;
+  }
+}
+
+async function runActive(args: string[]): Promise<void> {
+  const { json, source } = parseFlags(args);
+  const { runSchemaActive } = await import('./schema-active.ts');
+  return runSchemaActive({ json, sourceId: source }, withConnectedEngine);
+}
+
+function runList(_args: string[]): void {
+  const bundled = [...BUNDLED_PACK_NAMES];
+  const installedDir = gbrainPath('schema-packs');
+  const installed: string[] = [];
+  if (existsSync(installedDir)) {
+    for (const entry of readdirSync(installedDir)) {
+      const candidates = ['pack.yaml', 'pack.yml', 'pack.json'];
+      for (const c of candidates) {
+        if (existsSync(join(installedDir, entry, c))) {
+          installed.push(entry);
+          break;
+        }
+      }
+    }
+  }
+  console.log('Bundled packs:');
+  for (const name of bundled) console.log(`  ${name}`);
+  if (installed.length > 0) {
+    console.log('\nInstalled packs (~/.gbrain/schema-packs/):');
+    for (const name of installed) console.log(`  ${name}`);
+  } else {
+    console.log('\nNo user-installed packs (~/.gbrain/schema-packs/ empty or missing).');
+  }
+}
+
+async function runShow(args: string[]): Promise<void> {
+  // v0.39 T18 — `gbrain schema show --as-filing-rules` emits the JSON
+  // shape currently maintained by hand at `skills/_brain-filing-rules.json`.
+  // First step of the 4-step T18 sequence (per codex finding #3): ship
+  // the alternative source, then migrate consumers, then update tests,
+  // then DELETE the hand-maintained files. v0.39.0.0 ships the source;
+  // consumer migration + deletion deferred to v0.39.1 to avoid breaking
+  // synthesize/patterns/filing-audit/check-resolvable mid-wave.
+  const asFilingRules = args.includes('--as-filing-rules');
+  const jsonFlag = args.includes('--json') || asFilingRules;
+  const packArg = args.find((a) => !a.startsWith('--'));
+  const packName = packArg;
+  let manifest;
+  if (packName) {
+    const path = packPathByName(packName);
+    if (!path) {
+      console.error(`Unknown pack: ${packName}`);
+      console.error('Run `gbrain schema list` to see available packs.');
+      process.exit(1);
+    }
+    manifest = loadPackFromFile(path);
+  } else {
+    const cfg = loadConfig();
+    const pack = await loadActivePack({ cfg, remote: false, dbConfig: await readDbSchemaPackConfig(cfg) });
+    manifest = pack.manifest;
+  }
+  if (asFilingRules) {
+    // Emit the filing-rules-shaped JSON for downstream consumers per T18.
+    // Shape mirrors skills/_brain-filing-rules.json so synthesize.ts +
+    // patterns.ts + filing-audit.ts + check-resolvable.ts can migrate
+    // their reads to this output without re-shaping.
+    const filingRules = {
+      schema_version: 1,
+      source: 'gbrain schema show --as-filing-rules',
+      pack: { name: manifest.name, version: manifest.version },
+      page_types: manifest.page_types.map((pt) => ({
+        name: pt.name,
+        primitive: pt.primitive,
+        directory: pt.path_prefixes[0] ?? null,
+        path_prefixes: pt.path_prefixes,
+        extractable: pt.extractable,
+        expert_routing: pt.expert_routing,
+        aliases: pt.aliases ?? [],
+      })),
+      // Preserve the dream_synthesize_paths.globs key the synthesize
+      // protected-name guard depends on. v0.39.1 migration moves this
+      // to a first-class manifest field; for now derive from extractable
+      // entity types (the same set the old file curated).
+      dream_synthesize_paths: {
+        globs: manifest.page_types
+          .filter((pt) => pt.extractable)
+          .flatMap((pt) => pt.path_prefixes.map((p) => `${p}**`)),
+      },
+    };
+    console.log(JSON.stringify(filingRules, null, 2));
+    return;
+  }
+  if (jsonFlag) {
+    console.log(JSON.stringify({ schema_version: 1, ...manifest }, null, 2));
+    return;
+  }
+  console.log(`# ${manifest.name} v${manifest.version}`);
+  if (manifest.description) console.log(`# ${manifest.description}`);
+  console.log(`# extends: ${manifest.extends ?? 'null (no parent)'}`);
+  console.log();
+  console.log(`Page types (${manifest.page_types.length}):`);
+  for (const pt of manifest.page_types) {
+    const flags: string[] = [];
+    if (pt.extractable) flags.push('extractable');
+    if (pt.expert_routing) flags.push('expert');
+    const flagStr = flags.length > 0 ? ` [${flags.join(', ')}]` : '';
+    const prefixStr = pt.path_prefixes.length > 0 ? ` (${pt.path_prefixes.join(', ')})` : '';
+    const aliasStr = pt.aliases.length > 0 ? ` aliases:[${pt.aliases.join(', ')}]` : '';
+    console.log(`  ${pt.name} :: ${pt.primitive}${prefixStr}${aliasStr}${flagStr}`);
+  }
+  console.log();
+  console.log(`Link verbs (${manifest.link_types.length}):`);
+  for (const lt of manifest.link_types) {
+    const inferenceStr = lt.inference
+      ? lt.inference.page_type
+        ? ` (page_type: ${lt.inference.page_type})`
+        : lt.inference.regex
+          ? ` (regex)`
+          : ''
+      : '';
+    console.log(`  ${lt.name}${inferenceStr}`);
+  }
+  console.log();
+  console.log(`Takes kinds: ${manifest.takes_kinds.join(', ')}`);
+  console.log(`Enrichable types: ${manifest.enrichable_types.map(e => e.type).join(', ') || '(none)'}`);
+}
+
+function runValidate(args: string[]): void {
+  const packName = args[0];
+  let path: string | null;
+  if (packName) {
+    path = packPathByName(packName);
+    if (!path) {
+      console.error(`Unknown pack: ${packName}`);
+      process.exit(1);
+    }
+  } else {
+    path = packPathByName('gbrain-base');
+    if (!path) {
+      console.error('No active pack — provide a pack name.');
+      process.exit(1);
+    }
+  }
+  try {
+    const manifest = loadPackFromFile(path);
+    console.log(`✓ ${manifest.name} v${manifest.version}: valid manifest`);
+    console.log(`  Path: ${path}`);
+    console.log(`  Page types: ${manifest.page_types.length}`);
+    console.log(`  Link verbs: ${manifest.link_types.length}`);
+    console.log(`  Takes kinds: ${manifest.takes_kinds.length}`);
+  } catch (e) {
+    if (e instanceof SchemaPackManifestError) {
+      console.error(`✗ Invalid manifest at ${path}`);
+      console.error(`  Code: ${e.code}`);
+      console.error(`  ${e.message}`);
+      process.exit(1);
+    } else if (e instanceof SchemaPackLoaderError) {
+      console.error(`✗ Loader error at ${e.path}`);
+      console.error(`  ${e.message}`);
+      process.exit(1);
+    } else {
+      throw e;
+    }
+  }
+}
+
+function runUse(args: string[]): void {
+  const packName = args[0];
+  if (!packName) {
+    console.error('Usage: gbrain schema use <pack-name>');
+    process.exit(2);
+  }
+  const path = packPathByName(packName);
+  if (!path) {
+    console.error(`Unknown pack: ${packName}`);
+    console.error('Run `gbrain schema list` to see available packs.');
+    process.exit(1);
+  }
+  // Validate before activating — refuse to set a broken pack.
+  try {
+    loadPackFromFile(path);
+  } catch (e) {
+    console.error(`Refusing to activate ${packName}: ${(e as Error).message}`);
+    process.exit(1);
+  }
+  // Write to file-plane config (~/.gbrain/config.json schema_pack field).
+  // Tier 6 in the resolution chain — tiers 1-5 (per-call, env, DB) can
+  // still override this without editing the file.
+  const cfg = loadConfig() ?? { engine: 'pglite' as const };
+  const updated = { ...cfg, schema_pack: packName };
+  const cfgPath = configPath();
+  mkdirSync(dirname(cfgPath), { recursive: true });
+  writeFileSync(cfgPath, JSON.stringify(updated, null, 2) + '\n', 'utf-8');
+  console.log(`✓ Active schema pack set to: ${packName}`);
+  console.log(`  Written to: ${cfgPath}`);
+  console.log(`\nRun \`gbrain schema active\` to verify resolution.`);
+}
+
+function packPathByName(name: string): string | null {
+  if (BUNDLED_PACK_NAMES.has(name)) {
+    // Statically bundled asset path [ENG-6] (#4266): resolves in dev AND
+    // inside `bun build --compile` binaries, where the import.meta-relative
+    // candidates below don't exist.
+    const asset = bundledPackPath(name);
+    if (asset) return asset;
+    // Resolve bundled YAML — import.meta fallback, try a few locations.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const candidates = [
+      join(here, '..', 'core', 'schema-pack', 'base', `${name}.yaml`),
+      join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', `${name}.yaml`),
+    ];
+    for (const c of candidates) {
+      if (existsSync(c)) return c;
+    }
+    return null;
+  }
+  const baseDir = gbrainPath('schema-packs', name);
+  for (const c of ['pack.yaml', 'pack.yml', 'pack.json']) {
+    const candidate = join(baseDir, c);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+// Test seam — let unit tests inject the locator if needed.
+export const _testHelpers = {
+  __setPackLocatorForTests,
+  _resetPackLocatorForTests,
+  packPathByName,
+};
+
+// =================================================================
+// v0.39.0.0 schema cathedral verbs (T2-T5, T20, T23)
+// =================================================================
+//
+// Each verb shares two contracts:
+//   - --json output flag (T6 CLI contract)
+//   - --source <id> flag where source-scoping makes sense (T6 contract)
+// The contract is pinned in test/schema-cli-contract.test.ts so future
+// verbs can't drift.
+
+import { runDetect } from '../core/schema-pack/detect.ts';
+import { runSuggest } from '../core/schema-pack/suggest.ts';
+import {
+  runReviewCandidates,
+  runReviewOrphans,
+} from '../core/schema-pack/review.ts';
+
+interface ParsedFlags {
+  json: boolean;
+  source: string | undefined;
+  positional: string[];
+}
+
+function parseFlags(args: string[]): ParsedFlags {
+  let json = false;
+  let source: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--json') { json = true; continue; }
+    if (a === '--source' || a === '--source-id') { source = args[++i]; continue; }
+    if (a.startsWith('--source=')) { source = a.slice('--source='.length); continue; }
+    if (a.startsWith('--source-id=')) { source = a.slice('--source-id='.length); continue; }
+    positional.push(a);
+  }
+  return { json, source, positional };
+}
+
+async function withConnectedEngine<T>(fn: (engine: import('../core/engine.ts').BrainEngine) => Promise<T>): Promise<T> {
+  const { createEngine } = await import('../core/engine-factory.ts');
+  const cfg: GBrainConfig = loadConfig() ?? { engine: 'pglite' };
+  // A thin client has no local database: refuse rather than die with "No
+  // database URL" or read an empty in-memory PGLite (#5102).
+  if (isThinClient(cfg) && !cfg.database_url) {
+    throw opError('requires_local_engine',
+      'This `gbrain schema` subcommand reads the brain database, which lives on the brain host; it is not routable from a thin client.',
+      'Use the matching schema_* MCP tool (e.g. `schema_stats`) from your agent, or run it on the brain host.');
+  }
+  // PR #1321 (closed) defensive fix retained: build the EngineConfig once and
+  // pass it to BOTH createEngine and engine.connect. The factory captures
+  // config at construction; explicit re-pass at connect() is defense in depth
+  // against future engine implementations that read URL from connect-time.
+  const connectConfig = toEngineConfig(cfg);
+  const engine = await createEngine(connectConfig);
+  await engine.connect(connectConfig);
+  try {
+    return await fn(engine);
+  } finally {
+    await engine.disconnect();
+  }
+}
+
+// ------------- T2: schema detect ----------------------------------
+
+async function runDetectCmd(args: string[]): Promise<void> {
+  const { json, source, positional } = parseFlags(args);
+  if (positional.includes('--fields')) return runFieldUsageCmd(json, source);
+  const result = await withConnectedEngine((engine) => runDetect(engine, { sourceId: source }));
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
+    return;
+  }
+  console.log(`Total pages scanned:    ${result.total_pages}`);
+  console.log(`  with frontmatter type:  ${result.typed_pages}`);
+  console.log(`  without type (untyped): ${result.untyped_pages}`);
+  console.log('');
+  console.log('Candidate page_types (top by page count):');
+  for (const p of result.prefixes) {
+    const samples = p.sample_types.length ? ` [samples: ${p.sample_types.join(', ')}]` : '';
+    console.log(`  ${p.prefix.padEnd(30)} ${String(p.page_count).padStart(6)} pages → suggest type \`${p.suggested_type}\`${samples}`);
+  }
+  console.log('');
+  console.log('Next: gbrain schema review-candidates  (decide promote / rename / ignore)');
+  console.log('      gbrain schema suggest             (LLM refinement on this candidate)');
+}
+
+async function runFieldUsageCmd(json: boolean, source: string | undefined): Promise<void> {
+  const { runFieldUsage, REQUIRED_SHARE, OPTIONAL_SHARE } = await import('../core/schema-pack/field-usage.ts');
+  const types = await withConnectedEngine((engine) => runFieldUsage(engine, { sourceId: source }));
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, required_share: REQUIRED_SHARE, optional_share: OPTIONAL_SHARE, types }, null, 2));
+    return;
+  }
+  console.log(`Field usage by page type (required = on every sampled page, optional = on at least ${OPTIONAL_SHARE * 100}%).`);
+  console.log('Fields are frontmatter keys, [fact categories] and relation types -> from line-grammar lines.');
+  for (const t of types) {
+    console.log('');
+    console.log(`${t.type}  (${t.pages} pages, ${t.sampled} sampled)`);
+    console.log(`  required: ${t.required.join(', ') || '(none)'}`);
+    console.log(`  optional: ${t.optional.join(', ') || '(none)'}`);
+  }
+  console.log('');
+  console.log('Next: declare the relation types you rely on in your schema pack (gbrain schema add-link-type <name>) so relation lines use them.');
+}
+
+// ------------- T3: schema suggest ---------------------------------
+
+async function runSuggestCmd(args: string[]): Promise<void> {
+  const { json, source } = parseFlags(args);
+  const result = await withConnectedEngine((engine) => runSuggest(engine, { sourceId: source }));
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
+    return;
+  }
+  console.log(`Suggestions: ${result.suggestions.length}`);
+  for (const s of result.suggestions) {
+    console.log(`  [${s.confidence.toFixed(2)}] ${s.kind.padEnd(12)} ${s.summary}`);
+  }
+  if (result.notes.length) {
+    console.log('');
+    console.log('Notes:');
+    for (const n of result.notes) console.log(`  - ${n}`);
+  }
+}
+
+// ------------- T4: schema review-candidates -----------------------
+
+async function runReviewCandidatesCmd(args: string[]): Promise<void> {
+  const { json, source, positional } = parseFlags(args);
+  const applyIdx = positional.indexOf('--apply');
+  const applySlug = applyIdx >= 0 ? positional[applyIdx + 1] : undefined;
+  const result = await withConnectedEngine((engine) =>
+    runReviewCandidates(engine, { sourceId: source, applySlug }),
+  );
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
+    return;
+  }
+  // Codex finding #10: CLI must surface that this is DISK-derived, not
+  // audit-log review. Make this loud so users understand drift semantics.
+  console.log('Disk-derived candidates from current brain state.');
+  console.log(`Audit history (cross-reference): ~/.gbrain/audit/schema-candidates-*.jsonl`);
+  console.log('');
+  if (result.applied) {
+    console.log(`Applied: ${result.applied}`);
+    return;
+  }
+  if (!result.candidates.length) {
+    console.log('No candidate types found — your active pack matches current content shape.');
+    return;
+  }
+  console.log('Candidate types (run with --apply <prefix> to promote):');
+  for (const c of result.candidates) {
+    console.log(`  ${c.prefix.padEnd(30)} ${String(c.page_count).padStart(6)} pages  (suggest \`${c.suggested_type}\`)`);
+  }
+}
+
+// ------------- T5: 8 remaining cathedral verbs --------------------
+// These are intentionally THIN. Each shares loadActivePack + manifest
+// validation. Mark `init`, `fork`, `edit`, `diff`, `graph`, `explain` as
+// EXPERIMENTAL-TIER (T23) — telemetry-gated for v0.40+ retro.
+
+const EXPERIMENTAL_VERBS = new Set(['init', 'fork', 'edit', 'diff', 'graph', 'explain']);
+
+async function runInitCmd(args: string[]): Promise<void> {
+  const { json, positional } = parseFlags(args);
+  const name = positional[0];
+  if (!name) {
+    console.error('Usage: gbrain schema init <pack-name>  (experimental)');
+    process.exit(2);
+  }
+  const baseDir = gbrainPath('schema-packs', name);
+  if (existsSync(baseDir)) {
+    console.error(`Pack \`${name}\` already exists at ${baseDir}`);
+    process.exit(1);
+  }
+  assertManagedFilesystemWrite(baseDir);
+  mkdirSync(baseDir, { recursive: true });
+  // Cast through Partial — the validate verb is the authoritative shape check.
+  // The YAML written below has the minimum fields; lint/validate catch gaps.
+  const stub = {
+    api_version: 'gbrain-schema-pack-v1' as const,
+    name,
+    version: '0.0.1',
+    gbrain_min_version: '0.39.0',
+    extends: 'gbrain-base',
+    description: `Stub pack scaffolded by 'gbrain schema init ${name}'. Edit ${baseDir}/pack.yaml then 'gbrain schema validate' + 'gbrain schema use ${name}'.`,
+    page_types: [] as SchemaPackManifest['page_types'],
+    link_types: [] as SchemaPackManifest['link_types'],
+    takes_kinds: ['fact', 'take', 'bet', 'hunch'] as string[],
+    borrow_from: [] as SchemaPackManifest['borrow_from'],
+    frontmatter_links: [] as SchemaPackManifest['frontmatter_links'],
+    enrichable_types: [] as SchemaPackManifest['enrichable_types'],
+    filing_rules: [] as SchemaPackManifest['filing_rules'],
+  };
+  const yaml = `# Stub pack — extends gbrain-base by default. Add your own page_types below.
+api_version: ${stub.api_version}
+name: ${yamlScalar(stub.name)}
+version: ${stub.version}
+gbrain_min_version: ${stub.gbrain_min_version}
+extends: gbrain-base
+description: ${JSON.stringify(stub.description)}
+
+page_types: []
+link_types: []
+takes_kinds:
+  - fact
+  - take
+  - bet
+  - hunch
+borrow_from: []
+`;
+  writeFileSync(join(baseDir, 'pack.yaml'), yaml);
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, name, path: baseDir, tier: 'experimental' }, null, 2));
+    return;
+  }
+  console.log(`(experimental) Scaffolded pack \`${name}\` at ${baseDir}/pack.yaml`);
+  console.log(`Next: edit pack.yaml, then run \`gbrain schema validate ${name}\` and \`gbrain schema use ${name}\`.`);
+}
+
+async function runForkCmd(args: string[]): Promise<void> {
+  const { json, positional } = parseFlags(args);
+  const from = positional[0];
+  const to = positional[1];
+  if (!from || !to) {
+    console.error('Usage: gbrain schema fork <source-pack> <new-name>  (experimental)');
+    process.exit(2);
+  }
+  const fromPath = packPathByName(from);
+  if (!fromPath) {
+    console.error(`Source pack \`${from}\` not found.`);
+    process.exit(1);
+  }
+  const toDir = gbrainPath('schema-packs', to);
+  if (existsSync(toDir)) {
+    console.error(`Pack \`${to}\` already exists at ${toDir}`);
+    process.exit(1);
+  }
+  assertManagedFilesystemWrite(toDir);
+  mkdirSync(toDir, { recursive: true });
+  const sourceManifest = loadPackFromFile(fromPath);
+  const forked = { ...sourceManifest, name: to, version: '0.0.1' };
+  writeFileSync(join(toDir, 'pack.json'), JSON.stringify(forked, null, 2));
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, from, to, path: toDir, tier: 'experimental' }, null, 2));
+    return;
+  }
+  console.log(`(experimental) Forked \`${from}\` → \`${to}\` at ${toDir}/pack.json`);
+}
+
+async function runEditCmd(args: string[]): Promise<void> {
+  const { json, positional } = parseFlags(args);
+  const name = positional[0];
+  if (!name) {
+    console.error('Usage: gbrain schema edit <pack-name>  (experimental)');
+    process.exit(2);
+  }
+  const p = packPathByName(name);
+  if (!p) {
+    console.error(`Pack \`${name}\` not found.`);
+    process.exit(1);
+  }
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, name, path: p, tier: 'experimental' }, null, 2));
+    return;
+  }
+  console.log(`(experimental) Pack file: ${p}`);
+  console.log(`Open it in your editor; then run \`gbrain schema validate ${name}\`.`);
+}
+
+async function runDiffCmd(args: string[]): Promise<void> {
+  const { json, positional } = parseFlags(args);
+  const a = positional[0];
+  const b = positional[1];
+  if (!a || !b) {
+    console.error('Usage: gbrain schema diff <pack-a> <pack-b>  (experimental)');
+    process.exit(2);
+  }
+  const aPath = packPathByName(a);
+  const bPath = packPathByName(b);
+  if (!aPath || !bPath) {
+    console.error('One or both packs not found.');
+    process.exit(1);
+  }
+  const aPack = loadPackFromFile(aPath);
+  const bPack = loadPackFromFile(bPath);
+  const aTypes = new Set(aPack.page_types.map((t) => t.name));
+  const bTypes = new Set(bPack.page_types.map((t) => t.name));
+  const onlyA = [...aTypes].filter((t) => !bTypes.has(t)).sort();
+  const onlyB = [...bTypes].filter((t) => !aTypes.has(t)).sort();
+  const both = [...aTypes].filter((t) => bTypes.has(t)).sort();
+  if (json) {
+    console.log(JSON.stringify({
+      schema_version: 1,
+      a, b,
+      only_in_a: onlyA,
+      only_in_b: onlyB,
+      common: both,
+      tier: 'experimental',
+    }, null, 2));
+    return;
+  }
+  console.log(`(experimental) Diff ${a} ↔ ${b}`);
+  console.log(`Only in ${a}: ${onlyA.length ? onlyA.join(', ') : '<none>'}`);
+  console.log(`Only in ${b}: ${onlyB.length ? onlyB.join(', ') : '<none>'}`);
+  console.log(`Common: ${both.length}`);
+}
+
+async function runGraphCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const cfg = loadConfig();
+  const pack = await loadActivePack({ cfg, remote: false, dbConfig: await readDbSchemaPackConfig(cfg) });
+  if (json) {
+    console.log(JSON.stringify({
+      schema_version: 1,
+      pack: pack.manifest.name,
+      types: pack.manifest.page_types.map((t) => ({ name: t.name, primitive: t.primitive, aliases: t.aliases ?? [] })),
+      tier: 'experimental',
+    }, null, 2));
+    return;
+  }
+  console.log(`(experimental) ASCII graph for pack \`${pack.manifest.name}\`:`);
+  console.log('');
+  for (const t of pack.manifest.page_types) {
+    const aliases = (t.aliases ?? []).length ? `  aliases: ${(t.aliases ?? []).join(', ')}` : '';
+    console.log(`  ${t.name.padEnd(20)} (${t.primitive})${aliases}`);
+  }
+}
+
+async function runLintCmd(args: string[]): Promise<void> {
+  const { json, positional } = parseFlags(args);
+  const { values: { 'with-db': withDb }, positionals } = parseArgs({
+    args: positional,
+    allowPositionals: true,
+    options: {
+      'with-db': { type: 'boolean' },
+    },
+  });
+  if (positionals.length > 1) {
+    console.error('Usage: gbrain schema lint [<pack>] [--with-db] [--json]');
+    process.exit(2);
+  }
+  const name = positionals[0];
+  const cfg = loadConfig();
+  // v0.40.6.0 Phase 5: swap basic 2-rule check for the rich 11-rule lint
+  // suite from Phase 1.5. File-plane rules run by default; --with-db
+  // opts into extractable_empty_corpus + mutation_count_anomaly which
+  // need an engine connection.
+  const { runAllLintRules } = await import('../core/schema-pack/lint-rules.ts');
+  // Resolve + lint in one step so --with-db reads the tier-4 DB-plane
+  // schema_pack (#4653) on the SAME connection the DB-backed rules use.
+  const lint = async (engine?: import('../core/engine.ts').BrainEngine) => {
+    let pack: SchemaPackManifest | null;
+    if (name) {
+      const p = packPathByName(name);
+      let raw: SchemaPackManifest | null;
+      try { raw = p ? loadPackFromFile(p) : null; } catch { raw = null; }
+      if (raw) {
+        // #4501: lint the MERGED manifest (extends chain + borrow_from
+        // resolved), matching the no-name branch's loadActivePack path —
+        // a child pack referencing inherited parent types must not fail
+        // raw-manifest lint. Fall back to the raw child (with a stderr
+        // warning) when the chain can't be resolved, e.g. missing parent.
+        try {
+          pack = (await loadResolvedPackByName(name)).manifest;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          console.error(`warn: could not resolve extends chain for pack \`${name}\` (${msg}); linting raw manifest only`);
+          pack = raw;
+        }
+      } else {
+        pack = null;
+      }
+    } else {
+      const dbConfig = engine ? await readDbSchemaPack(engine) : await readDbSchemaPackConfig(cfg);
+      pack = (await loadActivePack({ cfg, remote: false, dbConfig })).manifest;
+    }
+    if (!pack) {
+      console.error(`Pack not found: ${name}`);
+      process.exit(1);
+    }
+    return { pack, report: await runAllLintRules(pack, engine ? { engine } : undefined) };
+  };
+  const { pack, report } = withDb ? await withConnectedEngine(lint) : await lint();
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, pack: pack.name, ...report }, null, 2));
+    if (!report.ok) process.exit(1);
+    return;
+  }
+  if (report.ok && report.warnings.length === 0) {
+    console.log(`OK — pack \`${pack.name}\` lint clean.`);
+    return;
+  }
+  console.log(`Pack \`${pack.name}\` lint:`);
+  for (const e of report.errors) {
+    console.log(`  ERROR (${e.rule}): ${e.message}`);
+    if (e.hint) console.log(`    hint: ${e.hint}`);
+  }
+  for (const w of report.warnings) {
+    console.log(`  warn (${w.rule}): ${w.message}`);
+    if (w.hint) console.log(`    hint: ${w.hint}`);
+  }
+  if (!report.ok) process.exit(1);
+}
+
+async function runExplainCmd(args: string[]): Promise<void> {
+  const { json, positional } = parseFlags(args);
+  const typeName = positional[0];
+  if (!typeName) {
+    console.error('Usage: gbrain schema explain <type-name>  (experimental)');
+    process.exit(2);
+  }
+  const cfg = loadConfig();
+  const pack = await loadActivePack({ cfg, remote: false, dbConfig: await readDbSchemaPackConfig(cfg) });
+  const found = pack.manifest.page_types.find((t) => t.name === typeName);
+  if (!found) {
+    console.error(`Type \`${typeName}\` not in active pack \`${pack.manifest.name}\`.`);
+    process.exit(1);
+  }
+  if (json) {
+    console.log(JSON.stringify({
+      schema_version: 1,
+      pack: pack.manifest.name,
+      type: found,
+      tier: 'experimental',
+    }, null, 2));
+    return;
+  }
+  console.log(`(experimental) Type \`${found.name}\` in pack \`${pack.manifest.name}\`:`);
+  console.log(`  primitive:     ${found.primitive}`);
+  console.log(`  path_prefixes: ${found.path_prefixes.join(', ')}`);
+  console.log(`  aliases:       ${(found.aliases ?? []).join(', ') || '<none>'}`);
+  console.log(`  extractable:   ${found.extractable}`);
+  console.log(`  expert_routing: ${found.expert_routing}`);
+}
+
+async function runReviewOrphansCmd(args: string[]): Promise<void> {
+  const { json, source } = parseFlags(args);
+  const result = await withConnectedEngine((engine) =>
+    runReviewOrphans(engine, { sourceId: source }),
+  );
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
+    return;
+  }
+  console.log(`Orphan pages (no active-pack type match): ${result.orphan_count}`
+    + (result.pack ? ` (pack ${result.pack})` : ' (no active pack resolved: only untyped pages checked)'));
+  for (const u of result.undeclared_types) {
+    console.log(`  type '${sanitizeTypeForDisplay(u.type)}' is not declared in the pack: ${u.count} page(s)`);
+  }
+  for (const o of result.orphans.slice(0, 20)) {
+    console.log(`  ${o.slug}${o.reason === 'undeclared' ? ` (type ${sanitizeTypeForDisplay(o.type)})` : ' (untyped)'}`);
+  }
+  if (result.orphan_count > 20) {
+    console.log(`  ... and ${result.orphan_count - 20} more (use --json to see all)`);
+  }
+}
+
+// ------------- T20: schema downgrade ------------------------------
+
+async function runDowngradeCmd(args: string[]): Promise<void> {
+  const { json, positional } = parseFlags(args);
+  const target = positional.includes('--to')
+    ? positional[positional.indexOf('--to') + 1]
+    : undefined;
+  // Find the previous pack from ~/.gbrain/schema-pack-history.jsonl OR honor --to <pack>.
+  const historyPath = gbrainPath('schema-pack-history.jsonl');
+  let restoredTo: string | null = null;
+  if (target) {
+    restoredTo = target;
+  } else if (existsSync(historyPath)) {
+    const lines = readFileSync(historyPath, 'utf-8').trim().split('\n').filter(Boolean);
+    if (lines.length >= 2) {
+      // Most-recent line is current; second-most-recent is the previous.
+      try {
+        const prev = JSON.parse(lines[lines.length - 2]) as { pack?: string };
+        if (prev.pack) restoredTo = prev.pack;
+      } catch {
+        // ignore
+      }
+    }
+  }
+  if (!restoredTo) {
+    restoredTo = 'gbrain-base';
+  }
+  const cfg = loadConfig();
+  const updated = { ...cfg, schema_pack: restoredTo };
+  const path = configPath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(updated, null, 2));
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, downgraded_to: restoredTo }, null, 2));
+    return;
+  }
+  console.log(`Active pack restored to \`${restoredTo}\` in ${path}`);
+  console.log('Run `gbrain schema active` to verify. Note: this command restores CONFIG only.');
+  console.log('Custom-typed pages, cache rows, and eval rows from v0.39 are not auto-cleaned.');
+  console.log('See docs/architecture/schema-packs.md for the full revert procedure.');
+}
+
+// ------------- T23: gbrain schema usage ---------------------------
+
+async function runUsageCmd(args: string[]): Promise<void> {
+  const { json, positional } = parseFlags(args);
+  const sinceArg = positional.includes('--since') ? positional[positional.indexOf('--since') + 1] : '30d';
+  const days = parseSinceDays(sinceArg);
+  const { readRecentSchemaEvents } = await import('../core/schema-events.ts');
+  const events = readRecentSchemaEvents(days);
+  const counts = new Map<string, number>();
+  for (const e of events) {
+    counts.set(e.verb, (counts.get(e.verb) ?? 0) + 1);
+  }
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  if (json) {
+    console.log(JSON.stringify({
+      schema_version: 1,
+      since_days: days,
+      total_invocations: events.length,
+      per_verb: Object.fromEntries(sorted),
+      experimental_verbs: [...EXPERIMENTAL_VERBS],
+    }, null, 2));
+    return;
+  }
+  console.log(`Schema CLI usage (last ${days}d):`);
+  console.log(`Total invocations: ${events.length}`);
+  console.log('');
+  for (const [verb, cnt] of sorted) {
+    const tag = EXPERIMENTAL_VERBS.has(verb) ? ' (experimental)' : '';
+    console.log(`  ${verb.padEnd(22)} ${String(cnt).padStart(6)}${tag}`);
+  }
+  console.log('');
+  console.log('Experimental verbs are candidates for deprecation in v0.40+ if usage stays low.');
+}
+
+function parseSinceDays(s: string): number {
+  const m = /^(\d+)([dhwm])?$/.exec(s.trim());
+  if (!m) return 30;
+  const n = parseInt(m[1], 10);
+  const unit = m[2] ?? 'd';
+  switch (unit) {
+    case 'h': return Math.max(1, Math.ceil(n / 24));
+    case 'd': return n;
+    case 'w': return n * 7;
+    case 'm': return n * 30;
+    default: return n;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// v0.40.6.0 Schema Cathedral v3 — 14 new authoring + DB-aware verbs.
+//
+// All handlers thin-wrap a pure core function from src/core/schema-pack/
+// (see Phase 2 mutate.ts, Phase 3 stats.ts/sync.ts). CLI prints to
+// stdout (text or --json) and exits with a meaningful code.
+// ──────────────────────────────────────────────────────────────────────
+
+function parseBool(raw: string | undefined): boolean | null {
+  if (raw === undefined) return null;
+  const lower = raw.trim().toLowerCase();
+  if (lower === 'true' || lower === '1' || lower === 'yes') return true;
+  if (lower === 'false' || lower === '0' || lower === 'no') return false;
+  return null;
+}
+
+/** W4.10: the subcommand's positionals, skipping flag values (`--pack mine` never names the type). */
+async function positionals(args: string[], valueFlags: readonly string[] = []): Promise<string[]> {
+  return (await import('./schema-add-type.ts')).schemaPositionals(args, valueFlags);
+}
+
+function pickPackName(parsed: { positional?: string[] }, args: string[]): string {
+  // Honor --pack <name> before falling back to the active pack.
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--pack') return args[i + 1] ?? '';
+    if (args[i]?.startsWith('--pack=')) return args[i]!.slice('--pack='.length);
+  }
+  const cfg = loadConfig();
+  const resolution = resolveActivePackNameOnly({ cfg, remote: false });
+  return resolution.pack_name;
+}
+
+function emitMutateResult(result: { pack: string; format: string; prev_sha8: string; new_sha8: string }, json: boolean): void {
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, ...result }));
+    return;
+  }
+  console.log(`Pack: ${result.pack} (${result.format})`);
+  console.log(`Sha8: ${result.prev_sha8} → ${result.new_sha8}`);
+}
+
+function handleMutationError(err: unknown): never {
+  if (err instanceof SchemaPackMutationError) {
+    console.error(`Error: ${err.message}`);
+    if (err.code === 'PACK_READONLY') {
+      console.error('  Hint: fork the pack first, then mutate the fork.');
+    } else if (err.code === 'PACK_TOO_LARGE') {
+      console.error('  Hint: `gbrain errors schema_pack_too_large` explains the hand repair.');
+    } else if (err.code === 'EMIT_MISMATCH') {
+      console.error('  Hint: `gbrain errors schema_pack_emit_mismatch` explains what refused.');
+    } else if (err.code === 'STILL_REFERENCED') {
+      const refs = (err.details?.references as string[] | undefined) ?? [];
+      if (refs.length > 0) console.error(`  Still referenced by: ${refs.join(', ')}`);
+    }
+    process.exit(1);
+  }
+  throw err;
+}
+
+async function runStatsCmd(args: string[]): Promise<void> {
+  const { json, source } = parseFlags(args);
+  await withConnectedEngine(async (engine) => {
+    const ctx = { engine, config: {}, logger: console, dryRun: false, remote: false, sourceId: source } as never;
+    const result = await runStatsCore(ctx, source ? { sourceId: source } : {});
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(`Pack: ${result.pack_identity ?? '(no pack loaded)'}`);
+    console.log(`Total pages: ${result.aggregate.total_pages}`);
+    console.log(`Typed: ${result.aggregate.typed_pages}; matching the active pack: ${(result.aggregate.coverage * 100).toFixed(1)}%`);
+    console.log(`Untyped: ${result.aggregate.untyped_pages}`);
+    if (result.aggregate.undeclared_pages > 0) {
+      console.log(`Undeclared type: ${result.aggregate.undeclared_pages} (not a page type or alias of the active pack; list them with \`gbrain schema review-orphans\`)`);
+    }
+    if (result.aggregate.by_type.length > 0) {
+      console.log(`\nBy type:`);
+      for (const t of result.aggregate.by_type) {
+        console.log(`  ${t.type.padEnd(20)} ${t.count}`);
+      }
+    }
+    if (result.per_source.length > 1) {
+      console.log(`\nPer source:`);
+      for (const s of result.per_source) {
+        console.log(`  ${s.source_id.padEnd(20)} total=${s.total_pages} typed=${s.typed_pages} coverage=${(s.coverage * 100).toFixed(1)}%`);
+      }
+    }
+    if (result.dead_prefixes.length > 0) {
+      console.log(`\nDead prefixes (declared but 0 pages):`);
+      for (const dp of result.dead_prefixes) {
+        console.log(`  ${dp.type.padEnd(20)} ${dp.prefix}`);
+      }
+    }
+  });
+}
+
+async function runCardinalityPreviewCmd(args: string[]): Promise<void> {
+  const { json, source } = parseFlags(args);
+  await withConnectedEngine(async (engine) => {
+    const { previewSingleValue } = await import('../core/link-single-value.ts');
+    const result = await previewSingleValue(engine, source);
+    if (json) { console.log(JSON.stringify(result, null, 2)); return; }
+    if (Object.keys(result.declared).length === 0) {
+      console.log('No single-value relations declared. A pack declares one with `cardinality: one_per_from` on a state relation (docs/guides/temporal-edges.md#declared-single-value-relations).');
+      return;
+    }
+    for (const [src, types] of Object.entries(result.declared)) console.log(`Source ${src}: single-value ${types.join(', ')}`);
+    if (result.groups.length === 0) { console.log('No page holds more than one live relationship of a declared type.'); return; }
+    for (const g of result.groups) {
+      console.log(`\n${g.subject} ${g.link_type} (${g.source_id}): ${g.live.map(l => `${l.target}${l.since ? ` since ${l.since}` : ' (undated)'}`).join(', ')}`);
+      for (const c of g.would_close) console.log(`  closes ${c.target} on ${c.close_date} (superseded by ${c.superseded_by})`);
+      for (const u of g.undated) console.log(`  leaves ${u} open: no dated start; add one to the page timeline`);
+      for (const [a, b] of g.same_date) console.log(`  leaves ${a} and ${b} open: both start on the same date`);
+    }
+    console.log('\nThe dream cycle (edge_contradictions phase) applies the closures as timeline lines; `gbrain edge-proposals list` shows them, and deleting a line reopens the relationship.');
+  });
+}
+
+async function runSyncCmd(args: string[]): Promise<void> {
+  const apply = args.includes('--apply');
+  const { json, source } = parseFlags(args);
+  await withConnectedEngine(async (engine) => {
+    const ctx = { engine, config: {}, logger: console, dryRun: false, remote: false, sourceId: source } as never;
+    const result = await runSyncCore(ctx, {
+      apply,
+      sourceId: source,
+      onProgress: (info) => {
+        if (!json) process.stderr.write(`  [sync] ${info.type} ${info.prefix} → ${info.appliedSoFar} applied\n`);
+      },
+    });
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(`Pack: ${result.pack_identity ?? '(no pack loaded)'}`);
+    console.log(`Mode: ${apply ? 'APPLY' : 'DRY-RUN'}`);
+    for (const p of result.per_prefix) {
+      const marker = p.dead_prefix ? ' (dead prefix — no matching pages)' : '';
+      console.log(`  ${p.type.padEnd(20)} ${p.prefix.padEnd(30)} would_apply=${p.would_apply} applied=${p.applied}${marker}`);
+      if (p.sample_slugs.length > 0 && !apply) {
+        console.log(`    sample: ${p.sample_slugs.slice(0, 3).join(', ')}${p.sample_slugs.length > 3 ? '...' : ''}`);
+      }
+    }
+    console.log(`\nTotal: would_apply=${result.total_would_apply} applied=${result.total_applied}`);
+    if (!apply && result.total_would_apply > 0) {
+      console.log(`\nRun \`gbrain schema sync --apply\` to backfill page.type.`);
+    }
+  });
+}
+
+function runReloadCmd(args: string[]): void {
+  const { json } = parseFlags(args);
+  let packName: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--pack') { packName = args[i + 1]; break; }
+    if (args[i]?.startsWith('--pack=')) { packName = args[i]!.slice('--pack='.length); break; }
+  }
+  const result = invalidatePackCache(packName);
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, ...result }));
+    return;
+  }
+  if (result.invalidated.length === 0) {
+    console.log('No cached packs to flush.');
+  } else {
+    console.log(`Flushed: ${result.invalidated.join(', ')}`);
+  }
+}
+
+async function runAddTypeCmd(args: string[]): Promise<void> {
+  const json = parseFlags(args).json || args.includes('--json=true');
+  const { parseAddTypeArgs, NO_PREFIX_NOTE } = await import('./schema-add-type.ts');
+  let parsed: import('./schema-add-type.ts').AddTypeArgs;
+  try {
+    parsed = parseAddTypeArgs(args);
+  } catch (e) {
+    const { writeCliRefusal } = await import('../cli/cli-error.ts');
+    const err = e as import('../core/ops/contract.ts').OperationError;
+    process.exit(writeCliRefusal(err, 'schema', { json, human: `${err.message}\n  ${err.suggestion}` }));
+  }
+  const packName = pickPackName({}, args);
+  try {
+    const result = await addTypeToPack(packName, {
+      name: parsed.name, primitive: parsed.primitive, prefix: parsed.prefix, noPrefix: parsed.noPrefix,
+      extractable: parsed.extractable, expertRouting: parsed.expert, aliases: parsed.aliases,
+    });
+    const output: typeof result & { note?: string } = parsed.noPrefix ? { ...result, note: NO_PREFIX_NOTE } : result;
+    emitMutateResult(output, json);
+    if (parsed.noPrefix && !json) console.log(`Note: ${NO_PREFIX_NOTE}`);
+  } catch (e) { handleMutationError(e); }
+}
+
+async function runRemoveTypeCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const name = (await positionals(args))[0];
+  if (!name) { console.error('Usage: gbrain schema remove-type <name>'); process.exit(2); }
+  try { emitMutateResult(await removeTypeFromPack(packName, name), json); }
+  catch (e) { handleMutationError(e); }
+}
+
+async function runUpdateTypeCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const name = (await positionals(args, ['--extractable', '--expert', '--expert-routing', '--primitive']))[0];
+  if (!name) { console.error('Usage: gbrain schema update-type <name> [--extractable BOOL] [--expert BOOL] [--primitive P]'); process.exit(2); }
+  const patch: Record<string, unknown> = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--extractable') {
+      const v = parseBool(args[++i]);
+      if (v === null) { console.error('--extractable requires true|false'); process.exit(2); }
+      patch.extractable = v;
+    } else if (a === '--expert' || a === '--expert-routing') {
+      const v = parseBool(args[++i]);
+      if (v === null) { console.error('--expert requires true|false'); process.exit(2); }
+      patch.expert_routing = v;
+    } else if (a === '--primitive') {
+      patch.primitive = args[++i];
+    }
+  }
+  try { emitMutateResult(await updateTypeOnPack(packName, { name, patch }), json); }
+  catch (e) { handleMutationError(e); }
+}
+
+async function runAddAliasCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const pos = await positionals(args);
+  if (pos.length < 2) { console.error('Usage: gbrain schema add-alias <type> <alias>'); process.exit(2); }
+  try { emitMutateResult(await addAliasToType(packName, pos[0]!, pos[1]!), json); }
+  catch (e) { handleMutationError(e); }
+}
+
+async function runRemoveAliasCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const pos = await positionals(args);
+  if (pos.length < 2) { console.error('Usage: gbrain schema remove-alias <type> <alias>'); process.exit(2); }
+  try { emitMutateResult(await removeAliasFromType(packName, pos[0]!, pos[1]!), json); }
+  catch (e) { handleMutationError(e); }
+}
+
+async function runAddPrefixCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const pos = await positionals(args);
+  if (pos.length < 2) { console.error('Usage: gbrain schema add-prefix <type> <prefix>'); process.exit(2); }
+  try { emitMutateResult(await addPrefixToType(packName, pos[0]!, pos[1]!), json); }
+  catch (e) { handleMutationError(e); }
+}
+
+async function runRemovePrefixCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const pos = await positionals(args);
+  if (pos.length < 2) { console.error('Usage: gbrain schema remove-prefix <type> <prefix>'); process.exit(2); }
+  try { emitMutateResult(await removePrefixFromType(packName, pos[0]!, pos[1]!), json); }
+  catch (e) { handleMutationError(e); }
+}
+
+async function runAddLinkTypeCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const name = (await positionals(args, ['--inverse', '--page-type', '--target-type']))[0];
+  if (!name) { console.error('Usage: gbrain schema add-link-type <name> [--inverse <verb>] [--page-type <t>] [--target-type <t>]'); process.exit(2); }
+  let inverse: string | undefined;
+  let pageType: string | undefined;
+  let targetType: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--inverse') inverse = args[++i];
+    else if (a === '--page-type') pageType = args[++i];
+    else if (a === '--target-type') targetType = args[++i];
+  }
+  const inference = (pageType || targetType) ? { page_type: pageType, target_type: targetType } : undefined;
+  try {
+    emitMutateResult(await addLinkTypeToPack(packName, { name, inverse, inference }), json);
+  } catch (e) { handleMutationError(e); }
+}
+
+async function runRemoveLinkTypeCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const name = (await positionals(args))[0];
+  if (!name) { console.error('Usage: gbrain schema remove-link-type <name>'); process.exit(2); }
+  try { emitMutateResult(await removeLinkTypeFromPack(packName, name), json); }
+  catch (e) { handleMutationError(e); }
+}
+
+async function runSetExtractableCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const pos = await positionals(args);
+  if (pos.length < 2) { console.error('Usage: gbrain schema set-extractable <type> <true|false>'); process.exit(2); }
+  const v = parseBool(pos[1]);
+  if (v === null) { console.error('Second argument must be true|false'); process.exit(2); }
+  try { emitMutateResult(await setExtractableOnType(packName, pos[0]!, v), json); }
+  catch (e) { handleMutationError(e); }
+}
+
+async function runSetExpertRoutingCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const pos = await positionals(args);
+  if (pos.length < 2) { console.error('Usage: gbrain schema set-expert-routing <type> <true|false>'); process.exit(2); }
+  const v = parseBool(pos[1]);
+  if (v === null) { console.error('Second argument must be true|false'); process.exit(2); }
+  try { emitMutateResult(await setExpertRoutingOnType(packName, pos[0]!, v), json); }
+  catch (e) { handleMutationError(e); }
+}
+
+async function runScaffoldExtractableCmd(args: string[]): Promise<void> {
+  const { json } = parseFlags(args);
+  const packName = pickPackName({}, args);
+  const pos = await positionals(args, ['--dims']);
+  if (pos.length < 1) {
+    console.error('Usage: gbrain schema scaffold-extractable <type> [--pack <name>] [--dims a,b,c] [--force]');
+    process.exit(2);
+  }
+  const typeName = pos[0]!;
+  const force = args.includes('--force');
+  let dims: string[] | undefined;
+  const dimsIdx = args.indexOf('--dims');
+  if (dimsIdx >= 0 && dimsIdx + 1 < args.length) {
+    dims = args[dimsIdx + 1]!
+      .split(',')
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+  }
+  try {
+    const { scaffoldExtractable } = await import('../core/schema-pack/scaffold-extractable.ts');
+    const result = await scaffoldExtractable({
+      packName,
+      typeName,
+      evalDimensions: dims,
+      force,
+    });
+    if (json) {
+      console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
+    } else {
+      console.log(`Scaffolded extractable type '${typeName}' on pack '${packName}'`);
+      if (result.filesWritten.length > 0) {
+        console.log('  Files written:');
+        for (const f of result.filesWritten) console.log(`    ${f}`);
+      }
+      if (result.filesSkipped.length > 0) {
+        console.log('  Files skipped (already exist; pass --force to overwrite):');
+        for (const f of result.filesSkipped) console.log(`    ${f}`);
+      }
+      console.log('');
+      console.log('Next steps:');
+      console.log(`  1. Edit prompts/extract/${typeName}.md to specify your domain.`);
+      console.log(`  2. Replace fixture placeholders in fixtures/extract/${typeName}.jsonl with real cases.`);
+      console.log(`  3. Run: gbrain extract benchmark --pack ${packName} --kind ${typeName}`);
+    }
+  } catch (e) {
+    handleMutationError(e);
+  }
+}

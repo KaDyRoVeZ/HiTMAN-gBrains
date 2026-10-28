@@ -1,0 +1,633 @@
+#!/usr/bin/env bash
+# Run E2E tests ONE FILE AT A TIME (within a shard).
+#
+# Bun's default is to run test files in parallel (each in its own worker).
+# Our E2E suite shares one Postgres database across the whole test/e2e glob
+# (220+ files), and `setupDB()` does TRUNCATE CASCADE + fixture import. When
+# files run in parallel against ONE database, file A's TRUNCATE can race with
+# file B's fixture import, producing observed fails like "expected 16 pages,
+# got 8", missing links, orphaned timeline entries, etc. The flakiness was
+# visible on ~3 of every 5 runs pre-fix.
+#
+# Running files sequentially eliminates the race entirely. Parallelism is
+# recovered ACROSS databases instead: the SHARD=N/M env below fans shards out
+# against separate Postgres containers (scripts/ci-local.sh runs 4). Within a
+# shard, per-file bun startup (~1-2s) amortizes under the natural per-file
+# test time of 5-10s.
+#
+# Reports every file failure, then exits non-zero if any file failed.
+#
+# `--timeout=60000` matches the unit test suite. Bun's default is 5s,
+# which is too tight for setupDB's TRUNCATE CASCADE on ~30 tables on
+# CI runners under load (one CI flake observed on PR #475 hitting
+# exactly 5000.09ms in the Tags beforeAll).
+#
+# HOME isolation: E2E tests call paths that resolve to gbrain init / saveConfig
+# (e.g. setupDB writing config for the test container) and would otherwise
+# write the user's real ~/.gbrain/config.json. The wrapper redirects HOME and
+# GBRAIN_HOME to a tmpdir before bun starts so config writes land in the
+# tmpdir, then verifies the user's real config md5 didn't change after the run.
+# Both env vars are required: loadConfig/saveConfig resolve via HOME, while
+# configPath/getDbUrlSource honor GBRAIN_HOME; setting only one leaves the
+# other path escaping isolation. HOME is set before bun starts because Bun's
+# os.homedir() caches at first call and in-process mutation would not take.
+# Trap cleans up the tmpdir even on test failure.
+
+set -euo pipefail
+RUNNER_SHARD="${SHARD:-}"
+unset SHARD
+
+cd "$(dirname "$0")/.."
+# Executed-test receipts (X2): captured here, before the GBRAIN_* scrub below,
+# and unset so test processes never inherit them. Each file pass keeps its
+# native JUnit report as a receipt (lane e2e unless GBRAIN_TEST_RECEIPT_LANE
+# says otherwise; backend-matrix passes record their arm).
+. scripts/lib/test-env.sh
+receipts_init e2e || exit 2
+
+# COVERAGE_DIR (opt-in lcov coverage) must be an ABSOLUTE path: this script
+# redirects HOME (and E2E tests spawn CLI subprocesses with varying cwd), so
+# a relative --coverage-dir would scatter lcov output across working dirs.
+# Normalize it once against the repo root, before HOME moves. COVERAGE_DIR is
+# deliberately NOT GBRAIN-prefixed: the hermetic env scrub below drops
+# GBRAIN_*/operator prefixes, and this variable must survive that scrub.
+if [ -n "${COVERAGE_DIR:-}" ]; then
+  case "$COVERAGE_DIR" in
+    /*) ;;
+    *) COVERAGE_DIR="$PWD/$COVERAGE_DIR" ;;
+  esac
+fi
+
+# #3485: this wrapper IS the e2e boundary — opt in to running with a database
+# URL present. The bunfig test preload (database-url-guard-preload.ts) refuses
+# bare `bun test` runs while DATABASE_URL/GBRAIN_DATABASE_URL is ambient; the
+# per-file name floor (test/helpers/db-guard.ts) still applies after this.
+export GBRAIN_TEST_ALLOW_DATABASE_URL=1
+# Provider keys: the unit-lane preload (provider-keys-preload.ts) strips
+# ambient ANTHROPIC/OPENAI keys for keyless-CI parity; e2e is the lane where
+# real keys are deliberate (live embed/parity tests skip-gate on them), so
+# opt back in at this boundary.
+export GBRAIN_TEST_KEEP_PROVIDER_KEYS=1
+# The e2e suite runs on DATABASE_URL only; an ambient GBRAIN_DATABASE_URL
+# would pass the opt-in yet reach CLI-subprocess paths with no name floor —
+# drop it here so only the floored variable crosses the boundary.
+unset GBRAIN_DATABASE_URL
+
+# --- HOME isolation: snapshot real user config before switching ---
+# Tolerate unset HOME (minimal containers, exotic CI shells) without tripping set -u.
+REAL_HOME="${HOME:-/tmp}"
+USER_CONFIG="$REAL_HOME/.gbrain/config.json"
+USER_CONFIG_EXISTED=0
+USER_CONFIG_MD5=""
+# `{ ... } || true` swallows non-zero exit when the file is missing or md5 isn't
+# installed, so set -e never aborts before the post-run breach detector can run.
+md5_of() {
+  { if command -v md5 >/dev/null 2>&1; then
+      md5 -q "$1" 2>/dev/null
+    elif command -v md5sum >/dev/null 2>&1; then
+      md5sum "$1" 2>/dev/null | awk '{print $1}'
+    fi
+  } || true
+}
+if [ -f "$USER_CONFIG" ]; then
+  USER_CONFIG_EXISTED=1
+  USER_CONFIG_MD5=$(md5_of "$USER_CONFIG")
+fi
+
+# Portable mktemp: explicit XXXXXX is required by GNU mktemp on Linux CI.
+# `-t prefix` works on BSD but errors on GNU when the template lacks Xs.
+E2E_TMP_HOME=$(mktemp -d "${TMPDIR:-/tmp}/gbrain-e2e.XXXXXX")
+trap 'rm -rf "$E2E_TMP_HOME"' EXIT
+
+# The foreground file runs as an owned child so signals interrupt wait promptly.
+# Snapshot descendants before signalling: reparented children cannot be found later.
+ACTIVE_E2E_PID=""
+e2e_descendants() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null || true); do
+    e2e_descendants "$child"
+    printf '%s\n' "$child"
+  done
+}
+interrupt_e2e() {
+  local code="$1" descendants="" pid
+  trap '' INT TERM
+  if [ -n "$ACTIVE_E2E_PID" ]; then
+    descendants=$(e2e_descendants "$ACTIVE_E2E_PID")
+    kill -TERM "$ACTIVE_E2E_PID" 2>/dev/null || true
+    for pid in $descendants; do kill -TERM "$pid" 2>/dev/null || true; done
+    sleep 1
+    for pid in $descendants; do kill -KILL "$pid" 2>/dev/null || true; done
+    kill -KILL "$ACTIVE_E2E_PID" 2>/dev/null || true
+    wait "$ACTIVE_E2E_PID" 2>/dev/null || true
+  fi
+  exit "$code"
+}
+trap 'interrupt_e2e 130' INT
+trap 'interrupt_e2e 143' TERM
+
+export HOME="$E2E_TMP_HOME"
+export GBRAIN_HOME="$E2E_TMP_HOME"
+mkdir -p "$E2E_TMP_HOME/.gbrain"
+
+# --- Hermetic env scrub: operator/agent context must not bleed into E2E ---
+# A dev shell or a Conductor workspace exports CONDUCTOR_*, MCP_*, OPENCLAW_*,
+# HERMES_*, and GBRAIN_* config overrides (e.g. a stray GBRAIN_BRAIN_ID,
+# GBRAIN_SOURCE, GBRAIN_*_THRESHOLD, GBRAIN_SUPERVISOR_PID_FILE, an operator's
+# HERMES_BIN/HERMES_HOME) that would silently change test behavior — making
+# "hermetic" E2E non-hermetic and its failures unreproducible across machines.
+# Drop them before bun starts. This is a DENYLIST of operator-context prefixes
+# (not an allowlist rebuild), so PATH, HOME, TMPDIR, CI, DATABASE_URL, and bun
+# internals survive untouched. We keep GBRAIN_HOME (just set above for HOME
+# isolation); everything else GBRAIN_* is an operator override the suite must
+# not inherit — which also scrubs GBRAIN_REAL_HERMES_E2E and
+# GBRAIN_REAL_GROK_E2E / GBRAIN_REAL_OPENCODE_E2E, so the real-agent door
+# suites structurally
+# cannot fire under this runner (their venue is heavy-tests.yml's direct bun
+# test). GROK_ also drops an operator's GROK_BIN/GROK_HOME; OPENCODE_ drops
+# OPENCODE_BIN and the OPENCODE_CONFIG* trio. Adapts GStack's
+# buildHermeticEnv() allowlist to gbrain's shell E2E runner.
+for _e2e_var in $(env | grep -oE '^(CONDUCTOR_|MCP_|OPENCLAW_|HERMES_|GROK_|OPENCODE_|GBRAIN_)[A-Za-z0-9_]*' | sort -u); do
+  case "$_e2e_var" in
+    GBRAIN_HOME) ;;  # required for HOME isolation (set above) — keep
+    GBRAIN_PGLITE_SNAPSHOT|GBRAIN_NO_SNAPSHOT) ;;  # snapshot fast-path fixture (exported by ci-local.sh / runners) — keep
+    GBRAIN_TEST_ALLOW_DATABASE_URL) ;;  # #3485 preload opt-in (set above) — keep
+    GBRAIN_TEST_KEEP_PROVIDER_KEYS) ;;  # provider-keys preload opt-in (set above) — keep
+    GBRAIN_CI_DISABLE_TEST_ENV_FILE) ;;  # CI forbids loading checkout-local .env.testing — keep through Bun startup
+    GBRAIN_TEST_DB) ;;  # explicit schema-reset opt-in for service hosts; schema-drift still requires a test-shaped DB name
+    GBRAIN_PGBOUNCER_URL|GBRAIN_PGBOUNCER_DIRECT_URL|GBRAIN_CI_REQUIRE_PGBOUNCER) ;; # explicit pooler test target and execution requirement
+    GBRAIN_PGBOUNCER_E2E_URL|GBRAIN_PGBOUNCER_E2E_DB) ;; # backend-matrix pooled target (scripts/e2e-backend-matrix.txt)
+    GBRAIN_SUPAVISOR_URL) ;; # #6543 explicit Supavisor transaction-pooler target for the live pooler suites
+    GBRAIN_TEST_WAIT_MULTIPLIER) ;;  # coverage deadline multiplier read by test/helpers/wait-for.ts — keep
+    GBRAIN_TEST_REQUIRE_COMPILE) ;;  # bootstrap-compiled-binary opt-in: a failed compile fails instead of skipping
+    GBRAIN_E2E_FILE_TIMEOUT) ;;  # per-file cap override — read AFTER this scrub, so it must survive it
+    GBRAIN_E2E_ALLOW_DB) ;;  # #3485 name-floor opt-in — the guard's own error
+                             # message tells operators to set it; stripping it
+                             # here would make that escape hatch a dead end
+    *) unset "$_e2e_var" || true ;;
+  esac
+done
+
+# --dry-run-list: print the resolved file list (one per line) and exit. Used
+# by scripts/ci-local.sh to smoke-test the argv branching at startup.
+DRY_RUN_LIST=0
+if [ "${1:-}" = "--dry-run-list" ]; then
+  DRY_RUN_LIST=1
+  shift
+fi
+
+# Argv-driven file list (used by `ci:local:diff`); fall back to the full glob.
+if [ "$#" -gt 0 ]; then
+  files=("$@")
+else
+  # phantom-redirect lives in test/ (its PGLite arm runs in the unit suite) but
+  # its Postgres arm is only reachable through a DATABASE_URL-bearing lane —
+  # the unit wrappers strip the URL (#3485), so this lane must carry it.
+  # Key-gated live files no CI job provides keys for; run them by name
+  # (docs/TESTING.md). One shared list, also read by ci-local-e2e-smoke.sh.
+  live_key_only=" $(grep -v '^[[:space:]]*#' "$(dirname "${BASH_SOURCE[0]}")/e2e-live-key-only.txt" | tr '\n' ' ') "
+  files=()
+  for f in test/e2e/*.test.ts; do
+    case "$live_key_only" in *" $f "*) continue ;; esac
+    files+=("$f")
+  done
+  files+=(test/phantom-redirect-engine-parity.test.ts)
+fi
+
+# Weighted across isolated databases, sequential within each shard.
+if [ -n "$RUNNER_SHARD" ]; then
+  if ! [[ "$RUNNER_SHARD" =~ ^[0-9]+/[0-9]+$ ]]; then
+    echo "ERROR: invalid SHARD=$RUNNER_SHARD (expected N/M)" >&2
+    exit 2
+  fi
+  shard_n=${RUNNER_SHARD%/*}
+  shard_m=${RUNNER_SHARD#*/}
+  selected=$(printf '%s\n' "${files[@]}" | bun scripts/sharding.ts "$shard_n" "$shard_m" --weights scripts/e2e-weights.json)
+  files=()
+  while IFS= read -r f; do
+    [ -n "$f" ] && files+=("$f")
+  done <<< "$selected"
+fi
+
+if [ "$DRY_RUN_LIST" = "1" ]; then
+  if [ "${#files[@]}" -eq 0 ]; then
+    exit 0
+  fi
+  printf '%s\n' "${files[@]}"
+  exit 0
+fi
+
+RECEIPT_SHARD=""
+RECEIPT_OF=""
+RECEIPT_TAG="run"
+if [ -n "$RUNNER_SHARD" ]; then
+  RECEIPT_SHARD="$shard_n"
+  RECEIPT_OF="$shard_m"
+  RECEIPT_TAG="s${shard_n}of${shard_m}"
+fi
+
+if [ "${#files[@]}" -eq 0 ]; then
+  # Empty shard (e.g. SHARD=4/4 with only 3 files): nothing to do.
+  echo "No files for shard ${RUNNER_SHARD:-(unsharded)}; exiting clean."
+  receipt_empty "$RECEIPT_TAG" "$RECEIPT_SHARD" "$RECEIPT_OF"
+  exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 is required to validate native E2E JUnit reports." >&2
+  exit 1
+fi
+
+if [ -n "${COVERAGE_DIR:-}" ]; then
+  mkdir -p "$(dirname "$COVERAGE_DIR")"
+  if ! mkdir "$COVERAGE_DIR"; then
+    echo "ERROR: COVERAGE_DIR must be a new, unused directory for each E2E invocation." >&2
+    exit 1
+  fi
+fi
+
+# PGLite snapshot fast path — ~90 e2e files boot in-memory PGLite; a cold boot
+# replays every migration (~3.5x per booting file). Every other runner already
+# activates this; the env scrub above deliberately keep-lists the var. Placed
+# AFTER --dry-run-list so list mode stays instant. Non-fatal on build failure
+# (tests fall back to cold init; the loader's schema-hash gate is authoritative).
+# Files asserting the path TO post-initSchema state carry their own per-file
+# `delete process.env.GBRAIN_PGLITE_SNAPSHOT` opt-out.
+. scripts/lib/test-env.sh
+ensure_pglite_snapshot "run-e2e"
+# Absolutize: e2e tests spawn CLI subprocesses with varying cwd; a relative
+# path would silently miss the tar there (cold-init fallback, benefit lost).
+# Same reason COVERAGE_DIR is normalized to absolute above.
+if [ -n "${GBRAIN_PGLITE_SNAPSHOT:-}" ] && [ "${GBRAIN_PGLITE_SNAPSHOT#/}" = "$GBRAIN_PGLITE_SNAPSHOT" ]; then
+  export GBRAIN_PGLITE_SNAPSHOT="$PWD/$GBRAIN_PGLITE_SNAPSHOT"
+fi
+
+# Backend matrix (refactor wave 1): files listed in scripts/e2e-backend-matrix.txt
+# run a second time with DATABASE_URL pointed at the transaction-mode PgBouncer
+# (GBRAIN_PGBOUNCER_E2E_URL, same database, reached through the pooler). The
+# pooler's prepare mode must be explicit in that URL, because only the 6543
+# port auto-detects it and CI poolers listen elsewhere. Both passes must
+# execute the same, non-zero number of tests.
+BACKEND_MATRIX_FILE="scripts/e2e-backend-matrix.txt"
+backend_matrix=" "
+backend_matrix_timeouts=" "
+[ -f "$BACKEND_MATRIX_FILE" ] && while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in ''|'#'*|'!'*) continue ;; esac
+  backend_matrix+="${line%%[[:space:]]*} "
+  case "$line" in
+    *pooled-timeout=*) backend_matrix_timeouts+="${line%%[[:space:]]*}=${line##*pooled-timeout=} " ;;
+  esac
+done < "$BACKEND_MATRIX_FILE"
+# The pooled target is either a full URL (GBRAIN_PGBOUNCER_E2E_URL) or a
+# database name behind the pooler named by GBRAIN_PGBOUNCER_URL
+# (GBRAIN_PGBOUNCER_E2E_DB); the second form creates that database through
+# GBRAIN_PGBOUNCER_DIRECT_URL on first use and always pins prepare=false.
+PGBOUNCER_E2E_URL="${GBRAIN_PGBOUNCER_E2E_URL:-}"
+PGBOUNCER_E2E_DB="${GBRAIN_PGBOUNCER_E2E_DB:-}"
+if [ -z "$PGBOUNCER_E2E_URL" ] && [ -n "$PGBOUNCER_E2E_DB" ]; then
+  if [ -z "${GBRAIN_PGBOUNCER_URL:-}" ]; then
+    echo "ERROR: GBRAIN_PGBOUNCER_E2E_DB needs GBRAIN_PGBOUNCER_URL (the pooler to reach it through)." >&2
+    exit 2
+  fi
+  PGBOUNCER_E2E_URL="${GBRAIN_PGBOUNCER_URL%/*}/${PGBOUNCER_E2E_DB}?prepare=false"
+fi
+pooled_db_ready=0
+if [ -n "$PGBOUNCER_E2E_URL" ]; then
+  case "$PGBOUNCER_E2E_URL" in
+    *[?\&]prepare=false|*[?\&]prepare=false\&*) ;;
+    *)
+      echo "ERROR: GBRAIN_PGBOUNCER_E2E_URL must set the pooler prepare mode explicitly (?prepare=false)." >&2
+      exit 2
+      ;;
+  esac
+fi
+backend_matrix_report=()
+
+pass_files=0
+fail_files=0
+fail_list=()
+total_pass=0
+total_fail=0
+file_idx=0
+
+completed_e2e_passes() {
+  python3 - "${1#./}" "$E2E_TMP_HOME/current.junit.xml" "$E2E_TMP_HOME/current.log" <<'PY'
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+expected, report, log = sys.argv[1:]
+try:
+    root = ET.parse(report).getroot()
+    suites = root.findall('testsuite')
+    if root.tag != 'testsuites' or len(suites) != 1 or suites[0].get('file') != expected:
+        raise ValueError('wrong selected-file suite')
+    for node in [root, *root.iter('testsuite')]:
+        cases = list(node.iter('testcase'))
+        skipped = sum(case.find('skipped') is not None for case in cases)
+        if any(case.find('failure') is not None or case.find('error') is not None for case in cases):
+            raise ValueError('failed testcase')
+        for key, count in [('tests', len(cases)), ('failures', 0), ('skipped', skipped)]:
+            if node.get(key) != str(count):
+                raise ValueError(f'inconsistent {key} count')
+        if node.get('errors', '0') != '0':
+            raise ValueError('reported errors')
+    tests = int(root.get('tests'))
+    skipped = int(root.get('skipped'))
+    header = False
+    counts = {}
+    final = None
+    with open(log) as stream:
+        for raw in stream:
+            line = re.sub(r'\x1b\[[0-9;]*m', '', raw.rstrip('\n'))
+            header = header or line in (expected + ':', '::group::' + expected + ':')
+            count = re.fullmatch(r'\s*(\d+) (pass|fail|skip|todo)\s*', line)
+            if count:
+                value, kind = count.groups()
+                if kind == 'pass':
+                    counts = {'skip': 0, 'todo': 0}
+                counts[kind] = int(value)
+            summary = re.match(r'^Ran (\d+) tests? across (\d+) files?\. \[[0-9.]+(?:ms|s)\]', line)
+            if summary:
+                final = (int(summary[1]), int(summary[2]), counts.copy())
+    if not header or final is None:
+        raise ValueError('missing final console report')
+    final_tests, final_files, counts = final
+    if final_tests != tests or final_files != 1 or counts.get('pass') != tests - skipped or counts.get('fail') != 0:
+        raise ValueError('missing or inconsistent final console report')
+    if counts.get('skip', 0) + counts.get('todo', 0) != skipped:
+        raise ValueError('inconsistent skipped/todo count')
+    print(tests - skipped)
+except (OSError, ET.ParseError, ValueError, TypeError) as error:
+    print(f'E2E report validation: {error}', file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+# A file's HOME must be removable once its bun process exits. Anything still
+# running with HOME=<file home> is a leaked child of that file (the B2 class:
+# a detached refresh still writing Bun's install cache). Kill those first
+# (Linux /proc scan; elsewhere none can be found), then remove the HOME. A
+# HOME that still cannot be removed fails THIS file by name instead of
+# letting `set -e` abort the rest of the partition. Prints a note on stdout
+# (empty when nothing leaked); returns 1 when the HOME is still there.
+remove_file_home() {
+  local home="$1" leaked="" pid cmd details=""
+  if [ -d /proc/self ]; then
+    leaked=$(grep -lzxF "HOME=$home" /proc/[0-9]*/environ 2>/dev/null | sed 's|^/proc/||; s|/environ$||' || true)
+  fi
+  for pid in $leaked; do
+    [ "$pid" = "$$" ] && continue
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-200 || true)
+    details="$details
+    pid $pid: ${cmd:-<exited>}"
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  if rm -rf "$home" 2>/dev/null || { sleep 1; rm -rf "$home" 2>/dev/null; }; then
+    [ -z "$details" ] || echo "WARN: $name left processes running with HOME=$home after its bun process exited (killed):$details"
+    return 0
+  fi
+  echo "FAILED: $name left a process writing to its HOME; cleanup could not remove $home"
+  echo "  Why: a test started a child (often detached) that outlived the test file and kept writing under HOME."
+  echo "  Fix: make the test wait for or stop its children; reproduce with: bash scripts/run-e2e.sh $f"
+  [ -z "$details" ] || echo "  Leaked processes (killed):$details"
+  find "$home" -mindepth 1 -maxdepth 4 2>/dev/null | head -10 | sed 's/^/  Remaining: /'
+  return 1
+}
+
+executed_files=()
+for f in "${files[@]}"; do
+  name=$(basename "$f")
+  executed_files+=("$f")
+  file_idx=$((file_idx + 1))
+  # COVERAGE_DIR (opt-in): each E2E file runs in its OWN bun process, so each
+  # needs its OWN coverage dir — a second bun process reusing a coverage dir
+  # OVERWRITES lcov.info. Empty/unset COVERAGE_DIR leaves the exec line
+  # byte-identical to the pre-coverage behavior.
+  COVERAGE_ARGS=()
+  if [ -n "${COVERAGE_DIR:-}" ]; then
+    COVERAGE_ARGS=(--coverage --coverage-reporter=lcov --coverage-dir="$COVERAGE_DIR/e2e-$file_idx")
+  fi
+  echo ""
+  echo "=== $name ==="
+  # Cross-file isolation: terminate any stale connections from the prior
+  # file's pool before the next file's setupDB() runs. Without this,
+  # idle postgres connections from the previous bun process race with
+  # the next file's TRUNCATE CASCADE → cross-file fixture-state pollution
+  # (people/sarah-chen disappears mid-test, etc.). The terminate call is
+  # idempotent + fast (~50ms); on the first iteration there's nothing to
+  # terminate so it's effectively free.
+  if [ -n "${DATABASE_URL:-}" ]; then
+    psql "$DATABASE_URL" -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid != pg_backend_pid() AND datname = current_database()" >/dev/null 2>&1 || true
+  fi
+  # Hard outer timeout (default 180s per file; GBRAIN_E2E_FILE_TIMEOUT or
+  # E2E_FILE_TIMEOUT_SECS overrides — the GBRAIN_ name is kept in the scrub
+  # keep-list below, the non-GBRAIN name survives the scrub by construction;
+  # nightly coverage runs use it to absorb instrumentation overhead). bun's
+  # --timeout covers tests AND hooks (measured on 1.3.14), but it's
+  # timer-based: a PGLite WASM call that blocks the event loop synchronously
+  # never lets the timer fire and the file wedges indefinitely.
+  # gtimeout/timeout SIGKILLs the file so the suite advances. gtimeout (macOS
+  # via coreutils) preferred; timeout (Linux) fallback; bare bun (no outer
+  # cap) if neither is installed.
+  #
+  # LLM-bound Tier-2 files (real provider round-trips when .env.testing
+  # carries keys) legitimately run past 180s — the ingest skill alone has
+  # been observed at ~131s — and were being SIGKILLed mid-run with no
+  # assertion output, which reads like a mystery failure. CI runs those
+  # files in their own job WITHOUT this wrapper (see .github/workflows/
+  # e2e.yml tier2), so the cap only ever bit local runs: give them 4x.
+  # serve-http-multi-agent rides the same carve-out for a different reason:
+  # it spawns TWO `gbrain serve --http` subprocesses (19133 + a chaos serve
+  # on 19134) plus several CLI register subprocesses, so its wall clock is
+  # process-spawn-bound, not test-bound.
+  file_timeout="${GBRAIN_E2E_FILE_TIMEOUT:-${E2E_FILE_TIMEOUT_SECS:-180}}"
+  # Digits-only validation (same strict positive-int posture as the TS env
+  # knobs): a malformed value falls back to the default instead of
+  # word-splitting into extra gtimeout arguments or breaking the 4x math.
+  case "$file_timeout" in ''|*[!0-9]*) file_timeout=180 ;; esac
+  case "$f" in
+    # graduation-crash-*: one graduation per custody or rollback boundary (5-6 SIGKILL-and-resume cases of ~16 s per file).
+    # large-pages-export: five 20 MiB imports per engine on the string path (~240 s on 4 cores, ~340 s on a loaded gate VM).
+    */large-pages-export.test.ts|*/skills.test.ts|*/serve-http-multi-agent.test.ts|*/graduation-cli*.test.ts|*/graduation-crash-*.test.ts|*/graduation-faults.test.ts|*/graduation-copy.test.ts|*/graduation-legacy-copy.test.ts) file_timeout=$((file_timeout * 4)) ;;
+  esac
+  if command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout $file_timeout"
+  elif command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout $file_timeout"
+  else
+    TIMEOUT_CMD=""
+  fi
+  in_backend_matrix=0
+  case "$backend_matrix" in *" ${f#./} "*) in_backend_matrix=1 ;; esac
+  run_e2e_pass() {
+    # $1 = pass label; $2 = receipt arm ("" outside the backend matrix);
+    # remaining args = env assignments for this pass.
+    local pass_label="$1" arm="$2"
+    shift 2
+    FILE_HOME="$E2E_TMP_HOME/file-$file_idx-$pass_label"
+    mkdir -p "$FILE_HOME/.gbrain"
+    rc=0
+    p=0
+    rm -f "$E2E_TMP_HOME/current.junit.xml"
+    receipt_begin primary "$RECEIPT_TAG-f$file_idx-$pass_label" "$RECEIPT_SHARD" "$RECEIPT_OF" "$arm" "${f#./}"
+    env "$@" HOME="$FILE_HOME" GBRAIN_HOME="$FILE_HOME" $TIMEOUT_CMD bun test --timeout=60000 --reporter=junit --reporter-outfile="$E2E_TMP_HOME/current.junit.xml" ${COVERAGE_ARGS[@]+"${COVERAGE_ARGS[@]}"} "$f" > "$E2E_TMP_HOME/current.log" 2>&1 &
+    ACTIVE_E2E_PID=$!
+    wait "$ACTIVE_E2E_PID" || rc=$?
+    ACTIVE_E2E_PID=""
+    if [ -n "$RECEIPT_ID" ] && [ -f "$E2E_TMP_HOME/current.junit.xml" ]; then
+      cp "$E2E_TMP_HOME/current.junit.xml" "$TEST_RECEIPT_DIR/$RECEIPT_ID.junit.xml"
+    fi
+    receipt_end "$rc"
+    output=$(cat "$E2E_TMP_HOME/current.log")
+    if ! cleanup_note=$(remove_file_home "$FILE_HOME"); then
+      output="$output
+$cleanup_note"
+      rc=1
+      return
+    fi
+    [ -z "$cleanup_note" ] || echo "$cleanup_note"
+    if [ "$rc" -eq 0 ] && ! p=$(completed_e2e_passes "$f"); then
+      echo "FAILED: $name did not produce a complete native Bun report for the selected file"
+      rc=1
+    fi
+  }
+  if [ "$in_backend_matrix" = "1" ]; then
+    run_e2e_pass direct postgres-direct GBRAIN_TEST_BACKEND=postgres-direct
+  else
+    run_e2e_pass direct ""
+  fi
+  if [ "$rc" -eq 0 ] && [ "$in_backend_matrix" = "1" ] && [ -n "${DATABASE_URL:-}" ]; then
+    direct_passes="$p"
+    if [ -z "$PGBOUNCER_E2E_URL" ]; then
+      if [ "${GBRAIN_CI_REQUIRE_PGBOUNCER:-0}" = "1" ]; then
+        echo "$output" | tail -8
+        echo "FAILED: $name is in $BACKEND_MATRIX_FILE but neither GBRAIN_PGBOUNCER_E2E_URL nor GBRAIN_PGBOUNCER_E2E_DB is set, so its PgBouncer pass cannot run"
+        rc=1
+      fi
+    else
+      echo "--- $name [pgbouncer] ---"
+      echo "$output" | tail -8
+      psql "$DATABASE_URL" -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid != pg_backend_pid() AND datname = current_database()" >/dev/null 2>&1 || true
+      if [ "$pooled_db_ready" = "0" ] && [ -n "$PGBOUNCER_E2E_DB" ] && [ -n "${GBRAIN_PGBOUNCER_DIRECT_URL:-}" ]; then
+        bun scripts/lib/ensure-e2e-database.ts "$GBRAIN_PGBOUNCER_DIRECT_URL" "$PGBOUNCER_E2E_DB" || echo "WARN: could not create $PGBOUNCER_E2E_DB; the pooled pass will report the connection error"
+        pooled_db_ready=1
+      fi
+      pooled_timeout_cmd="$TIMEOUT_CMD"
+      case "$backend_matrix_timeouts" in
+        *" ${f#./}="*)
+          pooled_timeout="${backend_matrix_timeouts#* "${f#./}"=}"
+          pooled_timeout="${pooled_timeout%% *}"
+          case "$pooled_timeout" in ''|*[!0-9]*) ;; *) [ -n "$TIMEOUT_CMD" ] && TIMEOUT_CMD="${TIMEOUT_CMD%% *} $pooled_timeout" ;; esac
+          ;;
+      esac
+      run_e2e_pass pgbouncer pgbouncer DATABASE_URL="$PGBOUNCER_E2E_URL" GBRAIN_TEST_BACKEND=pgbouncer
+      TIMEOUT_CMD="$pooled_timeout_cmd"
+      if [ "$rc" -eq 0 ] && { [ "$p" -eq 0 ] || [ "$p" -ne "$direct_passes" ]; }; then
+        echo "$output"
+        echo "FAILED: $name executed $direct_passes tests on postgres-direct but $p on pgbouncer (must be equal and non-zero)"
+        rc=1
+      fi
+      backend_matrix_report+=("$name postgres-direct=$direct_passes pgbouncer=$p")
+      [ "$rc" -eq 0 ] && p=$((p + direct_passes))
+    fi
+  fi
+  if [ "$rc" -eq 0 ]; then
+    if [ "$f" = "test/e2e/pgbouncer-teardown.test.ts" ] && \
+       [ "${GBRAIN_CI_REQUIRE_PGBOUNCER:-0}" = "1" ] && \
+       [ "$p" -eq 0 ]; then
+      fail_files=$((fail_files + 1))
+      fail_list+=("$name")
+      echo "$output"
+      echo "FAILED: required PgBouncer tests did not execute"
+      continue
+    fi
+    pass_files=$((pass_files + 1))
+    total_pass=$((total_pass + p))
+    echo "$output" | tail -8
+  else
+    fail_files=$((fail_files + 1))
+    fail_list+=("$name")
+    p=$(echo "$output" | grep -oE '[0-9]+ pass' | tail -1 | grep -oE '[0-9]+' || echo 0)
+    fl=$(echo "$output" | grep -oE '[0-9]+ fail' | tail -1 | grep -oE '[0-9]+' || echo 0)
+    total_pass=$((total_pass + p))
+    total_fail=$((total_fail + fl))
+    echo "$output"
+    echo ""
+    echo "FAILED: $name"
+    # Continue so we see all failures; exit nonzero at the end.
+  fi
+done
+
+# Execution receipt (B9): which files this lane ran, written pass or fail so a
+# red nightly still records them. lane-manifest.json (complete:true) stays
+# green-only, written at the end.
+if [ -n "${COVERAGE_DIR:-}" ]; then
+  printf '%s\n' "${executed_files[@]}" > "$COVERAGE_DIR/executed-files.txt"
+fi
+
+echo ""
+echo "========================================"
+echo "E2E SUMMARY (sequential execution)"
+echo "========================================"
+echo "Files: $((pass_files + fail_files)) total, $pass_files passed, $fail_files failed"
+echo "Tests: $total_pass passed, $total_fail failed"
+if [ "${#backend_matrix_report[@]}" -gt 0 ]; then
+  echo "Backend matrix (executed tests per backend):"
+  for line in "${backend_matrix_report[@]}"; do
+    echo "  $line"
+  done
+fi
+
+# --- HOME isolation verification: fail loud on any out-of-isolation write ---
+# Runs regardless of test pass/fail; isolation breach is higher-severity than
+# any individual test failure. Exit 2 distinguishes from exit 1 (test failure).
+# Three breach modes covered:
+#   1. Config existed before AND was modified (md5 changed)
+#   2. Config existed before AND was deleted during the run
+#   3. Config did NOT exist before but was created during the run
+AFTER_EXISTS=0
+[ -f "$USER_CONFIG" ] && AFTER_EXISTS=1
+AFTER_MD5=""
+if [ "$AFTER_EXISTS" = "1" ]; then
+  AFTER_MD5=$(md5_of "$USER_CONFIG")
+fi
+BREACH_REASON=""
+if [ "$USER_CONFIG_EXISTED" = "1" ] && [ "$AFTER_EXISTS" = "0" ]; then
+  BREACH_REASON="config existed before run but was deleted"
+elif [ "$USER_CONFIG_EXISTED" = "0" ] && [ "$AFTER_EXISTS" = "1" ]; then
+  BREACH_REASON="config did not exist before run but was created"
+elif [ -n "$USER_CONFIG_MD5" ] && [ "$AFTER_MD5" != "$USER_CONFIG_MD5" ]; then
+  BREACH_REASON="config md5 changed during run"
+fi
+if [ -n "$BREACH_REASON" ]; then
+  echo "" >&2
+  echo "ERROR: HOME isolation breach detected." >&2
+  echo "  Reason: $BREACH_REASON" >&2
+  echo "  Path: $USER_CONFIG" >&2
+  echo "  Before: existed=$USER_CONFIG_EXISTED md5=${USER_CONFIG_MD5:-none}" >&2
+  echo "  After:  existed=$AFTER_EXISTS md5=${AFTER_MD5:-none}" >&2
+  echo "  A test wrote outside the tmpdir HOME despite the override." >&2
+  exit 2
+fi
+
+if [ ${#fail_list[@]} -gt 0 ]; then
+  echo ""
+  echo "Failing files:"
+  for f in "${fail_list[@]}"; do
+    echo "  - $f"
+  done
+  exit 1
+fi
+
+# Lane manifest: written ONLY on a fully green run (isolation breach exits 2
+# and failing files exit 1 above, both before reaching here), so
+# complete:true means the lcov data represents the whole E2E lane.
+if [ -n "${COVERAGE_DIR:-}" ]; then
+  LCOV_COUNT=$(find "$COVERAGE_DIR" -name 'lcov.info' 2>/dev/null | grep -c '^' || true)
+  LANE="e2e"
+  [ -z "$RUNNER_SHARD" ] || LANE="e2e-$shard_n"
+  RUN_SHA=$(git rev-parse HEAD)
+  printf '{"lane":"%s","sha":"%s","lcovCount":%s,"complete":true}\n' \
+    "$LANE" "$RUN_SHA" "${LCOV_COUNT:-0}" > "$COVERAGE_DIR/lane-manifest.json"
+fi

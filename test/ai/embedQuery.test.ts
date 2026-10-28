@@ -1,0 +1,198 @@
+/**
+ * v0.35.0.0 — embedQuery() routing tests.
+ *
+ * Pins:
+ *  - embedQuery returns a single Float32Array (not a batch).
+ *  - embedQuery threads inputType='query' through dimsProviderOptions
+ *    into the provider options blob that reaches embedMany().
+ *  - embed() (without inputType arg) defaults to no input_type field for
+ *    back-compat. This is the contract the dimsProviderOptions 4th-arg
+ *    audit relies on: existing callers continue to embed as 'document'-
+ *    side without a code change.
+ *  - For symmetric providers (OpenAI text-3, DashScope), embedQuery does
+ *    NOT inject input_type into the provider options (CDX2-F6 per-model
+ *    filtering pinned at the dims-input-type.test.ts layer; this test
+ *    confirms the gateway end-to-end stays consistent).
+ *  - For Voyage voyage-4, embedQuery produces input_type='query'.
+ */
+
+import { describe, test, expect, afterEach, beforeEach } from 'bun:test';
+import {
+  configureGateway,
+  resetGateway,
+  embed,
+  embedQuery,
+  __setEmbedTransportForTests,
+} from '../../src/core/ai/gateway.ts';
+
+function configureVoyage4(): void {
+  configureGateway({
+    embedding_model: 'voyage:voyage-4',
+    embedding_dimensions: 1024,
+    env: { VOYAGE_API_KEY: 'sk-fake' },
+  });
+}
+
+function configureOpenAI(): void {
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: { OPENAI_API_KEY: 'sk-fake' },
+  });
+}
+
+function configureVoyage(): void {
+  configureGateway({
+    embedding_model: 'voyage:voyage-3-large',
+    embedding_dimensions: 1024,
+    env: { VOYAGE_API_KEY: 'sk-fake' },
+  });
+}
+
+function fakeEmbeddings(count: number, dims: number) {
+  return {
+    embeddings: Array.from({ length: count }, (_, i) =>
+      Array.from({ length: dims }, (_, j) => (j === 0 ? i : 0.1)),
+    ),
+  };
+}
+
+afterEach(() => {
+  __setEmbedTransportForTests(null);
+  resetGateway();
+});
+
+describe('embedQuery — return shape', () => {
+  beforeEach(() => configureVoyage4());
+
+  test('returns a single Float32Array (not a batch)', async () => {
+    __setEmbedTransportForTests((async () => fakeEmbeddings(1, 1024)) as any);
+    const v = await embedQuery('hello');
+    expect(v).toBeInstanceOf(Float32Array);
+    expect(v.length).toBe(1024);
+    // Index sentinel matches input position 0.
+    expect(v[0]).toBe(0);
+  });
+});
+
+describe('embed — input truncation', () => {
+  test('never splits a UTF-16 surrogate pair at MAX_CHARS', async () => {
+    configureOpenAI();
+    const input = `${'a'.repeat(7_999)}💡trailing prose`;
+    let captured = '';
+    __setEmbedTransportForTests((async (args: any) => {
+      captured = args.values[0];
+      return fakeEmbeddings(1, 1536);
+    }) as any);
+
+    await embed([input]);
+
+    expect(input.slice(0, 8_000).isWellFormed()).toBe(false); // positive control
+    expect(captured.isWellFormed()).toBe(true);
+    // Truncation must actually occur (not a no-op that trivially passes well-formedness):
+    // the straddling pair moves the safe cut back to 7,999, dropping both the emoji and
+    // the trailing prose entirely.
+    expect(captured.length).toBe(7_999);
+    expect(captured).not.toContain('trailing prose');
+  });
+});
+
+describe('embedQuery — inputType plumbing (Voyage asymmetric)', () => {
+  beforeEach(() => configureVoyage4());
+
+  test('embedQuery sends input_type=query in providerOptions', async () => {
+    let capturedOpts: any = null;
+    __setEmbedTransportForTests((async (args: any) => {
+      capturedOpts = args.providerOptions;
+      return fakeEmbeddings(1, 1024);
+    }) as any);
+    await embedQuery('hello');
+    expect(capturedOpts?.openaiCompatible?.input_type).toBe('query');
+    expect(capturedOpts?.openaiCompatible?.dimensions).toBe(1024);
+  });
+
+  test('embed() with document inputType sends input_type=document', async () => {
+    let capturedOpts: any = null;
+    __setEmbedTransportForTests((async (args: any) => {
+      capturedOpts = args.providerOptions;
+      return fakeEmbeddings(args.values.length, 1024);
+    }) as any);
+    await embed(['doc'], { inputType: 'document' });
+    expect(capturedOpts?.openaiCompatible?.input_type).toBe('document');
+  });
+
+  test('embed([…], "query") explicit threading also reaches the wire', async () => {
+    let capturedOpts: any = null;
+    __setEmbedTransportForTests((async (args: any) => {
+      capturedOpts = args.providerOptions;
+      return fakeEmbeddings(args.values.length, 1024);
+    }) as any);
+    await embed(['q1', 'q2'], { inputType: 'query' });
+    expect(capturedOpts?.openaiCompatible?.input_type).toBe('query');
+  });
+});
+
+describe('embedQuery — per-model filtering (CDX2-F6, end-to-end)', () => {
+  test('OpenAI text-embedding-3-large: NO input_type in providerOptions', async () => {
+    configureOpenAI();
+    let capturedOpts: any = null;
+    __setEmbedTransportForTests((async (args: any) => {
+      capturedOpts = args.providerOptions;
+      return fakeEmbeddings(1, 1536);
+    }) as any);
+    await embedQuery('hello');
+    // OpenAI's /embeddings endpoint would reject an unexpected input_type
+    // field. The CDX2-F6 fix puts the Voyage branches BEFORE the generic
+    // text-embedding-3 fall-through; this end-to-end test pins the absence.
+    expect(capturedOpts?.openai?.dimensions).toBe(1536);
+    expect(JSON.stringify(capturedOpts)).not.toContain('input_type');
+  });
+
+  test('Voyage voyage-3-large: input_type=query reaches the wire', async () => {
+    configureVoyage();
+    let capturedOpts: any = null;
+    __setEmbedTransportForTests((async (args: any) => {
+      capturedOpts = args.providerOptions;
+      return fakeEmbeddings(1, 1024);
+    }) as any);
+    await embedQuery('hello');
+    // Voyage v3+ accepts input_type; embedQuery threading reaches it.
+    expect(capturedOpts?.openaiCompatible?.input_type).toBe('query');
+    expect(capturedOpts?.openaiCompatible?.dimensions).toBe(1024);
+  });
+
+  test('Voyage with embed() (no inputType arg): NO input_type field (back-compat)', async () => {
+    configureVoyage();
+    let capturedOpts: any = null;
+    __setEmbedTransportForTests((async (args: any) => {
+      capturedOpts = args.providerOptions;
+      return fakeEmbeddings(args.values.length, 1024);
+    }) as any);
+    await embed(['doc']);
+    // CDX2-F6 contract: legacy callers (no 4th-arg) preserve their existing
+    // behavior. The pre-v0.35.0.0 Voyage gateway never sent input_type;
+    // a regression here would break existing brains. The condition is
+    // tested at the dimsProviderOptions layer too, but this end-to-end pin
+    // catches a future refactor that might bypass the condition.
+    expect(JSON.stringify(capturedOpts)).not.toContain('input_type');
+  });
+});
+
+describe('embedQuery — routes through same recipe as embed', () => {
+  beforeEach(() => configureVoyage4());
+
+  test('embedQuery + embed both use the configured Voyage model', async () => {
+    const dimsSeen: number[] = [];
+    __setEmbedTransportForTests((async (args: any) => {
+      // The args.model in the AI-SDK transport is the model instance; we
+      // can stringify a canonical name via the provider/recipe — easier
+      // to just confirm the dims and providerOptions match the Voyage config.
+      dimsSeen.push(args.providerOptions?.openaiCompatible?.dimensions);
+      return fakeEmbeddings(args.values.length, 1024);
+    }) as any);
+    await embedQuery('q');
+    await embed(['d']);
+    // Both calls routed through the same recipe + dim config.
+    expect(dimsSeen).toEqual([1024, 1024]);
+  });
+});

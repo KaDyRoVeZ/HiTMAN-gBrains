@@ -1,0 +1,293 @@
+/**
+ * Onboard + SkillOpt operation cluster — pure move from operations.ts
+ * (v0.46.x tranche 3): the v0.41.18.0 run_onboard remediation op and the
+ * v0.41.20.0 run_skillopt optimization op (adjacent slots at the tail of the
+ * canonical array). Op consts stay module-private; `skilloptOperations`
+ * below lists them in EXACTLY the order they appear in the canonical
+ * `operations` array in ../operations.ts. Never import from
+ * '../operations.ts' here (cycle).
+ */
+
+import type { Operation } from './contract.ts';
+import { opError } from './contract.ts';
+import { hostFix, invalidParam, paramUse } from './op-fix.ts';
+
+// v0.41.18.0 (A7 + T16, codex finding #5): MCP op for federated / thin-client
+// brain installs to drive `gbrain onboard --auto` over MCP. Admin scope
+// (NOT localOnly) so remote agents authenticated via OAuth can probe
+// brain health + submit auto-eligible remediation handlers.
+//
+// Critical security gate (codex #5): admin scope alone is NOT sufficient
+// to submit handlers in PROTECTED_JOB_NAMES (synthesize, patterns,
+// consolidate, extract-takes-from-pages, contextual_reindex_per_chunk).
+// Without this gate, an admin-scoped OAuth token would bypass the same
+// guard that `submit_job` enforces. The new NAMED scope
+// `run_protected_onboard` MUST be granted IN ADDITION TO admin for any
+// protected child handler to fire.
+//
+// Behavior:
+//   - mode='check' (default): returns the OnboardReport JSON envelope,
+//     never submits jobs. Admin scope sufficient.
+//   - mode='auto':            submits auto_apply tier. Admin + non-protected
+//                             handlers only.
+//   - mode='auto-with-prompt': submits auto_apply + prompt_required tier.
+//                             Same protection check.
+//
+// Any LLM-bearing handler the plan would have submitted gets filtered out
+// unless the caller has run_protected_onboard. Filtered items appear in
+// the response with status='skipped_missing_scope' so the caller knows
+// what they would have gotten with the right grants.
+const run_onboard: Operation = {
+  name: 'run_onboard',
+  idempotent: false,
+  outputRedaction: 'no_stored_text',
+  description: 'Probe brain health + optionally submit onboard remediations. Admin scope required. Protected handlers (LLM-bearing) require run_protected_onboard scope ADDITIONALLY.',
+  params: {
+    mode: { type: 'string', description: "'check' (default), 'auto', or 'auto-with-prompt'" },
+    target_score: { type: 'number', description: 'Target brain_score (default 90)' },
+    max_usd: { type: 'number', description: 'USD cap for autopilot path (required for auto modes)' },
+  },
+  mutating: true,
+  scope: 'admin',
+  handler: async (ctx, p) => {
+    const mode = (typeof p.mode === 'string' ? p.mode : 'check') as 'check' | 'auto' | 'auto-with-prompt';
+    const targetScore = typeof p.target_score === 'number' ? p.target_score : 90;
+    const maxUsd = typeof p.max_usd === 'number' ? p.max_usd : undefined;
+
+    const { computeRemediationPlan, runRemediation } = await import('../remediation/index.ts');
+    const { runAllOnboardChecks } = await import('../onboard/checks.ts');
+    const { buildOnboardReport } = await import('../onboard/render.ts');
+
+    // Per A26: source-scope via sourceScopeOpts(ctx). The recommendation
+    // planner is brain-wide today; future extension can scope by reading
+    // ctx.sourceId / ctx.auth.allowedSources for per-source plans.
+
+    let extraRemediations: import('../remediation-step.ts').RemediationStep[] = [];
+    try {
+      const checkResults = await runAllOnboardChecks(ctx.engine);
+      extraRemediations = checkResults.flatMap((r) => r.remediations);
+    } catch {
+      // Fail-open per A19 — return plan without extras rather than error.
+    }
+
+    // 'check' mode: just return the plan + JSON envelope. No submission.
+    if (mode === 'check') {
+      const plan = await computeRemediationPlan(ctx.engine, { targetScore, extraRemediations });
+      const report = buildOnboardReport(plan);
+      return report;
+    }
+
+    // 'auto' and 'auto-with-prompt' modes: require --max-usd per A12 + A20
+    // safety posture (cron-safety; refuses surprise spend).
+    if (maxUsd === undefined) {
+      throw opError('invalid_params', `mode='${mode}' requires max_usd (cron-safety cap)`,
+        `Pass ${paramUse(ctx, 'max_usd', 1)} (a spend cap in USD) with mode '${mode}', or use mode 'check' for a free plan. Spending needs the user's OK: ask before choosing a cap.`);
+    }
+
+    // Critical T16 + codex #5 security gate: filter out PROTECTED_JOB_NAMES
+    // unless the caller has the run_protected_onboard scope IN ADDITION
+    // to admin. Admin alone is insufficient.
+    const grantedScopes = ctx.auth?.scopes ?? [];
+    const canRunProtected = grantedScopes.includes('run_protected_onboard');
+    const { isProtectedJobName } = await import('../minions/protected-names.ts');
+
+    const skippedMissingScope: Array<{ id: string; job: string; reason: string }> = [];
+    const allowedExtras = extraRemediations.filter((r) => {
+      if (canRunProtected) return true;
+      if (isProtectedJobName(r.job)) {
+        skippedMissingScope.push({ id: r.id, job: r.job, reason: 'requires run_protected_onboard scope' });
+        return false;
+      }
+      return true;
+    });
+
+    // Run remediation with filtered extras. Hooks emit nothing — MCP
+    // returns structured result. Per A23 client_id attribution: stamp
+    // job.data.client_id on each submission so the spend chain (T10)
+    // attributes correctly. The library doesn't do this today; the
+    // upstream submit-side gating in submit_job filters protected names
+    // for ctx.remote !== false callers, so even if MCP run_onboard had a
+    // typo, the underlying queue.add would reject. Defense-in-depth.
+    const result = await runRemediation(
+      ctx.engine,
+      { targetScore, maxUsd, extraRemediations: allowedExtras },
+      {},
+    );
+
+    return {
+      ...result,
+      skipped_missing_scope: skippedMissingScope,
+    };
+  },
+};
+
+// v0.41.20.0 SkillOpt — MCP exposure (admin scope + per-skill allowlist
+// via `skillopt.allowed_skills` config, DEFAULT DENY-ALL for remote
+// callers; CLI bypasses via ctx.remote === false). Designed for trusted
+// admin tokens that want to drive optimization remotely; the same trust
+// gates as the CLI fire (working tree, install path, lock acquisition,
+// bundled-skill guard). NOT localOnly so admin HTTP MCP clients can invoke.
+const run_skillopt: Operation = {
+  name: 'run_skillopt',
+  idempotent: true,
+  outputRedaction: { exempt: 'skill catalog files are installed instructions read verbatim; redaction would corrupt approved revisions' },
+  description: 'Run SkillOpt against a single skill. Admin scope and remote skill allowlist required. shared_skill stages an exact catalog revision privately and requires explicit skill_editor and put_skill grants; only accepted body changes publish through the original revision CAS. Rate-limited per-skill via DB lock.',
+  params: {
+    skill_name: { type: 'string', required: true, description: 'Kebab-case skill name (resolves to skills/<name>/SKILL.md)' },
+    benchmark_path: { type: 'string', description: 'Absolute path to benchmark JSONL; defaults to skills/<name>/skillopt-benchmark.jsonl' },
+    epochs: { type: 'number', description: 'Default 4' },
+    batch_size: { type: 'number', description: 'Default 8' },
+    lr: { type: 'number', description: 'Default 4' },
+    max_cost_usd: { type: 'number', description: 'Default 5.00 (an unpriced model then warns and runs). When set, an unpriced model is refused with no_pricing. Remote callers must pass a positive value; 0 (uncapped) is host-only.' },
+    reflect_max_tokens: { type: 'number', description: 'Optimizer output cap (positive integer, clamped to 256..32000). Default: skillopt.reflect_max_tokens config, else 32000 for thinking optimizers and 4096 otherwise.' },
+    no_mutate: { type: 'boolean', description: 'Write proposed.md without replacing SKILL.md' },
+    allow_mutate_bundled: { type: 'boolean', description: 'Required to mutate bundled skills' },
+    held_out_path: { type: 'string', description: 'Path to a held-out test set (JSONL). REQUIRED (>=5 rows) to mutate a bundled skill in place — otherwise the run hard-refuses. Remote callers: must resolve within the skills directory.' },
+    dry_run: { type: 'boolean', description: 'Preview: models plan, strict verdict and cost estimate, no LLM calls' },
+    shared_skill: { type: 'boolean', description: 'Optimize an exact shared catalog revision in a private proposal workspace and publish the accepted body through put_skill.' },
+    source_id: { type: 'string', description: 'Required with shared_skill: canonical source.' },
+    source_incarnation: { type: 'string', description: 'Required with shared_skill: exact catalog source incarnation.' },
+    pack_id: { type: 'string', description: 'Required with shared_skill: exact catalog pack.' },
+    expected_revision: { type: 'string', description: 'Required with shared_skill: original revision CAS.' },
+    request_id: { type: 'string', description: 'Required with shared_skill: stable publication request UUID.' },
+  },
+  mutating: true,
+  scope: 'admin',
+  localOnly: false,
+  handler: async (ctx, p) => {
+    // SECURITY: skill_name is joined into filesystem paths (SKILL.md, default
+    // benchmark, checkpoint, history, best.md, proposed.md). A traversal-shaped
+    // name (`../`, absolute) would escape the skills dir even WITH the
+    // caller-supplied-path confinement below. Validate kebab-only up front so
+    // every derived path is contained by construction. Applies to all callers.
+    const skillNameRaw = (p.skill_name as string) ?? '';
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(skillNameRaw)) {
+      throw invalidParam(ctx, 'run_skillopt', 'skill_name', 'run_skillopt: skill_name must be kebab-case (matching ^[a-z0-9][a-z0-9-]*$)', { example: 'query' });
+    }
+    if (ctx.remote !== false) {
+      // Remote: enforce per-skill allowlist read from config.
+      // `skillopt.allowed_skills` is a JSON-array config of skill names
+      // an admin-scoped OAuth client may target. Default DENY-ALL: when
+      // unset, MCP cannot drive skillopt on any skill.
+      const allowedRaw = await ctx.engine.getConfig('skillopt.allowed_skills');
+      let allowed: string[] = [];
+      try {
+        if (allowedRaw) allowed = JSON.parse(allowedRaw) as string[];
+      } catch { /* fall through to deny */ }
+      const skillName = (p.skill_name as string) ?? '';
+      if (!allowed.includes(skillName)) {
+        throw opError('permission_denied', `run_skillopt: skill '${skillName}' is not in skillopt.allowed_skills allowlist (default deny-all for remote callers)`,
+          `Remote callers can optimize only skills the brain host's operator allow-lists (skillopt.allowed_skills, deny-all by default); ask them to add '${skillName}', or have the host run the optimizer itself.`,
+          { fix: hostFix(ctx, ['gbrain', 'skillopt', skillName], 'Runs the optimizer on the brain host, where no remote allowlist applies.', { consent: ['paid'] }) });
+      }
+    }
+    const maxCostUsd = p.max_cost_usd;
+    if (ctx.remote !== false && maxCostUsd !== undefined && !(typeof maxCostUsd === 'number' && Number.isFinite(maxCostUsd) && maxCostUsd > 0)) {
+      throw invalidParam(ctx, 'run_skillopt', 'max_cost_usd',
+        'run_skillopt: max_cost_usd must be a positive number of USD for remote callers; 0 (uncapped) is a host-only setting',
+        { example: 5 });
+    }
+    const { clampRemoteReflectMaxTokens } = await import('../skillopt/output-cap.ts');
+    let reflectMaxTokens: number | undefined;
+    try {
+      reflectMaxTokens = clampRemoteReflectMaxTokens(p.reflect_max_tokens);
+    } catch (err) {
+      throw opError('invalid_params', `run_skillopt: ${err instanceof Error ? err.message : String(err)}`,
+        'Lower reflect_max_tokens to the stated cap, or omit it to use the default.');
+    }
+    const { runSkillOpt } = await import('../skillopt/orchestrator.ts');
+    const { autoDetectSkillsDirReadOnly } = await import('../repo-root.ts');
+    const { resolveSkillOptModels, skillOptModelOpts } = await import('../skillopt/models-plan.ts');
+    let sharedSkill: import('../skillopt/types.ts').SkillOptOpts['sharedSkill'];
+    if (p.shared_skill === true) {
+      for (const field of ['source_id', 'source_incarnation', 'pack_id', 'expected_revision', 'request_id']) {
+        if (typeof p[field] !== 'string' || !p[field]) {
+          throw opError('invalid_params', `shared_skill requires ${field}.`,
+            `With shared_skill: true pass source_id, source_incarnation, pack_id and expected_revision from get_skill, and a fresh request_id (UUID); ${field} is missing.`);
+        }
+      }
+      const { assertSkillCapability } = await import('../shared-skills/policy.ts');
+      assertSkillCapability(ctx, 'skill_editor', 'put_skill');
+      sharedSkill = { source_id: p.source_id as string, source_incarnation: p.source_incarnation as string, pack_id: p.pack_id as string,
+        expected_revision: p.expected_revision as string, request_id: p.request_id as string };
+    }
+    const skillsDir = sharedSkill
+      ? await (await import('../shared-skills/optimizer.ts')).sharedOptimizerSkillsDir(ctx, sharedSkill.source_id, sharedSkill.source_incarnation)
+      : autoDetectSkillsDirReadOnly(process.cwd()).dir;
+    if (!skillsDir) {
+      throw opError('config_error', 'run_skillopt: skills directory not found',
+        'The brain host has no skills directory to optimize. Run `gbrain doctor --json` on the host; it reports where gbrain looks for skills.');
+    }
+    const models = await resolveSkillOptModels(ctx.engine);
+    const skillName = p.skill_name as string;
+    const benchmarkPath = (p.benchmark_path as string) ??
+      `${skillsDir}/${skillName}/skillopt-benchmark.jsonl`;
+    const heldOutPath = p.held_out_path as string | undefined;
+    // SECURITY: remote callers must NOT be able to point benchmark/held-out at
+    // arbitrary host files (loadBenchmark → fs.readFileSync would otherwise be an
+    // arbitrary-read + existence oracle). Confine any caller-supplied path to the
+    // skills directory. Local CLI callers (ctx.remote === false) are unconfined.
+    if (ctx.remote !== false && !sharedSkill) {
+      const nodePath = await import('node:path');
+      const nodeFs = await import('node:fs');
+      const rootReal = (() => {
+        try { return nodeFs.realpathSync(skillsDir); } catch { return nodePath.resolve(skillsDir); }
+      })();
+      const confine = (label: string, candidate: string | undefined): void => {
+        if (!candidate) return;
+        const resolved = nodePath.resolve(candidate);
+        let real = resolved;
+        try {
+          real = nodeFs.realpathSync(resolved);
+        } catch {
+          // Not yet present: canonicalize the nearest existing ancestor so a
+          // legit in-dir path under a symlinked skillsDir (e.g. macOS /tmp ->
+          // /private/tmp, Conductor worktrees) isn't wrongly rejected.
+          try { real = nodePath.join(nodeFs.realpathSync(nodePath.dirname(resolved)), nodePath.basename(resolved)); }
+          catch { /* parent also missing; fall back to resolved form */ }
+        }
+        if (real !== rootReal && !real.startsWith(rootReal + nodePath.sep)) {
+          throw opError('permission_denied', `run_skillopt: ${label} must resolve within the skills directory for remote callers`,
+            `Omit ${label} to use the skill's default benchmark, or pass a path inside the skills directory.`);
+        }
+      };
+      confine('benchmark_path', p.benchmark_path as string | undefined);
+      confine('held_out_path', heldOutPath);
+    }
+    const result = await runSkillOpt({
+      engine: ctx.engine,
+      operationContext: ctx,
+      ...(sharedSkill ? { sharedSkill } : {}),
+      skillName,
+      skillsDir,
+      benchmarkPath,
+      epochs: (p.epochs as number) ?? 4,
+      batchSize: (p.batch_size as number) ?? 8,
+      lr: (p.lr as number) ?? 4,
+      lrSchedule: 'cosine',
+      split: [4, 1, 5],
+      ...skillOptModelOpts(models),
+      ...(reflectMaxTokens !== undefined ? { reflectMaxTokens } : {}),
+      mode: 'patch',
+      dryRun: (p.dry_run as boolean) === true,
+      noMutate: (p.no_mutate as boolean) === true,
+      allowMutateBundled: (p.allow_mutate_bundled as boolean) === true,
+      bootstrapReviewed: false,
+      ...(heldOutPath ? { heldOutPath } : {}),
+      json: true,
+      maxCostUsd: (maxCostUsd as number | undefined) ?? 5.0,
+      maxCostSource: maxCostUsd === undefined ? 'default' : 'user',
+      maxRuntimeMin: 30,
+      force: false,
+    });
+    return {
+      outcome: result.outcome,
+      receipt: result.receipt,
+      mutated_skill_file: result.mutatedSkillFile,
+      proposed_path: result.proposedPath,
+      ...(result.sharedOptimization ? { shared_optimization: result.sharedOptimization } : {}),
+    };
+  },
+};
+
+export const skilloptOperations: Operation[] = [run_onboard, run_skillopt];

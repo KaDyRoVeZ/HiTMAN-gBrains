@@ -1,0 +1,192 @@
+/**
+ * The canonical worktree manifest that writer transfer, rebind (`sources
+ * set-path`), clone and reclone compare: a digest over relative path ->
+ * sha256 of the file's bytes, plus the file count, with deletions caught by
+ * exact path-set equality. Stored manifests carry only the digest, count and
+ * scope, so their size does not grow with the worktree.
+ *
+ * #6099: a Git checkout is hashed in `git` scope, over the paths Git tracks
+ * (`git ls-files -z --cached --stage`, hashed from the working-tree bytes; an
+ * index entry missing on disk counts as deleted). Ignored files (a `.env.local`,
+ * `node_modules`) are never opened, so a clean clone verifies and secrets are
+ * never read or hashed. Untracked files Git does not ignore are reported as a
+ * count only. A directory that is not the top of its own Git work tree keeps the
+ * `tree` scope: every file except `.git`, `.gbrain-managed` and physical-root
+ * metadata. A manifest without `scope` is in `tree` scope, which is also what every
+ * manifest an older release stored is, so those keep verifying in that scope.
+ *
+ * Git runs through `hardened-git.ts` (the candidate directory's config is
+ * untrusted). Symlinks, submodules (gitlinks) and tracked paths that resolve
+ * outside the root (including an index entry with a `..` segment) refuse with
+ * `writer_manifest_unsafe` before anything is read.
+ */
+import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { isAbsolute, join, relative, sep } from 'node:path';
+import { opError } from '../ops/contract.ts';
+import { createProgress, type ProgressOptions } from '../progress.ts';
+import { hardenedGitSync } from '../hardened-git.ts';
+import { classifyGitCheckout } from '../git-checkout.ts';
+import { digest, sha256 } from './digest.ts';
+import { isPhysicalRootMetadata } from './root-metadata.ts';
+import type { PhysicalRootRecovery } from './physical-root-recovery.ts';
+
+export type WorktreeManifestScope = 'git' | 'tree';
+export interface WorktreeManifest { digest: string; file_count: number;
+  /** `git` for a Git-scoped manifest; absent means `tree` (the only scope older releases recorded). */
+  scope?: 'git';
+  /** Git scope only: untracked files Git does not ignore, which the manifest does not cover (count only, never names). */
+  untracked_count?: number }
+export type StoredWorktreeManifest = WorktreeManifest & { canonical_stamp?: string; self_transfer?: PhysicalRootRecovery };
+export const MANIFEST_PROGRESS_MIN_FILES = 5000;
+const GIT_LIMITS = { timeoutMs: 60_000, maxBytes: 256 * 1024 * 1024 };
+
+const unsafe = (message: string, suggestion: string, opts?: Parameters<typeof opError>[3]) => opError('writer_manifest_unsafe', message, suggestion, opts);
+
+/** The scope a stored manifest was recorded in (older releases recorded `tree` without saying so). */
+export function storedManifestScope(manifest: { scope?: WorktreeManifestScope } | null | undefined): WorktreeManifestScope {
+  return manifest?.scope === 'git' ? 'git' : 'tree';
+}
+
+/**
+ * True when `canonical` positively cannot be the top of its own Git work tree:
+ * it has no `.git` directory or file. (Wave 12 seam: lane W1's shared
+ * "positively not a Git checkout" classifier replaces this at integration.)
+ */
+/**
+ * `git` when `root` is the top of its own Git work tree, else `tree`. W4.4:
+ * when Git cannot answer for a directory that holds `.git` (damaged HEAD,
+ * dubious ownership, timeout, Git missing), this refuses instead of hashing
+ * the whole tree, which would open ignored files such as `.env`.
+ */
+export function detectManifestScope(root: string): WorktreeManifestScope {
+  const canonical = realpathSync(root);
+  const top = hardenedGitSync(canonical, ['rev-parse', '--show-toplevel'], { timeoutMs: 10_000, maxBytes: 64 * 1024 });
+  if (!top.ok) {
+    if (classifyGitCheckout(canonical) === 'not_git') return 'tree';
+    throw unsafe('Git could not read this checkout, so no manifest was recorded.',
+      `${canonical} holds a .git entry but \`git rev-parse\` failed (${top.reason === 'exit' ? 'a damaged repository, or a checkout owned by another user' : top.reason}), and hashing every file instead would read ignored files such as .env. `
+        + `Ask the user to run \`git -C ${canonical} status\` to see why Git refuses it and repair it (or run gbrain as the checkout's owner), then run the step again.`,
+      { why: 'Without Git the manifest would cover every file, ignored secrets included, so nothing was hashed.',
+        fix: { argv: ['git', '-C', canonical, 'status'], consent: [], actor: 'user', requires_exclusive: false,
+          why: 'Git prints why it cannot read this checkout (a damaged HEAD or index, or a checkout owned by another user).',
+          user_message: `Git cannot read ${canonical}. Please run the command shown, repair what it reports, then run the gbrain step again.`,
+          verify: { argv: ['git', '-C', canonical, 'rev-parse', '--show-toplevel'] } } });
+  }
+  try { return realpathSync(top.stdout.toString('utf8').trim()) === canonical ? 'git' : 'tree'; } catch { return 'tree'; }
+}
+
+const excluded = (rel: string) => rel.split('/').some(part => part === '.git' || part === '.gbrain-managed' || isPhysicalRootMetadata(part));
+
+/**
+ * The manifest of `root` in `scope` (detected when omitted). `withFiles` also
+ * returns the per-file map, for a caller that compares two local checkouts.
+ */
+export function worktreeManifest(root: string, opts: { progress?: ProgressOptions; scope?: WorktreeManifestScope; withFiles?: boolean } = {}): WorktreeManifest & { files?: Record<string, string> } {
+  const canonical = realpathSync(root);
+  const scope = opts.scope ?? detectManifestScope(canonical);
+  const listed = scope === 'git' ? trackedPaths(canonical) : treePaths(canonical);
+  const progress = opts.progress && listed.paths.length > MANIFEST_PROGRESS_MIN_FILES ? createProgress(opts.progress) : undefined;
+  progress?.start('sources.manifest_hash', listed.paths.length);
+  const files: Record<string, string> = {};
+  for (const rel of listed.paths) {
+    const bytes = scope === 'git' ? trackedBytes(canonical, rel) : readFileSync(join(canonical, ...rel.split('/')));
+    if (bytes) files[rel] = sha256(bytes);
+    progress?.tick();
+  }
+  progress?.finish();
+  const count = Object.keys(files).length;
+  return { digest: digest(files), file_count: count, ...(scope === 'git' ? { scope, untracked_count: listed.untracked ?? 0 } : {}),
+    ...(opts.withFiles ? { files } : {}) };
+}
+
+function treePaths(canonical: string): { paths: string[]; untracked?: number } {
+  const paths: string[] = [];
+  const visit = (dir: string) => {
+    for (const name of readdirSync(dir).sort()) {
+      if (name === '.git' || name === '.gbrain-managed' || isPhysicalRootMetadata(name)) continue;
+      const path = join(dir, name), info = lstatSync(path);
+      if (info.isSymbolicLink()) throw unsafe('The canonical checkout manifest requires a symlink-free checkout.',
+        `${relative(canonical, path).split(sep).join('/')} in the checkout is a symlink, so no manifest was recorded. Ask the user to replace it with a real file or directory (or remove it), then run the step again.`);
+      if (info.isDirectory()) visit(path);
+      else if (info.isFile()) paths.push(relative(canonical, path).split(sep).join('/'));
+    }
+  };
+  visit(canonical);
+  return { paths };
+}
+
+function trackedPaths(canonical: string): { paths: string[]; untracked: number } {
+  const listed = hardenedGitSync(canonical, ['ls-files', '-z', '--cached', '--stage'], GIT_LIMITS);
+  if (!listed.ok) throw unsafe('The canonical manifest is recorded from tracked Git files, and Git could not list them here.',
+    `Git could not list the tracked files of ${canonical} (${listed.reason === 'exit' ? 'it is not the top of a Git checkout, or its index is unreadable' : listed.reason}), so no manifest was compared. `
+      + 'Use a Git checkout of the same repository: for example git clone <the owner\'s repository> <this directory>, check out the same commit, then run the step again.');
+  const paths = new Set<string>();
+  for (const record of listed.stdout.toString('utf8').split('\0')) {
+    if (!record) continue;
+    const tab = record.indexOf('\t');
+    const mode = record.slice(0, record.indexOf(' ')), rel = record.slice(tab + 1);
+    if (!insideCheckout(rel)) throw outsideCheckout(canonical);
+    if (excluded(rel)) continue;
+    if (mode === '160000') throw unsafe('Canonical worktree transfer does not support Git submodules.',
+      `${rel} in ${canonical} is a Git submodule, so no manifest was recorded. Ask the user to replace the submodule with ordinary tracked files (or remove it), then run the step again.`);
+    if (mode === '120000') throw unsafe('The canonical checkout manifest requires a symlink-free checkout.',
+      `${rel} in the checkout is a tracked symlink, so no manifest was recorded. Ask the user to replace it with a real file (or remove it), then run the step again.`);
+    paths.add(rel);
+  }
+  const others = hardenedGitSync(canonical, ['ls-files', '-z', '--others', '--exclude-standard'], GIT_LIMITS);
+  const untracked = others.ok ? others.stdout.toString('utf8').split('\0').filter(rel => rel && !excluded(rel)).length : 0;
+  return { paths: [...paths].sort(), untracked };
+}
+
+/** A repository-relative path that names a file under the checkout: no empty, `.` or `..` segment and not absolute. */
+function insideCheckout(rel: string): boolean {
+  return !isAbsolute(rel) && rel.split('/').every(part => part !== '' && part !== '.' && part !== '..');
+}
+const outsideCheckout = (canonical: string) => unsafe('Canonical worktree transfer only hashes files inside the checkout.',
+  `The Git index of ${canonical} lists a path that leaves the checkout (a hand-edited or corrupted index), so no manifest was recorded and nothing outside the checkout was read. `
+    + 'Ask the user to replace the checkout with a fresh git clone of the same repository at the same commit, then run the step again.');
+
+/**
+ * The working-tree bytes of a tracked path; null when it is missing on disk (counted as deleted).
+ *
+ * #6510: the symlink check is `lstat` on every directory component between the canonical root and the leaf, then
+ * the leaf, on every read; a symlink anywhere refuses. The earlier `realpath(path) === path` proxy conflated "resolves
+ * through a link" with "the filesystem spells this name differently", which is legal on a normalization-insensitive
+ * volume (APFS answers an NFC request with the NFD entry) and on a case-insensitive one, and falsely refused with
+ * `writer_manifest_unsafe`. The bytes are read through the Git spelling, never through an alias. No component is
+ * cached across files: a parent replaced by a symlink after the first file of a manifest would otherwise let a later
+ * leaf read outside the root.
+ */
+function trackedBytes(canonical: string, rel: string): Buffer | null {
+  if (!insideCheckout(rel)) throw outsideCheckout(canonical);
+  const parts = rel.split('/');
+  const path = join(canonical, ...parts);
+  const within = relative(canonical, path);
+  if (within === '' || within.split(sep)[0] === '..' || isAbsolute(within)) throw outsideCheckout(canonical);
+  let component = canonical;
+  for (let i = 0; i < parts.length; i++) {
+    component = join(component, parts[i]!);
+    let info;
+    try { info = lstatSync(component); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ENOTDIR') return null;
+      throw error;
+    }
+    if (info.isSymbolicLink()) throw unsafe('The canonical checkout manifest requires a symlink-free checkout.',
+      `${rel} in the checkout resolves through a symlink, so no manifest was recorded. Ask the user to replace the link with a real file or directory (or remove it), then run the step again.`);
+    if (i < parts.length - 1 ? !info.isDirectory() : !info.isFile()) return null;
+  }
+  return readFileSync(path);
+}
+
+/** Drops a legacy per-file map from a stored manifest, keeping every other field. */
+export function compactStoredManifest<T extends { digest: string; files?: Record<string, string>; file_count?: number }>(manifest: T): Omit<T, 'files'> & { file_count: number } {
+  const { files, ...rest } = manifest;
+  return { ...rest, file_count: rest.file_count ?? Object.keys(files ?? {}).length };
+}
+
+/** The first `limit` relative paths whose bytes differ, or that only one of two local checkouts has, in `scope`. */
+export function manifestDifferences(left: string, right: string, scope: WorktreeManifestScope, limit = 5): { paths: string[]; total: number } {
+  const a = worktreeManifest(left, { scope, withFiles: true }).files!, b = worktreeManifest(right, { scope, withFiles: true }).files!;
+  const differing = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort().filter(path => a[path] !== b[path]);
+  return { paths: differing.slice(0, limit), total: differing.length };
+}

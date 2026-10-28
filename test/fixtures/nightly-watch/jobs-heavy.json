@@ -1,0 +1,517 @@
+{
+  "total_count": 7,
+  "jobs": [
+    {
+      "id": 111415376143,
+      "name": "opencode door e2e (keyless)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/garrytan/gbrain/actions/runs/37195155240/job/111415376143",
+      "steps": [
+        {
+          "number": 1,
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "number": 2,
+          "name": "Set up runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 3,
+          "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 4,
+          "name": "Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "success"
+        },
+        {
+          "number": 5,
+          "name": "Run bun install --frozen-lockfile",
+          "conclusion": "success"
+        },
+        {
+          "number": 6,
+          "name": "Prepare evidence dir",
+          "conclusion": "success"
+        },
+        {
+          "number": 7,
+          "name": "Build gbrain (compile once per lane)",
+          "conclusion": "success"
+        },
+        {
+          "number": 8,
+          "name": "Install opencode (pinned npm package, pack-verify-install)",
+          "conclusion": "success"
+        },
+        {
+          "number": 9,
+          "name": "Run opencode door tests (keyless tier — SMOKE included)",
+          "conclusion": "success"
+        },
+        {
+          "number": 10,
+          "name": "Report credentialed coverage not run in keyless lane",
+          "conclusion": "success"
+        },
+        {
+          "number": 11,
+          "name": "Preconditions (credentialed lane requires secret)",
+          "conclusion": "skipped"
+        },
+        {
+          "number": 12,
+          "name": "Run opencode door tests (credentialed tier only)",
+          "conclusion": "skipped"
+        },
+        {
+          "number": 13,
+          "name": "Version re-check (mid-job drift tripwire)",
+          "conclusion": "success"
+        },
+        {
+          "number": 14,
+          "name": "Scrub credentials from evidence (defensive)",
+          "conclusion": "skipped"
+        },
+        {
+          "number": 15,
+          "name": "Upload opencode door evidence",
+          "conclusion": "skipped"
+        },
+        {
+          "number": 16,
+          "name": "Remove opencode credentials (unconditional)",
+          "conclusion": "success"
+        },
+        {
+          "number": 30,
+          "name": "Post Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "success"
+        },
+        {
+          "number": 31,
+          "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 32,
+          "name": "Complete runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 33,
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 111415376248,
+      "name": "Heavy tests",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/garrytan/gbrain/actions/runs/37195155240/job/111415376248",
+      "steps": [
+        {
+          "number": 1,
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "number": 2,
+          "name": "Set up runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 3,
+          "name": "Initialize containers",
+          "conclusion": "success"
+        },
+        {
+          "number": 4,
+          "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 5,
+          "name": "Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "success"
+        },
+        {
+          "number": 6,
+          "name": "Run actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684",
+          "conclusion": "success"
+        },
+        {
+          "number": 7,
+          "name": "Run bun install --frozen-lockfile",
+          "conclusion": "success"
+        },
+        {
+          "number": 8,
+          "name": "Run heavy tests",
+          "conclusion": "success"
+        },
+        {
+          "number": 9,
+          "name": "Bootstrap offline Docker e2e (placeholder)",
+          "conclusion": "failure"
+        },
+        {
+          "number": 10,
+          "name": "Stage heavy-test logs into workspace",
+          "conclusion": "success"
+        },
+        {
+          "number": 11,
+          "name": "Upload heavy-test artifacts",
+          "conclusion": "success"
+        },
+        {
+          "number": 19,
+          "name": "Post Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "skipped"
+        },
+        {
+          "number": 20,
+          "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 21,
+          "name": "Stop containers",
+          "conclusion": "success"
+        },
+        {
+          "number": 22,
+          "name": "Complete runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 23,
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 111415376262,
+      "name": "Real-agent door e2e (skips without authed binaries)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/garrytan/gbrain/actions/runs/37195155240/job/111415376262",
+      "steps": [
+        {
+          "number": 1,
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "number": 2,
+          "name": "Set up runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 3,
+          "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 4,
+          "name": "Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "success"
+        },
+        {
+          "number": 5,
+          "name": "Run actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684",
+          "conclusion": "success"
+        },
+        {
+          "number": 6,
+          "name": "Run bun install --frozen-lockfile",
+          "conclusion": "success"
+        },
+        {
+          "number": 7,
+          "name": "Run real-agent door tests",
+          "conclusion": "success"
+        },
+        {
+          "number": 12,
+          "name": "Post Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "success"
+        },
+        {
+          "number": 13,
+          "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 14,
+          "name": "Complete runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 15,
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 111415376292,
+      "name": "Hermes door e2e (credentialed, real binary, loud-fail)",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/garrytan/gbrain/actions/runs/37195155240/job/111415376292",
+      "steps": [
+        {
+          "number": 1,
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "number": 2,
+          "name": "Set up runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 3,
+          "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 4,
+          "name": "Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "success"
+        },
+        {
+          "number": 5,
+          "name": "Run actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684",
+          "conclusion": "success"
+        },
+        {
+          "number": 6,
+          "name": "Run bun install --frozen-lockfile",
+          "conclusion": "success"
+        },
+        {
+          "number": 7,
+          "name": "Prepare evidence dir",
+          "conclusion": "success"
+        },
+        {
+          "number": 8,
+          "name": "Install hermes (pinned installer digest)",
+          "conclusion": "success"
+        },
+        {
+          "number": 9,
+          "name": "Preconditions (binary, secret, version pin)",
+          "conclusion": "failure"
+        },
+        {
+          "number": 10,
+          "name": "Configure hermes (auth + model pin)",
+          "conclusion": "skipped"
+        },
+        {
+          "number": 11,
+          "name": "Run hermes door tests",
+          "conclusion": "skipped"
+        },
+        {
+          "number": 12,
+          "name": "Scrub credentials from evidence (defensive)",
+          "conclusion": "success"
+        },
+        {
+          "number": 13,
+          "name": "Upload hermes door evidence",
+          "conclusion": "success"
+        },
+        {
+          "number": 14,
+          "name": "Remove hermes credentials (unconditional)",
+          "conclusion": "success"
+        },
+        {
+          "number": 26,
+          "name": "Post Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "skipped"
+        },
+        {
+          "number": 27,
+          "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 28,
+          "name": "Complete runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 29,
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 111415376295,
+      "name": "opencode door canary (latest, keyless, non-gating)",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/garrytan/gbrain/actions/runs/37195155240/job/111415376295",
+      "steps": [
+        {
+          "number": 1,
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "number": 2,
+          "name": "Set up runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 3,
+          "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 4,
+          "name": "Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "success"
+        },
+        {
+          "number": 5,
+          "name": "Run bun install --frozen-lockfile",
+          "conclusion": "success"
+        },
+        {
+          "number": 6,
+          "name": "Build gbrain",
+          "conclusion": "success"
+        },
+        {
+          "number": 7,
+          "name": "Install opencode@latest (unpinned — the whole point)",
+          "conclusion": "success"
+        },
+        {
+          "number": 8,
+          "name": "Run opencode door tests (keyless tier against latest)",
+          "conclusion": "success"
+        },
+        {
+          "number": 14,
+          "name": "Post Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "success"
+        },
+        {
+          "number": 15,
+          "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 16,
+          "name": "Complete runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 17,
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 111415376359,
+      "name": "Plugin doors (codex + claude, install tier)",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/garrytan/gbrain/actions/runs/37195155240/job/111415376359",
+      "steps": [
+        {
+          "number": 1,
+          "name": "Set up job",
+          "conclusion": "success"
+        },
+        {
+          "number": 2,
+          "name": "Set up runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 3,
+          "name": "Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 4,
+          "name": "Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "success"
+        },
+        {
+          "number": 5,
+          "name": "Run bun install --frozen-lockfile",
+          "conclusion": "success"
+        },
+        {
+          "number": 6,
+          "name": "Build gbrain (compile once for the doors)",
+          "conclusion": "success"
+        },
+        {
+          "number": 7,
+          "name": "Install codex + claude (pinned npm versions, refuse on drift)",
+          "conclusion": "success"
+        },
+        {
+          "number": 8,
+          "name": "Codex plugin door (install tier — expected shape enforced)",
+          "conclusion": "failure"
+        },
+        {
+          "number": 9,
+          "name": "Claude plugin door (install tier — expected shape enforced)",
+          "conclusion": "skipped"
+        },
+        {
+          "number": 16,
+          "name": "Post Run oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+          "conclusion": "skipped"
+        },
+        {
+          "number": 17,
+          "name": "Post Run actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "conclusion": "success"
+        },
+        {
+          "number": 18,
+          "name": "Complete runner",
+          "conclusion": "success"
+        },
+        {
+          "number": 19,
+          "name": "Complete job",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 111415376784,
+      "name": "Grok door e2e (real binary, keyless-first)",
+      "status": "completed",
+      "conclusion": "skipped",
+      "html_url": "https://github.com/garrytan/gbrain/actions/runs/37195155240/job/111415376784",
+      "steps": []
+    }
+  ]
+}

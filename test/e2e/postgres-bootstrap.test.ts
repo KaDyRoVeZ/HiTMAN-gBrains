@@ -1,0 +1,443 @@
+/**
+ * E2E test for PostgresEngine forward-reference bootstrap.
+ *
+ * Codex caught that `test/e2e/helpers.ts:74` uses the standalone
+ * `db.initSchema()` from `src/core/db.ts`, which only runs SCHEMA_SQL and
+ * never calls runMigrations(). A test using that helper would NOT exercise
+ * `PostgresEngine.initSchema()`'s reordered path, producing false-positive
+ * coverage. This test deliberately bypasses the standard helper and
+ * instantiates `PostgresEngine` directly, calling `engine.initSchema()` so
+ * the bootstrap → SCHEMA_SQL → runMigrations sequence runs end-to-end.
+ *
+ * Covers issues #366, #375, #378 — Postgres-side wedges where pre-v0.18
+ * brains crashed on `column "source_id" does not exist`.
+ *
+ * NOTE: snapshot-based historical state simulation is out of scope for this
+ * wave (would require maintaining historical schema dumps). The test
+ * mutates a fresh-LATEST brain to a pre-v0.18 shape; codex flagged this as
+ * approximate. Acceptable here because the bootstrap's contract is narrow:
+ * "given a brain that lacks the specific forward-references, initSchema
+ * produces a brain at LATEST." The test exercises exactly that contract.
+ *
+ * Run: DATABASE_URL=postgresql://... bun run test:e2e test/e2e/postgres-bootstrap.test.ts
+ */
+
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { LATEST_VERSION } from '../../src/core/migrate.ts';
+import { readFactsEmbeddingDim } from '../../src/core/embedding-dim-check.ts';
+import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
+import { applyPostgresForwardReferenceBootstrap } from '../../src/core/engine-sql/bootstrap.ts';
+
+const DATABASE_URL = process.env.DATABASE_URL;
+const skip = !DATABASE_URL;
+
+describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => {
+  let engine: PostgresEngine;
+  let close: (() => Promise<void>) | undefined;
+
+  beforeAll(async () => {
+    const fixture = await isolatedPersistencePostgres(DATABASE_URL!, 'module');
+    engine = fixture.engine;
+    close = fixture.close;
+  }, 30_000);
+
+  afterAll(async () => {
+    await close?.();
+  });
+
+  test('fact embedding identity bootstrap repairs old and partial schemas without inventing provenance', async () => {
+    await engine.initSchema();
+    const { dims } = await readFactsEmbeddingDim(engine);
+    const fact = await engine.insertFact({ fact: 'Synthetic bootstrap claim', source: 'synthetic', embedding: new Float32Array(dims!).fill(0.1) }, { source_id: 'default' });
+    const original = await engine.executeRaw('SELECT id,fact,embedding::text,embedded_at FROM facts WHERE id=$1', [fact.id]);
+    expect(original[0].embedding).not.toBeNull();
+    for (const missing of [['embedding_model', 'embedded_text_hash'], ['embedding_model'], ['embedded_text_hash']]) {
+      const conn = await (engine as any).sql.reserve();
+      try {
+        await conn.unsafe('SELECT pg_advisory_lock(42)');
+        await conn.unsafe("UPDATE facts SET embedding_model='synthetic:original',embedded_text_hash='synthetic-preserved-hash' WHERE id=$1", [fact.id]);
+        for (const column of missing) await conn.unsafe(`ALTER TABLE facts DROP COLUMN ${column}`);
+        await conn.unsafe("UPDATE config SET value='165' WHERE key='version'");
+        await applyPostgresForwardReferenceBootstrap(conn);
+        await applyPostgresForwardReferenceBootstrap(conn);
+        expect((await conn.unsafe("SELECT value FROM config WHERE key='version'"))[0].value).toBe('165');
+        expect(await conn.unsafe(`SELECT column_name,data_type,is_nullable,column_default FROM information_schema.columns
+          WHERE table_schema=current_schema() AND table_name='facts' AND column_name IN ('embedding_model','embedded_text_hash') ORDER BY column_name`)).toEqual([
+          { column_name: 'embedded_text_hash', data_type: 'text', is_nullable: 'YES', column_default: null },
+          { column_name: 'embedding_model', data_type: 'text', is_nullable: 'YES', column_default: null },
+        ]);
+      } finally {
+        await conn.unsafe('SELECT pg_advisory_unlock(42)');
+        conn.release();
+      }
+      const identity = [{
+        embedding_model: missing.includes('embedding_model') ? null : 'synthetic:original',
+        embedded_text_hash: missing.includes('embedded_text_hash') ? null : 'synthetic-preserved-hash',
+      }];
+      expect(await engine.executeRaw('SELECT embedding_model,embedded_text_hash FROM facts WHERE id=$1', [fact.id])).toEqual(identity);
+      for (const column of missing) await engine.executeRaw(`ALTER TABLE facts DROP COLUMN ${column}`);
+      await engine.initSchema();
+      await engine.initSchema();
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+      expect(await engine.executeRaw('SELECT embedding_model,embedded_text_hash FROM facts WHERE id=$1', [fact.id])).toEqual(identity);
+      expect(await engine.executeRaw('SELECT id,fact,embedding::text,embedded_at FROM facts WHERE id=$1', [fact.id])).toEqual(original);
+    }
+  }, 60_000);
+
+  test('grant bootstrap repairs a partial installation without changing existing client policy', async () => {
+    await engine.initSchema();
+    const conn = await (engine as any).sql.reserve();
+    try {
+      await conn.unsafe('SELECT pg_advisory_lock(42)');
+      await conn.unsafe(`
+        INSERT INTO oauth_clients (client_id, client_name, scope, grant_revision)
+        VALUES ('fixture-bootstrap-client', 'fixture client', 'read', 4);
+        ALTER TABLE oauth_clients DROP COLUMN grant_profile;
+        ALTER TABLE oauth_clients DROP COLUMN allowed_operations;
+      `);
+      await expect((async () => { await conn.unsafe('SELECT grant_profile FROM oauth_clients LIMIT 1'); })())
+        .rejects.toThrow('does not exist');
+      await applyPostgresForwardReferenceBootstrap(conn);
+      await applyPostgresForwardReferenceBootstrap(conn);
+      expect(await conn.unsafe(`
+        SELECT scope, grant_revision, grant_profile, allowed_operations
+        FROM oauth_clients WHERE client_id = 'fixture-bootstrap-client'
+      `)).toEqual([{ scope: 'read', grant_revision: 4, grant_profile: null, allowed_operations: null }]);
+    } finally {
+      await applyPostgresForwardReferenceBootstrap(conn);
+      await conn.unsafe("DELETE FROM oauth_clients WHERE client_id = 'fixture-bootstrap-client'");
+      await conn.unsafe('SELECT pg_advisory_unlock(42)');
+      conn.release();
+    }
+  }, 30_000);
+
+  test('queue bootstrap preserves historical NULL authority and repairs either missing protocol column', async () => {
+    await engine.initSchema();
+    const conn = await (engine as any).sql.reserve();
+    try {
+      await conn.unsafe('SELECT pg_advisory_lock(42)');
+      await conn.unsafe(`
+        TRUNCATE minion_jobs RESTART IDENTITY CASCADE;
+        DROP TRIGGER IF EXISTS minion_queue_protocol ON minion_jobs;
+        ALTER TABLE minion_jobs DROP COLUMN submission_authority;
+        ALTER TABLE minion_jobs DROP COLUMN claim_generation;
+        INSERT INTO minion_jobs (name, status, data, attempts_made, attempts_started, delay_until)
+        VALUES ('sync', 'delayed', '{"sourceId":"default"}', 1, 2, '2026-09-01T00:00:00Z'),
+               ('lint', 'completed', '{}', 0, 1, NULL);
+      `);
+      const snapshotSql = 'SELECT id, name, status, data, attempts_made, attempts_started, delay_until FROM minion_jobs ORDER BY id';
+      const original = await conn.unsafe(snapshotSql);
+      await applyPostgresForwardReferenceBootstrap(conn);
+      await applyPostgresForwardReferenceBootstrap(conn);
+      expect(await conn.unsafe(snapshotSql)).toEqual(original);
+      expect(await conn.unsafe('SELECT submission_authority, claim_generation::int FROM minion_jobs ORDER BY id'))
+        .toEqual([{ submission_authority: null, claim_generation: 0 }, { submission_authority: null, claim_generation: 0 }]);
+      await conn.unsafe(`ALTER TABLE minion_jobs DROP COLUMN submission_authority;
+        UPDATE minion_jobs SET claim_generation = 7 WHERE name = 'lint';`);
+      await applyPostgresForwardReferenceBootstrap(conn);
+      expect(await conn.unsafe("SELECT submission_authority, claim_generation::int FROM minion_jobs WHERE name = 'lint'"))
+        .toEqual([{ submission_authority: null, claim_generation: 7 }]);
+      await conn.unsafe(`ALTER TABLE minion_jobs DROP COLUMN claim_generation;
+        UPDATE minion_jobs SET submission_authority = '{"version":1,"kind":"application"}' WHERE name = 'lint';`);
+      await applyPostgresForwardReferenceBootstrap(conn);
+      expect(await conn.unsafe("SELECT submission_authority, claim_generation::int FROM minion_jobs WHERE name = 'lint'"))
+        .toEqual([{ submission_authority: { version: 1, kind: 'application' }, claim_generation: 0 }]);
+    } finally {
+      await conn.unsafe('SELECT pg_advisory_unlock(42)');
+      conn.release();
+    }
+    await engine.initSchema();
+  }, 30_000);
+
+  test('PostgresEngine.initSchema applies bootstrap → SCHEMA_SQL → migrations on pre-v0.18 brain', async () => {
+    // First call: bring the test DB to LATEST shape so we have something to mutate.
+    await engine.initSchema();
+
+    // Clear data from prior tests in the suite. Adding a UNIQUE(slug)
+    // constraint below would fail if multi-source fixtures left rows with
+    // duplicate slugs across sources (which is valid under the composite
+    // UNIQUE this test is undoing).
+    const conn = (engine as any).sql;
+    await conn.unsafe(`TRUNCATE pages, content_chunks, links, tags, raw_data, timeline_entries, page_versions, ingest_log RESTART IDENTITY CASCADE`);
+
+    // Mutate to pre-v0.18 shape: drop source_id and the sources table.
+    // The advisory lock is released between initSchema calls, so this
+    // direct DDL won't deadlock.
+    await conn.unsafe(`
+      ALTER TABLE pages DROP CONSTRAINT IF EXISTS pages_source_slug_key;
+      ALTER TABLE pages ADD CONSTRAINT pages_slug_key UNIQUE (slug);
+      DROP INDEX IF EXISTS idx_pages_source_id;
+      ALTER TABLE pages DROP COLUMN IF EXISTS source_id CASCADE;
+      DROP TABLE IF EXISTS sources CASCADE;
+    `);
+    await engine.setConfig('version', '20');
+
+    // The path under test: full PostgresEngine.initSchema() including the
+    // bootstrap call, SCHEMA_SQL replay, and runMigrations chain.
+    await engine.initSchema();
+
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+
+    // Verify the forward-referenced column exists after upgrade.
+    const colCheck = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'pages'
+        AND column_name = 'source_id'
+    `;
+    expect(colCheck).toHaveLength(1);
+
+    // Verify the default source row was seeded.
+    const srcCheck = await conn`SELECT id FROM sources WHERE id = 'default'`;
+    expect(srcCheck).toHaveLength(1);
+  });
+
+  test('PostgresEngine.initSchema is idempotent on a brain already at LATEST', async () => {
+    // Fresh-LATEST brain. Calling initSchema again must not error and must
+    // not regress the version.
+    await engine.initSchema();
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+  });
+
+  test('pre-v121 timeline shape converges to full final shape on REAL Postgres (#2626 wedge class)', async () => {
+    // The v121 wedge was Postgres-visible in production (blob CREATE INDEX
+    // on a column migration v121 hadn't added yet); the PGLite twins live in
+    // test/bootstrap.test.ts. Rewind schema AND the version counter to the
+    // wedged cohort's true state, then assert full initSchema convergence:
+    // column + FK + BOTH partial indexes, ledger at LATEST.
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS idx_timeline_event_dedup;
+      DROP INDEX IF EXISTS idx_timeline_event_page;
+      ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+      ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
+    `);
+    await engine.setConfig('version', '120');
+
+    await engine.initSchema();
+
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    const col = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'timeline_entries' AND column_name = 'event_page_id'
+    `;
+    expect(col).toHaveLength(1);
+    const fk = await conn`
+      SELECT conname FROM pg_constraint WHERE conname = 'timeline_entries_event_page_id_fkey'
+    `;
+    expect(fk).toHaveLength(1);
+    const idx = await conn`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename = 'timeline_entries'
+        AND indexname IN ('idx_timeline_event_page', 'idx_timeline_event_dedup')
+    `;
+    expect(idx).toHaveLength(2);
+  }, 60_000);
+
+  test('pre-v143 dream_verdicts shape (#4657 wedge class) converges on REAL Postgres', async () => {
+    // #4657: blob CREATE INDEX dream_verdicts_expires_idx references
+    // expires_at, added only by migration v143 — every Postgres brain at
+    // schema v30-v142 wedged on connect. Rewind schema AND version to the
+    // wedged cohort's state, seed a row so v143's judged_at-derived backfill
+    // is exercised, then assert full initSchema convergence.
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS dream_verdicts_expires_idx;
+      ALTER TABLE dream_verdicts DROP COLUMN IF EXISTS expires_at;
+      DELETE FROM dream_verdicts WHERE file_path = '/tmp/i4657.jsonl';
+      INSERT INTO dream_verdicts (file_path, content_hash, worth_processing, judged_at)
+        VALUES ('/tmp/i4657.jsonl', 'i4657hash', true, now() - interval '10 days');
+    `);
+    await engine.setConfig('version', '142');
+
+    await engine.initSchema();
+
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    // Column converged: NOT NULL with the 30-day default restored by v143.
+    const col = await conn`
+      SELECT is_nullable, column_default FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'dream_verdicts' AND column_name = 'expires_at'
+    `;
+    expect(col).toHaveLength(1);
+    expect(col[0].is_nullable).toBe('NO');
+    expect(String(col[0].column_default)).toContain('30 days');
+    // Pre-TTL row backfilled from judged_at, not stamped with a fresh 30 days.
+    const row = await conn`
+      SELECT (expires_at = judged_at + interval '30 days') AS backfilled
+      FROM dream_verdicts WHERE file_path = '/tmp/i4657.jsonl'
+    `;
+    expect(row).toHaveLength(1);
+    expect(row[0].backfilled).toBe(true);
+    // Index restored.
+    const idx = await conn`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename = 'dream_verdicts' AND indexname = 'dream_verdicts_expires_idx'
+    `;
+    expect(idx).toHaveLength(1);
+    // Clean up the seeded row so it doesn't leak into other suites sharing
+    // the DATABASE_URL database (its expires_at sits ~20 days in the future).
+    await conn.unsafe(`DELETE FROM dream_verdicts WHERE file_path = '/tmp/i4657.jsonl'`);
+  }, 60_000);
+
+  test('pre-v7 minion_jobs shape (scanner-sweep wedge class) converges on REAL Postgres', async () => {
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS idx_minion_jobs_timeout;
+      DROP INDEX IF EXISTS uniq_minion_jobs_idempotency;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS timeout_at;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS idempotency_key;
+    `);
+
+    await engine.initSchema();
+
+    const cols = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'minion_jobs'
+        AND column_name IN ('timeout_at', 'idempotency_key')
+    `;
+    expect(cols).toHaveLength(2);
+    const idx = await conn`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename = 'minion_jobs'
+        AND indexname IN ('idx_minion_jobs_timeout', 'uniq_minion_jobs_idempotency')
+    `;
+    expect(idx).toHaveLength(2);
+  }, 60_000);
+
+  test('pre-v136 minion_jobs private-queue shape (dream-inline lifecycle) converges on REAL Postgres', async () => {
+    // v0.46.25 (#4332): the private-queue owner/lease columns are migration-
+    // added AND referenced by the blob partial indexes — the same wedge class
+    // as v121 and pre-v7 above. Strip all three columns + both indexes, then
+    // assert the bootstrap → SCHEMA_SQL replay re-adds every piece.
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS idx_minion_jobs_private_queue_recovery;
+      DROP INDEX IF EXISTS idx_minion_jobs_private_queue_owner;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_owner_job_id;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_owner_token;
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_lease_until;
+    `);
+
+    await engine.initSchema();
+
+    const cols = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'minion_jobs'
+        AND column_name IN ('private_queue_owner_job_id', 'private_queue_owner_token', 'private_queue_lease_until')
+    `;
+    expect(cols).toHaveLength(3);
+    const idx = await conn`
+      SELECT indexname, indexdef FROM pg_indexes
+      WHERE tablename = 'minion_jobs'
+        AND indexname IN ('idx_minion_jobs_private_queue_recovery', 'idx_minion_jobs_private_queue_owner')
+    `;
+    expect(idx).toHaveLength(2);
+    // The recovery index must come back PARTIAL — the dream-inline predicate
+    // is what keeps the startup recovery scan off the general job table.
+    const recovery = idx.find(
+      (r: { indexname: string; indexdef: string }) => r.indexname === 'idx_minion_jobs_private_queue_recovery',
+    );
+    expect(recovery?.indexdef).toContain('dream-inline-');
+  }, 60_000);
+
+  test('token-only-missing minion_jobs is repaired by the pq_token probe on REAL Postgres (749a7dcb)', async () => {
+    // Partial-upgrade shape: ONLY private_queue_owner_token is missing.
+    // Neither blob index references the token, so SCHEMA_SQL replay cannot
+    // crash on it, and the ledger is already at LATEST so runMigrations won't
+    // re-run v136 — the ONLY repair path is the minion_jobs_pq_token_exists
+    // probe (749a7dcb) triggering the bootstrap's three-column ALTER block.
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      ALTER TABLE minion_jobs DROP COLUMN IF EXISTS private_queue_owner_token;
+    `);
+
+    await engine.initSchema();
+
+    const cols = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'minion_jobs'
+        AND column_name = 'private_queue_owner_token'
+    `;
+    expect(cols).toHaveLength(1);
+  }, 60_000);
+
+  test('standalone db.initSchema straddles an old-shaped brain via the shared bootstrap (#4477)', async () => {
+    // src/core/db.ts's module-level initSchema (used by test/e2e/helpers.ts
+    // and legacy callers) replays SCHEMA_SQL directly. Pre-fix it ran NO
+    // forward-reference bootstrap, so a brain whose pages table predates a
+    // blob-indexed column (here: deleted_at ← pages_deleted_at_purge_idx)
+    // wedged on the blob's CREATE INDEX. It now shares
+    // applyPostgresForwardReferenceBootstrap with PostgresEngine.initSchema.
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS pages_deleted_at_purge_idx;
+      ALTER TABLE pages DROP COLUMN IF EXISTS deleted_at CASCADE;
+    `);
+
+    // The engine connected in module-singleton style (PostgresEngine.connect
+    // delegates to db.connect), so db.initSchema() runs on the SAME pool —
+    // exactly how test/e2e/helpers.ts drives it. Do NOT db.disconnect()
+    // here: that would tear down the shared singleton under the engine.
+    const db = await import('../../src/core/db.ts');
+    // The path under test: bootstrap → SCHEMA_SQL, no engine.initSchema.
+    await db.initSchema();
+
+    const col = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema()
+        AND table_name = 'pages' AND column_name = 'deleted_at'
+    `;
+    expect(col).toHaveLength(1);
+    const idx = await conn`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename = 'pages' AND indexname = 'pages_deleted_at_purge_idx'
+    `;
+    expect(idx).toHaveLength(1);
+    // The CASCADE dropped the derivation-purge scope trigger with the column;
+    // the replay must recreate it once deleted_at exists again.
+    const trg = await conn`
+      SELECT tgname FROM pg_trigger
+      WHERE tgrelid = 'pages'::regclass AND tgname = 'pages_derivation_scope_delete'
+    `;
+    expect(trg).toHaveLength(1);
+  }, 60_000);
+
+  // Migration v120 — schema-lint hardening (#1647 / #171). Postgres-only
+  // assertions (security_invoker has no surface on embedded PGLite).
+  test('v120: page_links view runs with security_invoker=on (#1647b)', async () => {
+    await engine.initSchema();
+    const rows = await engine.executeRaw<{ reloptions: string[] | null }>(
+      `SELECT c.reloptions FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = 'page_links' AND c.relkind = 'v'`,
+    );
+    expect(rows.length).toBe(1);
+    expect(JSON.stringify(rows[0].reloptions ?? [])).toContain('security_invoker=on');
+  });
+
+  test('v120: trigger + event-trigger functions pin search_path, incl auto_enable_rls (#1647a/#171)', async () => {
+    await engine.initSchema();
+    const rows = await engine.executeRaw<{ proname: string; proconfig: unknown }>(
+      `SELECT p.proname, p.proconfig FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND p.proname IN ('bump_page_generation_fn','bump_page_generation_clock_fn',
+                            'update_chunk_search_vector','update_page_search_vector',
+                            'notify_minion_job_change','auto_enable_rls')`,
+    );
+    expect(rows.length).toBeGreaterThanOrEqual(5);
+    for (const r of rows) {
+      expect(JSON.stringify(r.proconfig ?? [])).toContain('search_path=');
+    }
+  });
+});

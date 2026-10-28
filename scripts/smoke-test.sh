@@ -1,0 +1,280 @@
+#!/bin/bash
+# smoke-test.sh — GBrain post-restart smoke tests + auto-fix
+#
+# Ships with gbrain. Tests gbrain core services + OpenClaw plugin health.
+# Users extend via ~/.gbrain/smoke-tests.d/*.sh (user-defined tests).
+#
+# Usage:
+#   gbrain smoke-test          # run all tests
+#   bash scripts/smoke-test.sh # direct invocation
+#
+# Each test: check → if broken, attempt fix → re-check → report.
+# Exit code = number of remaining failures (0 = all pass).
+
+set -a
+[ -f /data/.env ] && . /data/.env 2>/dev/null || true
+set +a
+
+LOG="${GBRAIN_SMOKE_LOG:-/tmp/gbrain-smoke-test.log}"
+WORKER_PID_FILE="${GBRAIN_SMOKE_WORKER_PID_FILE:-/tmp/gbrain-worker.pid}"
+FAILURES=0
+FIXES=0
+TOTAL=0
+SKIPPED=0
+
+# with_deadline SECONDS CMD [ARG...]: run CMD, stopping it once SECONDS pass.
+# Linux has coreutils `timeout` and Homebrew installs it as `gtimeout`, but
+# stock macOS ships neither (#5248). Without either, CMD runs as a background
+# child that this shell polls; at the deadline it gets TERM and, if still
+# alive a second later, KILL. Only that child pid is ever signalled, and CMD
+# is run from "$@" as given, never re-parsed. The return value is CMD's own
+# status, or 124 when the deadline stopped it, as `timeout` reports.
+with_deadline() {
+  local limit="$1" tool
+  shift
+  for tool in timeout gtimeout; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      "$tool" "$limit" "$@"
+      return
+    fi
+  done
+  "$@" &
+  local child=$! give_up=$((SECONDS + limit + 1)) expired=0 status
+  while kill -0 "$child" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$give_up" ]; then
+      expired=1
+      kill -TERM "$child" 2>/dev/null
+      sleep 1
+      kill -0 "$child" 2>/dev/null && kill -KILL "$child" 2>/dev/null
+      break
+    fi
+    sleep 0.2 2>/dev/null || sleep 1
+  done
+  wait "$child"
+  status=$?
+  if [ "$expired" = 1 ]; then return 124; fi
+  return "$status"
+}
+
+timestamp() { date -u '+%Y-%m-%d %H:%M:%S'; }
+pass()    { TOTAL=$((TOTAL + 1)); echo "✅ $1"; echo "$(timestamp) PASS: $1" >> "$LOG"; }
+fail()    { TOTAL=$((TOTAL + 1)); FAILURES=$((FAILURES + 1)); echo "❌ $1"; echo "$(timestamp) FAIL: $1" >> "$LOG"; }
+fixed()   { FIXES=$((FIXES + 1)); echo "🔧 Fixed: $1"; echo "$(timestamp) FIXED: $1" >> "$LOG"; }
+skip()    { SKIPPED=$((SKIPPED + 1)); echo "⏭️  $1"; echo "$(timestamp) SKIP: $1" >> "$LOG"; }
+
+echo "$(timestamp) === GBrain Smoke Tests ===" >> "$LOG"
+echo "🧪 Running gbrain smoke tests..."
+echo ""
+
+# ── Resolve paths ───────────────────────────────────────────
+# Find gbrain — could be global install, workspace dep, or /data/gbrain
+GBRAIN_DIR=""
+for candidate in \
+  "${GBRAIN_DIR_OVERRIDE:-}" \
+  "/data/gbrain" \
+  "$(dirname "$0")/.." \
+  "${OPENCLAW_WORKSPACE:-/data/.openclaw/workspace}/node_modules/gbrain" \
+  "./node_modules/gbrain"; do
+  [ -n "$candidate" ] && [ -f "$candidate/src/cli.ts" ] && GBRAIN_DIR="$candidate" && break
+done
+
+# Find bun
+BUN_PATH=""
+for bp in "${GBRAIN_BUN_PATH:-}" "/root/.bun/bin/bun" "/data/.bun/bin/bun" "$(which bun 2>/dev/null)"; do
+  [ -n "$bp" ] && [ -x "$bp" ] && BUN_PATH="$bp" && break
+done
+
+# Resolve database URL
+DB_URL="${GBRAIN_DATABASE_URL:-${DATABASE_URL:-}}"
+# Fallback: grep from .env (handles files with parse-breaking lines)
+[ -z "$DB_URL" ] && DB_URL=$(grep '^GBRAIN_DATABASE_URL=' /data/.env 2>/dev/null | head -1 | cut -d= -f2-)
+[ -z "$DB_URL" ] && DB_URL=$(grep '^DATABASE_URL=' /data/.env 2>/dev/null | head -1 | cut -d= -f2-)
+
+# ── 1. Bun runtime ─────────────────────────────────────────
+if [ -n "$BUN_PATH" ]; then
+  export PATH="$(dirname "$BUN_PATH"):$PATH"
+  pass "Bun runtime ($BUN_PATH)"
+else
+  # Auto-fix: install bun
+  curl -fsSL https://bun.sh/install | bash 2>/dev/null
+  if [ -x "/root/.bun/bin/bun" ]; then
+    BUN_PATH="/root/.bun/bin/bun"
+    export PATH="/root/.bun/bin:$PATH"
+    fixed "Bun runtime installed"
+    pass "Bun runtime"
+  else
+    fail "Bun runtime — install failed"
+  fi
+fi
+
+# ── 2. GBrain CLI loads ────────────────────────────────────
+if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
+  if with_deadline 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
+    pass "GBrain CLI ($GBRAIN_DIR)"
+  else
+    # Auto-fix: reinstall deps
+    cd "$GBRAIN_DIR" && "$BUN_PATH" install --frozen-lockfile 2>/dev/null
+    if with_deadline 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
+      fixed "GBrain deps reinstalled"
+      pass "GBrain CLI (after dep fix)"
+    else
+      fail "GBrain CLI — won't start"
+    fi
+  fi
+else
+  [ -z "$GBRAIN_DIR" ] && fail "GBrain CLI — not found"
+  [ -z "$BUN_PATH" ] && skip "GBrain CLI — bun not available"
+fi
+
+# ── 3. GBrain database ────────────────────────────────────
+# db-availability loop: the old check grepped human doctor output for
+# "Health Check", which a FAILED connection also prints — it could not fail
+# on a broken DB and had no fix arm. Now: engine identity first (engine-free,
+# works with the DB down), then branch on doctor --json's connection check,
+# with `gbrain db-repair --yes` as the auto-fix arm.
+if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
+  ENGINE_JSON=$(DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" with_deadline 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" engine status --json 2>/dev/null)
+  # #4182: BSD grep (macOS) has no -P; keep this shipped smoke test POSIX-portable.
+  ENGINE_KIND=$(printf '%s\n' "$ENGINE_JSON" | sed -n 's/.*"effective_engine": *"\([a-z]*\)".*/\1/p' | head -1)
+  ENGINE_SRC=$(printf '%s\n' "$ENGINE_JSON" | sed -n 's/.*"db_url_source": *"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$ENGINE_KIND" ] && echo "  engine: $ENGINE_KIND (${ENGINE_SRC:-no url})"
+  # #5063: a URL from the config file (engine status db_url_source) is as valid as one from the environment.
+  if [ -z "$DB_URL" ] && [ "$ENGINE_KIND" != "pglite" ] && [ -z "$ENGINE_SRC" ]; then
+    fail "GBrain database — no DATABASE_URL, GBRAIN_DATABASE_URL or configured database URL (and the engine is not pglite)"
+  else
+    run_doctor_json() { DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" with_deadline 30 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" doctor --json 2>/dev/null; }
+    DOCTOR_JSON=$(run_doctor_json)
+    CONN_STATUS=$(printf '%s\n' "$DOCTOR_JSON" | sed -n 's/.*"name": *"connection", *"status": *"\([a-z]*\)".*/\1/p' | head -1)
+    if [ "$CONN_STATUS" = "ok" ]; then
+      SCORE=$(printf '%s\n' "$DOCTOR_JSON" | sed -n 's/.*"health_score": *\([0-9]*\).*/\1/p' | head -1)
+      pass "GBrain database (connection ok, health score: ${SCORE:-?}/100)"
+    else
+      # Auto-fix: engine-free access repair, then re-test (never fix without
+      # confirming broken — the doctor run above IS the confirmation).
+      # 240s: the docker conn_refused arm's readiness poll alone can run
+      # ~165s worst-case; a 60s cap would SIGTERM the repair mid-poll and
+      # report failure while the container it just started is still warming.
+      DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" with_deadline 240 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" db-repair --yes >> "$LOG" 2>&1
+      DOCTOR_JSON=$(run_doctor_json)
+      CONN_STATUS=$(printf '%s\n' "$DOCTOR_JSON" | sed -n 's/.*"name": *"connection", *"status": *"\([a-z]*\)".*/\1/p' | head -1)
+      if [ "$CONN_STATUS" = "ok" ]; then
+        fixed "GBrain database access repaired (gbrain db-repair --yes)"
+        pass "GBrain database (connection ok after repair)"
+      else
+        fail "GBrain database — connection ${CONN_STATUS:-unknown} (run: gbrain db-repair for the recipe)"
+      fi
+    fi
+  fi
+else
+  skip "GBrain database — gbrain not found"
+fi
+
+# ── 4. GBrain worker process ──────────────────────────────
+if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ] && [ -n "$DB_URL" ]; then
+  SUPERVISOR_RUNNING=0
+  LEGACY_WORKER_RUNNING=0
+  if DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" \
+      with_deadline 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" jobs supervisor status --json >/dev/null 2>&1; then
+    SUPERVISOR_RUNNING=1
+  fi
+  if [ -f "$WORKER_PID_FILE" ] && kill -0 "$(cat "$WORKER_PID_FILE")" 2>/dev/null; then
+    LEGACY_WORKER_RUNNING=1
+  fi
+
+  if [ "$SUPERVISOR_RUNNING" -eq 1 ] && [ "$LEGACY_WORKER_RUNNING" -eq 1 ]; then
+    fail "GBrain worker — duplicate supervisor + legacy worker PID $(cat "$WORKER_PID_FILE"); stop the legacy worker after verifying ownership"
+  elif [ "$SUPERVISOR_RUNNING" -eq 1 ]; then
+    pass "GBrain worker (supervisor-managed)"
+  elif [ "$LEGACY_WORKER_RUNNING" -eq 1 ]; then
+    pass "GBrain worker (PID: $(cat "$WORKER_PID_FILE"))"
+  else
+    fail "GBrain worker — no live supervisor or legacy worker; start explicitly with: gbrain jobs supervisor start --detach"
+  fi
+else
+  skip "GBrain worker — prerequisites missing"
+fi
+
+# ── 5. OpenClaw plugin health (if OpenClaw is installed) ──
+OPENCLAW_CODEX_ZOD="/app/node_modules/openclaw/dist/extensions/codex/node_modules/zod"
+if [ -d "$OPENCLAW_CODEX_ZOD" ]; then
+  CORE_CJS="$OPENCLAW_CODEX_ZOD/v4/core/core.cjs"
+  if [ -f "$CORE_CJS" ] && node -e "require('$OPENCLAW_CODEX_ZOD/v4/core/index.cjs')" 2>/dev/null; then
+    pass "OpenClaw Codex plugin (Zod CJS)"
+  else
+    # Auto-fix: reinstall zod
+    cd "$OPENCLAW_CODEX_ZOD" && npm install zod@4 --force --silent 2>/dev/null
+    if [ -f "$CORE_CJS" ] && node -e "require('$OPENCLAW_CODEX_ZOD/v4/core/index.cjs')" 2>/dev/null; then
+      fixed "Codex Zod core.cjs reinstalled"
+      pass "OpenClaw Codex plugin (Zod CJS after fix)"
+    else
+      fail "OpenClaw Codex plugin — Zod fix failed"
+    fi
+  fi
+else
+  skip "OpenClaw Codex plugin — not installed"
+fi
+
+# ── 6. OpenClaw gateway (if running) ─────────────────────
+OPENCLAW_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
+if curl -sf "http://127.0.0.1:$OPENCLAW_PORT/" >/dev/null 2>&1; then
+  pass "OpenClaw gateway (port $OPENCLAW_PORT)"
+else
+  skip "OpenClaw gateway — not responding (may not be running yet)"
+fi
+
+# ── 7. Embedding provider ────────────────────────────────
+# #5063: the configured provider decides (ollama and other keyless providers
+# need no OPENAI/VOYAGE key), so trust doctor's embedding_provider verdict when
+# section 3 read it; fall back to the raw keys only without a doctor report.
+EMBED_STATUS=$(printf '%s\n' "${DOCTOR_JSON:-}" | sed -n 's/.*"name": *"embedding_provider", *"status": *"\([a-z]*\)".*/\1/p' | head -1)
+EMBED_KEY="${OPENAI_API_KEY:-${VOYAGE_API_KEY:-}}"
+if [ "$EMBED_STATUS" = "fail" ]; then
+  fail "Embedding provider — doctor embedding_provider failed (run: gbrain doctor --only embedding_provider)"
+elif [ -n "$EMBED_STATUS" ]; then
+  pass "Embedding provider (doctor embedding_provider: $EMBED_STATUS)"
+elif [ -n "$EMBED_KEY" ]; then
+  pass "Embedding API key set"
+else
+  fail "Embedding provider — no doctor report and neither OPENAI_API_KEY nor VOYAGE_API_KEY is set"
+fi
+
+# ── 8. Brain repo (if configured) ────────────────────────
+BRAIN_PATH="${GBRAIN_BRAIN_PATH:-/data/brain}"
+if [ -d "$BRAIN_PATH/.git" ]; then
+  PAGE_COUNT=$(find "$BRAIN_PATH" -name "*.md" -not -path "*/.git/*" 2>/dev/null | wc -l)
+  pass "Brain repo ($PAGE_COUNT pages at $BRAIN_PATH)"
+elif [ -d "$BRAIN_PATH" ]; then
+  pass "Brain directory exists ($BRAIN_PATH, not a git repo)"
+else
+  skip "Brain repo — $BRAIN_PATH not found"
+fi
+
+# ── User-defined tests (~/.gbrain/smoke-tests.d/*.sh) ────
+USER_TESTS_DIR="${HOME}/.gbrain/smoke-tests.d"
+if [ -d "$USER_TESTS_DIR" ]; then
+  for test_script in "$USER_TESTS_DIR"/*.sh; do
+    [ -f "$test_script" ] || continue
+    TEST_NAME=$(basename "$test_script" .sh)
+    echo "  Running user test: $TEST_NAME"
+    if bash "$test_script" 2>/dev/null; then
+      pass "User: $TEST_NAME"
+    else
+      fail "User: $TEST_NAME"
+    fi
+  done
+fi
+
+# ── Summary ─────────────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+PASSED=$((TOTAL - FAILURES))
+echo "Results: $PASSED/$TOTAL passed, $FIXES auto-fixed, $SKIPPED skipped"
+if [ $FAILURES -gt 0 ]; then
+  echo "⚠️  $FAILURES failure(s) remain — manual intervention needed"
+else
+  echo "✅ All smoke tests passed"
+fi
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "$(timestamp) Summary: $PASSED/$TOTAL passed, $FIXES fixed, $FAILURES failed, $SKIPPED skipped" >> "$LOG"
+
+exit $FAILURES

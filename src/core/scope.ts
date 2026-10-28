@@ -1,0 +1,339 @@
+/**
+ * gbrain OAuth scope hierarchy + allowlist (v0.28).
+ *
+ * Single source of truth for the 5 scope strings. Used by:
+ *  - src/commands/serve-http.ts (scopesSupported, request-time hasScope)
+ *  - src/core/oauth-provider.ts (F3 refresh, token issuance, registration)
+ *  - src/commands/auth.ts (CLI register-client validation)
+ *  - admin/src/lib/scope-constants.ts (HAND-MAINTAINED MIRROR; CI drift check
+ *    in scripts/check-admin-scope-drift.sh keeps them aligned)
+ *
+ * Hierarchy (see plan ASCII diagram):
+ *
+ *                    admin
+ *                      │
+ *      ┌──────────┬────┴────┬──────────┐
+ *      ▼          ▼         ▼          ▼
+ *   sources_admin  users_admin  write  read
+ *                                │      ▲
+ *                                └──────┘
+ *
+ * sources_admin and users_admin are siblings (different axes — sources-mgmt
+ * vs user-account-mgmt — neither implies the other).
+ */
+
+export type Scope = 'read' | 'write' | 'admin' | 'sources_admin' | 'users_admin' | 'agent' | 'skill_editor' | 'skill_publisher' | 'skills_member_self' | 'memory_confirm';
+
+export const ALLOWED_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
+  'read',
+  'write',
+  'admin',
+  'sources_admin',
+  'users_admin',
+  'agent',
+  'skill_editor',
+  'skill_publisher',
+  'skills_member_self',
+  'memory_confirm',
+]);
+
+/**
+ * Sorted list (deterministic for OAuth metadata + drift-check output).
+ * Use this when emitting `scopes_supported` over the wire.
+ */
+export const ALLOWED_SCOPES_LIST: ReadonlyArray<Scope> = Object.freeze([
+  'admin',
+  'agent',
+  'memory_confirm',
+  'read',
+  'skill_editor',
+  'skill_publisher',
+  'skills_member_self',
+  'sources_admin',
+  'users_admin',
+  'write',
+]);
+
+/**
+ * Ceiling for anonymous Dynamic Client Registration (RFC 7591). A network
+ * caller that self-registers may hold at most `read write`; every privileged
+ * scope needs an operator-created grant (`gbrain auth register-client`, the
+ * admin API) or a later `gbrain auth rescope-client`. The owner-approval
+ * step on /authorize shows the requested scopes but never narrows them, so
+ * the ceiling is what keeps "approve" from meaning "grant admin".
+ */
+export const DCR_REGISTRABLE_SCOPES: ReadonlySet<Scope> = new Set<Scope>(['read', 'write']);
+
+/**
+ * A `client_credentials` DCR client (only reachable under
+ * `--enable-dcr-insecure`) mints tokens with NO owner approval at all, so its
+ * ceiling is tighter still: read-only.
+ */
+const DCR_MACHINE_SCOPES: ReadonlySet<Scope> = new Set<Scope>(['read']);
+
+/**
+ * #5575 (CEO-6): scopes only the trusted local CLI may grant
+ * (`gbrain auth create --scopes ...,memory_confirm`, `auth register-client`,
+ * `auth rescope`). `memory_confirm` lets a connection confirm memory as the
+ * owner (raise a trust tier), so the admin HTTP API, the admin SPA, `gbrain mcp
+ * admin`, API-key minting and dynamic registration all refuse it, and no
+ * grant profile or grandfathered token carries it.
+ */
+export const LOCAL_CLI_ONLY_SCOPES: ReadonlySet<Scope> = new Set<Scope>(['memory_confirm']);
+
+/** null when no local-CLI-only scope is requested; otherwise the refusal message naming the local command. */
+export function localCliOnlyScopeViolation(requested: readonly string[]): string | null {
+  const over = [...new Set(requested.filter(s => LOCAL_CLI_ONLY_SCOPES.has(s as Scope)))];
+  if (over.length === 0) return null;
+  return `Scope "${over.join(' ')}" lets a connection confirm memory as the owner, so only the local CLI on the brain host can grant it: `
+    + '`gbrain auth create <name> --scopes read,write,memory_confirm` or `gbrain auth rescope --client <client_id> --scopes ...`.';
+}
+
+/**
+ * null when the requested DCR scopes fit under the ceiling; otherwise the
+ * `invalid_client_metadata` message naming the offending scopes + remedy.
+ * Unknown scope strings are ignored here (filterAllowedScopes drops them);
+ * `agent` keeps its own wording because it also needs delegation bindings.
+ */
+export function dcrScopeViolation(requested: readonly string[], grantTypes: readonly string[]): string | null {
+  if (requested.includes('agent')) {
+    return 'agent scope requires an operator-approved grant with explicit delegation bindings; dynamic registration cannot grant it';
+  }
+  const localOnly = localCliOnlyScopeViolation(requested);
+  if (localOnly) return localOnly;
+  const machine = grantTypes.includes('client_credentials');
+  const ceiling = machine ? DCR_MACHINE_SCOPES : DCR_REGISTRABLE_SCOPES;
+  const over = [...new Set(requested.filter((s) => isScope(s) && !ceiling.has(s)))];
+  if (over.length === 0) return null;
+  const limit = [...ceiling].join(' ');
+  return (
+    `Scope "${over.join(' ')}" cannot be granted through dynamic client registration; ` +
+    (machine
+      ? `a client_credentials registration is limited to \`${limit}\` because it is issued without owner approval. `
+      : `self-registered clients are limited to \`${limit}\`. `) +
+    'Register the client with `gbrain auth register-client` / the admin API instead, ' +
+    'or register with a narrower scope and widen it later with `gbrain auth rescope-client <client_id> --scopes ...`.'
+  );
+}
+
+/**
+ * `scopes_supported` for OAuth discovery. The MCP SDK router emits ONE value
+ * into the RFC 8414 authorization-server document and the RFC 9728
+ * protected-resource document(s), so this is the single place that decides
+ * what a client reading discovery is told it may ask for:
+ *
+ *  - DCR enabled (either mode): exactly the anonymous-registration ceiling,
+ *    `read write`, in canonical order. Clients commonly copy `scopes_supported`
+ *    verbatim into their /register request; advertising a privileged scope
+ *    would steer every such client straight into `dcrScopeViolation` (HTTP 400)
+ *    even though the server is willing to register it at `read write`. The
+ *    tighter read-only ceiling for `client_credentials` registrations stays in
+ *    `dcrScopeViolation` — authorization_code is the DCR default and may hold
+ *    both, so advertising `read` alone would under-describe it.
+ *  - DCR disabled: every scope except operator-only `agent`, which also needs
+ *    delegation bindings no OAuth request can carry, and the local-CLI-only
+ *    `memory_confirm`. Operator-registered clients see the full set they may hold.
+ *
+ * Narrowed discovery never narrows an operator-registered client: one that
+ * omits `scope` at /authorize or /token receives its full registered set
+ * (`grantScopes` in oauth-grants.ts falls back to the row's scope), and an
+ * explicit request is intersected with its registration, not with this list.
+ */
+export function scopesSupportedForDiscovery(opts: { enableDcr: boolean }): Scope[] {
+  return opts.enableDcr
+    ? ALLOWED_SCOPES_LIST.filter((s) => DCR_REGISTRABLE_SCOPES.has(s))
+    : ALLOWED_SCOPES_LIST.filter((s) => s !== 'agent' && !LOCAL_CLI_ONLY_SCOPES.has(s));
+}
+
+/**
+ * Hierarchy table: which required scopes are implied by which granted scope.
+ * `admin` implies all (escape hatch for legacy + super-admin tokens).
+ * `write` implies `read`. The two `*_admin` siblings only imply themselves.
+ *
+ * v0.38 (D13): `agent` is a SIBLING, not implied by admin. A super-admin
+ * token still needs to be re-registered with explicit bindings to submit
+ * subagent jobs. This prevents existing admin clients from silently gaining
+ * agent-dispatch capability on upgrade.
+ *
+ * #5575: `memory_confirm` (confirm memory as the owner) is a sibling too:
+ * admin never implies it, so grandfathered full-access tokens and admin
+ * clients cannot raise a trust tier.
+ */
+const IMPLIES: Record<Scope, ReadonlySet<Scope>> = {
+  admin: new Set(['admin', 'sources_admin', 'users_admin', 'write', 'read']),
+  write: new Set(['write', 'read']),
+  sources_admin: new Set(['sources_admin']),
+  users_admin: new Set(['users_admin']),
+  read: new Set(['read']),
+  agent: new Set(['agent']),
+  skill_editor: new Set(['skill_editor']),
+  skill_publisher: new Set(['skill_publisher']),
+  skills_member_self: new Set(['skills_member_self']),
+  memory_confirm: new Set(['memory_confirm']),
+};
+
+/**
+ * Does the granted scope set include something that satisfies `required`?
+ * - admin in granted → true for any required
+ * - write in granted → true for {write, read}
+ * - sources_admin in granted → true for {sources_admin}
+ * - users_admin in granted → true for {users_admin}
+ * - read in granted → true for {read}
+ *
+ * Unknown scopes in `granted` are ignored (forward-compat — pre-allowlist
+ * tokens with bogus scopes don't crash hasScope; they just don't satisfy).
+ */
+export function hasScope(grantedScopes: readonly string[], requiredScope: string): boolean {
+  for (const granted of grantedScopes) {
+    if (!isScope(granted)) continue;
+    const implied = IMPLIES[granted];
+    if (implied.has(requiredScope as Scope)) return true;
+  }
+  return false;
+}
+
+export function operationScopesAllowed(
+  grantedScopes: readonly string[],
+  operation: { scope?: string; requiredScopes?: readonly string[]; agentCallable?: boolean },
+): boolean {
+  return (hasScope(grantedScopes, operation.scope ?? 'read')
+    || (operation.agentCallable === true && hasScope(grantedScopes, 'agent')))
+    && (operation.requiredScopes ?? []).every(scope => hasScope(grantedScopes, scope));
+}
+
+export function isScope(s: string): s is Scope {
+  return ALLOWED_SCOPES.has(s as Scope);
+}
+
+/**
+ * Validate that every scope in the input is allowed. Throws on the first
+ * unknown scope. Used at OAuth client registration time (CLI, DCR, manual).
+ */
+export class InvalidScopeError extends Error {
+  constructor(public readonly invalidScope: string, public readonly allScopes: readonly string[]) {
+    super(
+      `Unknown scope "${invalidScope}". Allowed: ${ALLOWED_SCOPES_LIST.join(', ')}.`,
+    );
+    this.name = 'InvalidScopeError';
+  }
+}
+
+export function assertAllowedScopes(scopes: readonly string[]): void {
+  for (const s of scopes) {
+    if (!isScope(s)) throw new InvalidScopeError(s, scopes);
+  }
+}
+
+/**
+ * Split a requested scope list into allowed vs unknown entries.
+ *
+ * Used by the unauthenticated DCR path so clients that send OIDC-style
+ * extras (e.g. `offline_access`, `openid`) still register successfully
+ * with the intersection of known scopes. RFC 7591 §2 lets the AS replace
+ * client metadata values; dropping unknowns is that replacement.
+ *
+ * Operator-trusted paths (CLI / admin) keep using `assertAllowedScopes`
+ * so typos surface loudly instead of silently shrinking the grant.
+ */
+export function filterAllowedScopes(scopes: readonly string[]): {
+  allowed: Scope[];
+  dropped: string[];
+} {
+  const allowed: Scope[] = [];
+  const dropped: string[] = [];
+  const seen = new Set<string>();
+  for (const s of scopes) {
+    if (seen.has(s)) continue;
+    seen.add(s);
+    if (isScope(s)) allowed.push(s);
+    else dropped.push(s);
+  }
+  return { allowed, dropped };
+}
+
+/**
+ * Parse a space-separated scope string (OAuth wire format) into an array,
+ * dropping empty fragments. Does NOT validate against ALLOWED_SCOPES — call
+ * assertAllowedScopes afterward at registration time.
+ */
+export function parseScopeString(s: string | undefined | null): string[] {
+  if (!s) return [];
+  return s.split(' ').filter(Boolean);
+}
+
+/**
+ * v0.39.3.0 WARN-9 + CV12 — normalize the `scopes` (or `scope`) field that
+ * arrives from the admin SPA's register-client request body to the
+ * space-separated wire format `registerClientManual` expects. Three valid
+ * input shapes; everything else throws Error to be caught and surfaced
+ * as 400 invalid_scopes.
+ *
+ * Valid shapes:
+ *   - `undefined` / `null` / missing  →  defaults to 'read'
+ *   - `string`                         →  split on /\s+/, filter empty,
+ *                                         dedupe, validate each, re-join
+ *   - `string[]`                       →  validate each element is a non-
+ *                                         empty single scope (no internal
+ *                                         whitespace — that's the bug
+ *                                         shape codex flagged where
+ *                                         ['read write'] silently lets
+ *                                         `read write` through as a single
+ *                                         unknown scope), dedupe, validate
+ *                                         each against ALLOWED_SCOPES
+ *
+ * Rejection cases:
+ *   - non-string non-array (number, object, boolean) → Error
+ *   - empty array after normalization → Error
+ *   - array element with internal whitespace → Error (the ['read write'] bug)
+ *   - array element that's not a string (null, number, ...) → Error
+ *   - any element not in ALLOWED_SCOPES → InvalidScopeError
+ *
+ * Returns the space-separated string (e.g. 'read write') in sorted order
+ * for determinism so two registrations with the same scope set produce
+ * identical DB rows.
+ */
+export function normalizeScopesInput(raw: unknown): string {
+  if (raw == null) return 'read';
+
+  let candidates: string[];
+
+  if (typeof raw === 'string') {
+    candidates = raw.split(/\s+/).filter(Boolean);
+  } else if (Array.isArray(raw)) {
+    for (const el of raw) {
+      if (typeof el !== 'string') {
+        throw new Error(
+          `scopes array must contain only strings, got ${el === null ? 'null' : typeof el}`,
+        );
+      }
+      if (el.length === 0) {
+        throw new Error('scopes array must not contain empty strings');
+      }
+      if (/\s/.test(el)) {
+        throw new Error(
+          `scopes array element "${el}" contains whitespace. Each element must be a single scope name; use ['read', 'write'] not ['read write'].`,
+        );
+      }
+    }
+    candidates = raw as string[];
+  } else {
+    throw new Error(
+      `scopes must be a string or array of strings, got ${typeof raw}`,
+    );
+  }
+
+  // Dedupe via Set + sort for stable output.
+  const deduped = Array.from(new Set(candidates)).sort();
+
+  if (deduped.length === 0) {
+    throw new Error('scopes is empty after normalization');
+  }
+
+  // Validate against ALLOWED_SCOPES (throws InvalidScopeError on miss).
+  assertAllowedScopes(deduped);
+  // Every caller of this normalizer is an admin HTTP surface (or its remote CLI), never the local CLI.
+  const localOnly = localCliOnlyScopeViolation(deduped);
+  if (localOnly) throw new Error(localOnly);
+
+  return deduped.join(' ');
+}

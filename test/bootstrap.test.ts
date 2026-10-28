@@ -1,0 +1,464 @@
+/**
+ * PGLite forward-reference bootstrap tests.
+ *
+ * Validates the contract of `PGLiteEngine#applyForwardReferenceBootstrap`:
+ * given a brain that lacks the schema-blob's forward-referenced state, the
+ * bootstrap adds enough state for PGLITE_SCHEMA_SQL to replay safely.
+ *
+ * The bootstrap covers the wedge incidents from issues
+ * #239/#266/#357/#366/#374/#375/#378/#396 — every gbrain release that added
+ * a column-with-index in the schema blob without a corresponding bootstrap
+ * triggered the same wedge family.
+ *
+ * Honest limitation: test 4 simulates a v20 brain by dropping known forward
+ * state from a fresh-LATEST instance. This is the same down-mutation pattern
+ * codex flagged as "weak simulation" — it can't simulate every possible
+ * historical state. Acceptable here because the bootstrap's contract is
+ * narrow ("given a brain that lacks the specific forward-references,
+ * initSchema produces a brain at LATEST"), and that contract is exactly
+ * what this test exercises.
+ */
+
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { LATEST_VERSION } from '../src/core/migrate.ts';
+import { readFactsEmbeddingDim } from '../src/core/embedding-dim-check.ts';
+
+// Tier 3 opt-out: this file tests the cold init / bootstrap path explicitly.
+// If GBRAIN_PGLITE_SNAPSHOT is set (ci:local sets it for unit shards), every
+// PGlite would boot post-initSchema and these assertions ("0 tables on fresh
+// install", "bootstrap converts pre-v0.18 brain to LATEST") would fail
+// trivially. Unset for this file's tests and restore it afterwards: a CI
+// shard runs hundreds of files in ONE bun process (scripts/test-shard.sh),
+// so a module-scope delete would cold-boot every later engine in the shard
+// (~3 s each, +350 s per shard; check:test-env-opt-ins pins this shape).
+let savedSnapshot: string | undefined;
+beforeAll(() => {
+  savedSnapshot = process.env.GBRAIN_PGLITE_SNAPSHOT;
+  delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+});
+afterAll(() => {
+  if (savedSnapshot === undefined) delete process.env.GBRAIN_PGLITE_SNAPSHOT;
+  else process.env.GBRAIN_PGLITE_SNAPSHOT = savedSnapshot;
+});
+
+describe('PGLiteEngine#applyForwardReferenceBootstrap', () => {
+  test('fact embedding identity bootstrap repairs old and partial schemas without inventing provenance', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const { dims } = await readFactsEmbeddingDim(engine);
+      const fact = await engine.insertFact({ fact: 'Synthetic bootstrap claim', source: 'synthetic', embedding: new Float32Array(dims!).fill(0.1) }, { source_id: 'default' });
+      const original = await engine.executeRaw('SELECT id,fact,embedding::text,embedded_at FROM facts WHERE id=$1', [fact.id]);
+      expect(original[0].embedding).not.toBeNull();
+      for (const missing of [['embedding_model', 'embedded_text_hash'], ['embedding_model'], ['embedded_text_hash']]) {
+        await engine.executeRaw("UPDATE facts SET embedding_model='synthetic:original',embedded_text_hash='synthetic-preserved-hash' WHERE id=$1", [fact.id]);
+        for (const column of missing) await engine.executeRaw(`ALTER TABLE facts DROP COLUMN ${column}`);
+        await engine.setConfig('version', '165');
+        await (engine as any).applyForwardReferenceBootstrap();
+        await (engine as any).applyForwardReferenceBootstrap();
+        expect(await engine.getConfig('version')).toBe('165');
+        expect(await engine.executeRaw(`SELECT column_name,data_type,is_nullable,column_default FROM information_schema.columns
+          WHERE table_schema='public' AND table_name='facts' AND column_name IN ('embedding_model','embedded_text_hash') ORDER BY column_name`)).toEqual([
+          { column_name: 'embedded_text_hash', data_type: 'text', is_nullable: 'YES', column_default: null },
+          { column_name: 'embedding_model', data_type: 'text', is_nullable: 'YES', column_default: null },
+        ]);
+        const identity = [{
+          embedding_model: missing.includes('embedding_model') ? null : 'synthetic:original',
+          embedded_text_hash: missing.includes('embedded_text_hash') ? null : 'synthetic-preserved-hash',
+        }];
+        expect(await engine.executeRaw('SELECT embedding_model,embedded_text_hash FROM facts WHERE id=$1', [fact.id])).toEqual(identity);
+        for (const column of missing) await engine.executeRaw(`ALTER TABLE facts DROP COLUMN ${column}`);
+        await engine.initSchema();
+        await engine.initSchema();
+        expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+        expect(await engine.executeRaw('SELECT embedding_model,embedded_text_hash FROM facts WHERE id=$1', [fact.id])).toEqual(identity);
+        expect(await engine.executeRaw('SELECT id,fact,embedding::text,embedded_at FROM facts WHERE id=$1', [fact.id])).toEqual(original);
+      }
+    } finally {
+      await engine.disconnect();
+    }
+  }, 60_000);
+
+  test('queue bootstrap preserves legacy jobs without authorizing them and repairs either missing column', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+      await db.exec(`
+        DROP TRIGGER IF EXISTS minion_queue_protocol ON minion_jobs;
+        ALTER TABLE minion_jobs DROP COLUMN submission_authority;
+        ALTER TABLE minion_jobs DROP COLUMN claim_generation;
+        INSERT INTO minion_jobs (name, status, data, attempts_made, attempts_started, delay_until)
+        VALUES ('sync', 'delayed', '{"sourceId":"default"}', 1, 2, '2026-09-01T00:00:00Z'),
+               ('lint', 'completed', '{}', 0, 1, NULL);
+      `);
+      const original = await engine.executeRaw(`
+        SELECT id, name, status, data, attempts_made, attempts_started, delay_until FROM minion_jobs ORDER BY id
+      `);
+      await (engine as any).applyForwardReferenceBootstrap();
+      await (engine as any).applyForwardReferenceBootstrap();
+      const columns = await engine.executeRaw<{ column_name: string; is_nullable: string; column_default: string | null }>(`
+        SELECT column_name, is_nullable, column_default FROM information_schema.columns
+        WHERE table_name = 'minion_jobs' AND column_name IN ('submission_authority', 'claim_generation')
+        ORDER BY column_name
+      `);
+      expect(columns).toEqual([
+        { column_name: 'claim_generation', is_nullable: 'NO', column_default: '0' },
+        { column_name: 'submission_authority', is_nullable: 'YES', column_default: null },
+      ]);
+      expect(await engine.executeRaw(`
+        SELECT id, name, status, data, attempts_made, attempts_started, delay_until FROM minion_jobs ORDER BY id
+      `)).toEqual(original);
+      expect(await engine.executeRaw(`
+        SELECT submission_authority, claim_generation::int FROM minion_jobs ORDER BY id
+      `)).toEqual([{ submission_authority: null, claim_generation: 0 }, { submission_authority: null, claim_generation: 0 }]);
+
+      // Partial upgrades must repair either field without overwriting the other.
+      await db.exec(`ALTER TABLE minion_jobs DROP COLUMN submission_authority;
+        UPDATE minion_jobs SET claim_generation = 7 WHERE name = 'lint';`);
+      await (engine as any).applyForwardReferenceBootstrap();
+      expect(await engine.executeRaw(`SELECT submission_authority, claim_generation::int FROM minion_jobs WHERE name = 'lint'`))
+        .toEqual([{ submission_authority: null, claim_generation: 7 }]);
+      await db.exec(`ALTER TABLE minion_jobs DROP COLUMN claim_generation;
+        UPDATE minion_jobs SET submission_authority = '{"version":1,"kind":"application"}' WHERE name = 'lint';`);
+      await (engine as any).applyForwardReferenceBootstrap();
+      expect(await engine.executeRaw(`SELECT submission_authority, claim_generation::int FROM minion_jobs WHERE name = 'lint'`))
+        .toEqual([{ submission_authority: { version: 1, kind: 'application' }, claim_generation: 0 }]);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('no-op on fresh install (no pages or links table)', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      // Don't call initSchema — verify bootstrap alone does nothing on empty DB
+      await (engine as any).applyForwardReferenceBootstrap();
+      const { rows } = await (engine as any).db.query(`
+        SELECT COUNT(*)::int AS c FROM information_schema.tables
+        WHERE table_schema = 'public'
+      `);
+      expect(rows[0].c).toBe(0);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('idempotent: calling twice produces same result', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+
+      // Mutate to pre-v0.18 shape: drop source_id and the sources FK target
+      await db.exec(`
+        ALTER TABLE pages DROP CONSTRAINT IF EXISTS pages_source_slug_key;
+        ALTER TABLE pages ADD CONSTRAINT pages_slug_key UNIQUE (slug);
+        DROP INDEX IF EXISTS idx_pages_source_id;
+        -- The v230 trust generation trigger's WHEN reads pages.source_id, slug and
+        -- deleted_at; a pre-v0.18 brain predates it (v230 recreates it).
+        DROP TRIGGER IF EXISTS trust_generation_update ON pages;
+        ALTER TABLE pages DROP COLUMN IF EXISTS source_id;
+        DROP TABLE IF EXISTS sources CASCADE;
+      `);
+
+      // First call: applies bootstrap
+      await (engine as any).applyForwardReferenceBootstrap();
+      // Second call: must not error, must not duplicate state
+      await (engine as any).applyForwardReferenceBootstrap();
+
+      const { rows: cols } = await db.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'pages' AND column_name = 'source_id'
+      `);
+      expect(cols).toHaveLength(1);
+
+      const { rows: src } = await db.query(`SELECT COUNT(*)::int AS c FROM sources`);
+      expect(src[0].c).toBe(1); // 'default' seed not duplicated
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('no-op on modern brain (source_id and links provenance already present)', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+
+      const before = await db.query(`SELECT COUNT(*)::int AS c FROM sources`);
+      await (engine as any).applyForwardReferenceBootstrap();
+      const after = await db.query(`SELECT COUNT(*)::int AS c FROM sources`);
+
+      // Bootstrap probe should detect the brain is modern and skip the seed insert
+      expect(after.rows[0].c).toBe(before.rows[0].c);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('full path: pre-v0.18 brain reaches LATEST_VERSION via initSchema', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+
+      // Mutate to pre-v0.18 shape: strip the forward-referenced state.
+      // Match the shape from #399's regression fixture; constraints first
+      // (so dropping columns succeeds).
+      await db.exec(`
+        ALTER TABLE pages DROP CONSTRAINT IF EXISTS pages_source_slug_key;
+        ALTER TABLE pages ADD CONSTRAINT pages_slug_key UNIQUE (slug);
+        DROP INDEX IF EXISTS idx_pages_source_id;
+        -- The v230 trust generation trigger's WHEN reads pages.source_id, slug and
+        -- deleted_at; a pre-v0.18 brain predates it (v230 recreates it).
+        DROP TRIGGER IF EXISTS trust_generation_update ON pages;
+        ALTER TABLE pages DROP COLUMN IF EXISTS source_id;
+        DROP TABLE IF EXISTS sources CASCADE;
+        ALTER TABLE links DROP CONSTRAINT IF EXISTS links_resolution_type_check;
+        ALTER TABLE links DROP COLUMN IF EXISTS resolution_type;
+      `);
+      await engine.setConfig('version', '20');
+
+      // Path under test: bootstrap → SCHEMA_SQL → runMigrations
+      await engine.initSchema();
+
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+
+      const { rows: srcCol } = await db.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'pages' AND column_name = 'source_id'
+      `);
+      expect(srcCol).toHaveLength(1);
+
+      const { rows: defaultSrc } = await db.query(`SELECT id FROM sources WHERE id = 'default'`);
+      expect(defaultSrc).toHaveLength(1);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('fresh install regression: initSchema on empty DB produces LATEST', async () => {
+    // The bootstrap's table-existence probe must not mis-classify "no table"
+    // as "pre-v0.18 brain." Without the table-existence guard, the bootstrap
+    // would call runMigrations against an empty DB and crash on
+    // `relation "config" does not exist`. Regression test for that path.
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+
+      const db = (engine as any).db;
+      const pages = await db.query(`SELECT 1 FROM pages LIMIT 0`);
+      const sources = await db.query(`SELECT 1 FROM sources LIMIT 0`);
+      const config = await db.query(`SELECT 1 FROM config LIMIT 0`);
+      expect(pages).toBeDefined();
+      expect(sources).toBeDefined();
+      expect(config).toBeDefined();
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('pre-v0.13 links shape: bootstrap adds link_source + origin_page_id', async () => {
+    // Issues #266 / #357 — pre-v0.13 brains had `links` without
+    // `link_source` / `origin_page_id`. Schema blob's
+    // `CREATE INDEX idx_links_source` would crash before v11 ran.
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+
+      await db.exec(`
+        DROP INDEX IF EXISTS idx_links_source;
+        DROP INDEX IF EXISTS idx_links_origin;
+        ALTER TABLE links DROP CONSTRAINT IF EXISTS links_from_to_type_source_origin_unique;
+        ALTER TABLE links DROP COLUMN IF EXISTS link_source;
+        ALTER TABLE links DROP COLUMN IF EXISTS origin_page_id;
+      `);
+
+      await (engine as any).applyForwardReferenceBootstrap();
+
+      const { rows: lsCol } = await db.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'links' AND column_name = 'link_source'
+      `);
+      expect(lsCol).toHaveLength(1);
+
+      const { rows: opCol } = await db.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'links' AND column_name = 'origin_page_id'
+      `);
+      expect(opCol).toHaveLength(1);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('pre-v121 timeline shape reaches LATEST through full initSchema', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+      await db.exec(`
+        DROP INDEX IF EXISTS idx_timeline_event_dedup;
+        DROP INDEX IF EXISTS idx_timeline_event_page;
+        ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+        ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
+      `);
+      await engine.setConfig('version', '119');
+
+      await engine.initSchema();
+      await engine.initSchema();
+
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+      const { rows } = await db.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'timeline_entries' AND column_name = 'event_page_id'
+      `);
+      expect(rows).toHaveLength(1);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('pre-v121 partial bootstrap resumes without skipping migration work', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+      await db.exec(`
+        DROP INDEX IF EXISTS idx_timeline_event_dedup;
+        DROP INDEX IF EXISTS idx_timeline_event_page;
+        ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+      `);
+      await engine.setConfig('version', '119');
+
+      // Simulates interruption after bootstrap added the column but before
+      // schema-blob replay and migration v121 completed the FK/index work.
+      await engine.initSchema();
+
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+      const { rows } = await db.query(`
+        SELECT to_regclass('idx_timeline_event_page') AS lookup_idx,
+               to_regclass('idx_timeline_event_dedup') AS dedup_idx
+      `);
+      expect(rows[0]?.lookup_idx).not.toBeNull();
+      expect(rows[0]?.dedup_idx).not.toBeNull();
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('wedged-brain recovery: a brain that already FAILED the v0.42.56 upgrade converges on retry', async () => {
+    // The loudest #2626-class cohort: operators who upgraded, wedged, and are
+    // retrying with a fixed binary. Simulates the failed attempt (the blob's
+    // CREATE INDEX crashing on the missing column) and asserts the retry
+    // converges to the FULL final shape (column + FK + both partial indexes)
+    // with no residue — the failed attempt must not advance the version ledger.
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+
+      // Rewind to the pre-v121 shape: schema AND the version counter.
+      await db.exec(`
+        DROP INDEX IF EXISTS idx_timeline_event_page;
+        DROP INDEX IF EXISTS idx_timeline_event_dedup;
+        ALTER TABLE timeline_entries DROP CONSTRAINT IF EXISTS timeline_entries_event_page_id_fkey;
+        ALTER TABLE timeline_entries DROP COLUMN IF EXISTS event_page_id;
+      `);
+      await engine.setConfig('version', '120');
+
+      // The failed old-binary attempt: without the bootstrap probe, the blob's
+      // CREATE INDEX was the first statement to touch the missing column.
+      let wedgeError: Error | null = null;
+      try {
+        await db.exec(
+          `CREATE INDEX IF NOT EXISTS idx_timeline_event_page
+             ON timeline_entries(event_page_id) WHERE event_page_id IS NOT NULL`,
+        );
+      } catch (e) {
+        wedgeError = e as Error;
+      }
+      expect(wedgeError?.message ?? '').toContain('event_page_id');
+
+      // The failed attempt must not have advanced the ledger.
+      expect(parseInt((await engine.getConfig('version')) || '1', 10)).toBe(120);
+
+      // Retry with the fixed binary: full initSchema converges to LATEST with
+      // the complete final shape.
+      await engine.initSchema();
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+      const { rows: col } = await db.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'timeline_entries' AND column_name = 'event_page_id'
+      `);
+      expect(col).toHaveLength(1);
+      const { rows: fk } = await db.query(`
+        SELECT conname FROM pg_constraint
+        WHERE conname = 'timeline_entries_event_page_id_fkey'
+      `);
+      expect(fk).toHaveLength(1);
+      const { rows: idx } = await db.query(`
+        SELECT indexname FROM pg_indexes
+        WHERE tablename = 'timeline_entries'
+          AND indexname IN ('idx_timeline_event_page', 'idx_timeline_event_dedup')
+      `);
+      expect(idx).toHaveLength(2);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('compounded pre-v34 brain (v0.20 + v0.26.3 + v0.27 + v39-v41 gaps) walks forward to LATEST', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const dropped: Array<[string, string]> = [
+        ['content_chunks', 'parent_symbol_path'], ['content_chunks', 'doc_comment'],
+        ['content_chunks', 'symbol_name_qualified'], ['content_chunks', 'search_vector'],
+        ['mcp_request_log', 'agent_name'], ['mcp_request_log', 'params'], ['mcp_request_log', 'error_message'],
+        ['subagent_messages', 'provider_id'],
+        ['content_chunks', 'embedding_image'], ['content_chunks', 'modality'],
+        ['pages', 'emotional_weight'], ['pages', 'effective_date'], ['pages', 'effective_date_source'],
+        ['pages', 'import_filename'], ['pages', 'salience_touched_at'],
+      ];
+      await (engine as any).db.exec(`
+        DROP INDEX IF EXISTS idx_chunks_search_vector;
+        DROP INDEX IF EXISTS idx_chunks_symbol_qualified;
+        DROP TRIGGER IF EXISTS chunk_search_vector_trigger ON content_chunks;
+        DROP FUNCTION IF EXISTS update_chunk_search_vector;
+        DROP INDEX IF EXISTS idx_mcp_log_agent_time;
+        DROP INDEX IF EXISTS idx_subagent_messages_provider;
+        DROP INDEX IF EXISTS idx_chunks_embedding_image;
+        ${dropped.map(([table, column]) => `ALTER TABLE ${table} DROP COLUMN IF EXISTS ${column} CASCADE;`).join('\n        ')}
+        UPDATE config SET value = '13' WHERE key = 'version';
+      `);
+
+      await engine.initSchema();
+
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+      const present = await engine.executeRaw<{ table_name: string; column_name: string }>(
+        `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public'`,
+      );
+      const have = new Set(present.map(r => `${r.table_name}.${r.column_name}`));
+      expect(dropped.map(([table, column]) => `${table}.${column}`).filter(c => !have.has(c))).toEqual([]);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+});

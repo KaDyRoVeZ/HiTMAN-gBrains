@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "napi": 3,
+  "zig": "0.14.1",
+  "input_sha256": "9f4f646beaed859ce5d130a05e8eaa43e67006d3b0b7655eea01de5d4bbae03b",
+  "artifacts": {
+    "linux-x64-glibc": {
+      "sha256": "6194329dbb1a410aca6614ceaa9b5cf1ff4c1c0c9fad3d7106e59ebe2ce1ebce",
+      "bytes": 17296
+    },
+    "linux-arm64-glibc": {
+      "sha256": "78dfa5e3b3cbe1e192a0d86e0282ce14e363c7c80fabe7f70b830358ae7b7a63",
+      "bytes": 17280
+    },
+    "linux-x64-musl": {
+      "sha256": "6810aef4a80309a1d95f4386c640d685e7025e31aedb85279f76f50df0712b08",
+      "bytes": 16808
+    },
+    "linux-arm64-musl": {
+      "sha256": "b75c7c8cbbadb81e66fc970ddb09efb9c3ec7515bb89c2ae9d7155ef7600fa44",
+      "bytes": 16872
+    },
+    "darwin-x64": {
+      "sha256": "f3614608756acd50a32ebe4fe32736713a74f0d41b3493a9441892243864a8c8",
+      "bytes": 28013
+    },
+    "darwin-arm64": {
+      "sha256": "bb54b41a741baedded5e8379bc8ddde8a0fbd5386e665138a240bf47497ea789",
+      "bytes": 70608
+    },
+    "win32-x64": {
+      "sha256": "0c1d2cd059268ce654f7eb0442dcfb9d196f85cfdd2235c77295c9cfa0edc3eb",
+      "bytes": 36352
+    },
+    "win32-arm64": {
+      "sha256": "99ac2c187ad37d48890da702729a54c598363858840c507ebe88fb629b045ff8",
+      "bytes": 32768
+    }
+  }
+}

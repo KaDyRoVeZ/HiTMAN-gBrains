@@ -1,0 +1,977 @@
+{
+  "decision_id": "p1-dev-2026-10-04",
+  "plan": "P1",
+  "stage": "dev",
+  "eligible_for_default": false,
+  "eligibility_note": "Dev verdicts come from development data and never set a default. A held-out verdict comes from the custodian after a committed preregistration.",
+  "verdict_type": "quality",
+  "overall": "blocked",
+  "decided_at": "2026-10-04T19:25:54.006Z",
+  "sources": [
+    {
+      "source": "temporal-edges",
+      "verdict": "pass",
+      "arms": {
+        "baseline": "0.60.48.0",
+        "candidate": "0.60.48.0"
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04:temporal-edges",
+        "verdict": "pass",
+        "reasons": [],
+        "alpha": 0.05,
+        "holm_family": [
+          "now-precision",
+          "asof",
+          "during",
+          "correction",
+          "now-recall",
+          "live-recall"
+        ],
+        "comparisons": [
+          {
+            "id": "now-precision",
+            "metric": "now_precision",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 24,
+            "n_clusters": 24,
+            "n_excluded": 1067,
+            "stats": {
+              "n_pairs": 24,
+              "n_clusters": 24,
+              "mean_a": 0.3427812689761218,
+              "mean_b": 1,
+              "delta": 0.657218731023878,
+              "se_cluster": 0.027122631310579504,
+              "se_iid": 0.027122631310579508,
+              "design_effect": 0.9999999999999998,
+              "effective_n": 24.000000000000007,
+              "ci95": [
+                0.6042636285283343,
+                0.707072165987607
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.07598636297595132,
+              "min_one_sided_discordant": null,
+              "note": "with 24 pairs in 24 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0760; the observed delta is at least that size"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.1,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "asof",
+            "metric": "asof_exact",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [
+              "McNemar treats items as independent; the clustered sign-flip p-value is the primary test here"
+            ],
+            "n_pairs": 480,
+            "n_clusters": 160,
+            "n_excluded": 611,
+            "stats": {
+              "n_pairs": 480,
+              "n_clusters": 160,
+              "mean_a": 0.2125,
+              "mean_b": 0.9,
+              "delta": 0.6875,
+              "se_cluster": 0.033916221750567715,
+              "se_iid": 0.021178422370722868,
+              "design_effect": 2.564647735213773,
+              "effective_n": 187.16020660825384,
+              "ci95": [
+                0.6208333333333333,
+                0.7520833333333333
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 330,
+              "both_pass": 102,
+              "both_fail": 48,
+              "discordant": 330,
+              "p_two_sided": 9.1438991302582e-100
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.09501918553552131,
+              "min_one_sided_discordant": 6,
+              "note": "with 480 pairs in 160 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0950; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05; clustering inflates variance by 2.56x (effective n about 187.2 of 480)"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.15,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "during",
+            "metric": "during_f1",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 160,
+            "n_clusters": 160,
+            "n_excluded": 931,
+            "stats": {
+              "n_pairs": 160,
+              "n_clusters": 160,
+              "mean_a": 0.5943750000000001,
+              "mean_b": 0.8958333333333334,
+              "delta": 0.3014583333333335,
+              "se_cluster": 0.022056536835444136,
+              "se_iid": 0.022056536835444136,
+              "design_effect": 1,
+              "effective_n": 160,
+              "ci95": [
+                0.259375,
+                0.34541666666666687
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.061793267577130565,
+              "min_one_sided_discordant": null,
+              "note": "with 160 pairs in 160 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0618; the observed delta is at least that size"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.15,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "correction",
+            "metric": "correction_ok",
+            "gate": "superiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 30,
+            "n_clusters": 30,
+            "n_excluded": 1061,
+            "stats": {
+              "n_pairs": 30,
+              "n_clusters": 30,
+              "mean_a": 0,
+              "mean_b": 0.8666666666666667,
+              "delta": 0.8666666666666667,
+              "se_cluster": 0.06312427686319994,
+              "se_iid": 0.06312427686319992,
+              "design_effect": 1.0000000000000004,
+              "effective_n": 29.999999999999986,
+              "ci95": [
+                0.7333333333333333,
+                0.9666666666666667
+              ],
+              "p_two_sided": 0.00009999000099990002,
+              "p_greater": 0.00009999000099990002,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 26,
+              "both_pass": 0,
+              "both_fail": 4,
+              "discordant": 26,
+              "p_two_sided": 2.9802322387695312e-8
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.17684804101033486,
+              "min_one_sided_discordant": 6,
+              "note": "with 30 pairs in 30 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.1768; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0.00039996000399960006,
+            "min_effect": 0.2,
+            "p_superiority": 0.00009999000099990002
+          },
+          {
+            "id": "now-recall",
+            "metric": "now_recall",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 24,
+            "n_clusters": 24,
+            "n_excluded": 1067,
+            "stats": {
+              "n_pairs": 24,
+              "n_clusters": 24,
+              "mean_a": 0.8421897546897547,
+              "mean_b": 0.8421897546897547,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": null,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.02,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "live-recall",
+            "metric": "live_recall",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 139,
+            "n_clusters": 139,
+            "n_excluded": 952,
+            "stats": {
+              "n_pairs": 139,
+              "n_clusters": 139,
+              "mean_a": 0.841726618705036,
+              "mean_b": 0.841726618705036,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 0,
+              "both_pass": 117,
+              "both_fail": 22,
+              "discordant": 0,
+              "p_two_sided": 1
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": 6,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.02,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "traps",
+            "metric": "trap_ok",
+            "gate": "exact",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 74,
+            "n_excluded": 1017
+          },
+          {
+            "id": "invariance",
+            "metric": "invariant",
+            "gate": "exact",
+            "status": "pass",
+            "reasons": [],
+            "n_pairs": 160,
+            "n_excluded": 931
+          },
+          {
+            "id": "names-current",
+            "metric": "correction_names_current",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 30,
+            "n_clusters": 30,
+            "n_excluded": 1061,
+            "stats": {
+              "n_pairs": 30,
+              "n_clusters": 30,
+              "mean_a": 0.1,
+              "mean_b": 0.3333333333333333,
+              "delta": 0.23333333333333334,
+              "se_cluster": 0.07854032324531726,
+              "se_iid": 0.07854032324531725,
+              "design_effect": 1.0000000000000004,
+              "effective_n": 29.999999999999986,
+              "ci95": [
+                0.1,
+                0.4
+              ],
+              "p_two_sided": 0.015798420157984203,
+              "p_greater": 0.0081991800819918,
+              "p_less": 1,
+              "p_method": "monte-carlo-sign-flip"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 7,
+              "both_pass": 3,
+              "both_fail": 20,
+              "discordant": 7,
+              "p_two_sided": 0.015625
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.22003740868753166,
+              "min_one_sided_discordant": 6,
+              "note": "with 30 pairs in 30 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.2200; the observed delta is at least that size; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher"
+          }
+        ]
+      }
+    },
+    {
+      "source": "locomo-dev",
+      "verdict": "pass",
+      "arms": {
+        "baseline": {
+          "package": "gbrain",
+          "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "version": "0.60.48.0",
+          "package_sha256": "5f9974dcaa7b13d1077ff6fdad3c24fd2b975cb4536efb4693663d0e4bc3c84c",
+          "loaded_git_head": "5bd9e84978126689b11cf65107c0a9aa0e91e11b"
+        },
+        "candidate": {
+          "package": "gbrain",
+          "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "version": "0.60.48.0",
+          "package_sha256": "59f8caa2a1ea43cfee7af4552c2c9878ff0801d2f9ccf798586f5e175362e376",
+          "loaded_git_head": "bc6723c856a268af6e3772ad7720dba226754fd9"
+        }
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04:locomo-dev",
+        "verdict": "pass",
+        "reasons": [],
+        "alpha": 0.05,
+        "holm_family": [
+          "recall-all-5"
+        ],
+        "comparisons": [
+          {
+            "id": "recall-all-5",
+            "metric": "recall_all_at_5",
+            "gate": "noninferiority",
+            "status": "pass",
+            "reasons": [
+              "McNemar treats items as independent; the clustered sign-flip p-value is the primary test here"
+            ],
+            "n_pairs": 464,
+            "n_clusters": 3,
+            "n_excluded": 123,
+            "stats": {
+              "n_pairs": 464,
+              "n_clusters": 3,
+              "mean_a": 0.7543103448275862,
+              "mean_b": 0.7543103448275862,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 0,
+              "both_pass": 350,
+              "both_fail": 114,
+              "discordant": 0,
+              "p_two_sided": 1
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": 6,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.01,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "ndcg-10",
+            "metric": "ndcg_at_10",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 464,
+            "n_clusters": 3,
+            "n_excluded": 123,
+            "stats": {
+              "n_pairs": 464,
+              "n_clusters": 3,
+              "mean_a": 0.7413419020946757,
+              "mean_b": 0.7413526895886994,
+              "delta": 0.000010787494023888618,
+              "se_cluster": 0.00007698792232459171,
+              "se_iid": 0.00006262103533976084,
+              "design_effect": 1.5114880276126383,
+              "effective_n": 306.982252934466,
+              "ci95": [
+                -0.00009355212852148978,
+                0.0001524923584979258
+              ],
+              "p_two_sided": 1,
+              "p_greater": 0.5,
+              "p_less": 0.75,
+              "p_method": "exact-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.00021568822521430279,
+              "min_one_sided_discordant": null,
+              "note": "with 464 pairs in 3 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0002; the observed delta is below that size, so a null result here is not evidence of no effect; clustering inflates variance by 1.51x (effective n about 307.0 of 464)"
+            },
+            "direction": "higher"
+          },
+          {
+            "id": "latency",
+            "metric": "latency_ms",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 464,
+            "n_clusters": 3,
+            "n_excluded": 123,
+            "stats": {
+              "n_pairs": 464,
+              "n_clusters": 3,
+              "mean_a": 225.56551724137938,
+              "mean_b": 226.20818965517205,
+              "delta": 0.6426724137931032,
+              "se_cluster": 1.0422629297254573,
+              "se_iid": 5.118095957429353,
+              "design_effect": 0.041470353249762636,
+              "effective_n": 11188.71588108924,
+              "ci95": [
+                -1.8910569105691062,
+                1.8329842931937177
+              ],
+              "p_two_sided": 0.75,
+              "p_greater": 0.375,
+              "p_less": 0.75,
+              "p_method": "exact-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 2.9199884180708167,
+              "min_one_sided_discordant": null,
+              "note": "with 464 pairs in 3 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 2.9200; the observed delta is below that size, so a null result here is not evidence of no effect"
+            },
+            "direction": "lower"
+          }
+        ]
+      }
+    },
+    {
+      "source": "beam-100k-dev",
+      "verdict": "inconclusive",
+      "arms": {
+        "baseline": {
+          "package": "gbrain",
+          "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "version": "0.60.48.0",
+          "package_sha256": "5f9974dcaa7b13d1077ff6fdad3c24fd2b975cb4536efb4693663d0e4bc3c84c",
+          "loaded_git_head": "5bd9e84978126689b11cf65107c0a9aa0e91e11b"
+        },
+        "candidate": {
+          "package": "gbrain",
+          "declared_pin": "github:garrytan/gbrain#739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "declared_sha": "739e5cc89ca43b9b9351f0f203c7b12a7c0c571c",
+          "version": "0.60.48.0",
+          "package_sha256": "59f8caa2a1ea43cfee7af4552c2c9878ff0801d2f9ccf798586f5e175362e376",
+          "loaded_git_head": "bc6723c856a268af6e3772ad7720dba226754fd9"
+        }
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04:beam-100k-dev",
+        "verdict": "inconclusive",
+        "reasons": [
+          "recall-all-5: inconclusive"
+        ],
+        "alpha": 0.05,
+        "holm_family": [
+          "recall-all-5"
+        ],
+        "comparisons": [
+          {
+            "id": "recall-all-5",
+            "metric": "recall_all_at_5",
+            "gate": "noninferiority",
+            "status": "inconclusive",
+            "reasons": [
+              "McNemar treats items as independent; the clustered sign-flip p-value is the primary test here",
+              "6 clusters is below the family minimum of 10"
+            ],
+            "n_pairs": 108,
+            "n_clusters": 6,
+            "n_excluded": 12,
+            "stats": {
+              "n_pairs": 108,
+              "n_clusters": 6,
+              "mean_a": 0.4537037037037037,
+              "mean_b": 0.4537037037037037,
+              "delta": 0,
+              "se_cluster": 0,
+              "se_iid": 0,
+              "design_effect": null,
+              "effective_n": null,
+              "ci95": [
+                0,
+                0
+              ],
+              "p_two_sided": 1,
+              "p_greater": 1,
+              "p_less": 1,
+              "p_method": "degenerate"
+            },
+            "mcnemar": {
+              "losses": 0,
+              "wins": 0,
+              "both_pass": 49,
+              "both_fail": 59,
+              "discordant": 0,
+              "p_two_sided": 1
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": null,
+              "min_one_sided_discordant": 6,
+              "note": "no paired variation was observed, so the detectable effect cannot be estimated from this data; an exact McNemar test needs at least 6 wins with zero losses to reach 0.05"
+            },
+            "direction": "higher",
+            "p_holm": 0,
+            "tolerance": 0.01,
+            "p_noninferiority": 0
+          },
+          {
+            "id": "ndcg-10",
+            "metric": "ndcg_at_10",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 108,
+            "n_clusters": 6,
+            "n_excluded": 12,
+            "stats": {
+              "n_pairs": 108,
+              "n_clusters": 6,
+              "mean_a": 0.5673942086796449,
+              "mean_b": 0.5678053768472163,
+              "delta": 0.0004111681675714771,
+              "se_cluster": 0.00041116816757147704,
+              "se_iid": 0.00041116816757147704,
+              "design_effect": 1,
+              "effective_n": 108,
+              "ci95": [
+                0,
+                0.0012335045027144313
+              ],
+              "p_two_sided": 1,
+              "p_greater": 0.5,
+              "p_less": 1,
+              "p_method": "exact-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 0.0011519226607285798,
+              "min_one_sided_discordant": null,
+              "note": "with 108 pairs in 6 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 0.0012; the observed delta is below that size, so a null result here is not evidence of no effect"
+            },
+            "direction": "higher"
+          },
+          {
+            "id": "latency",
+            "metric": "latency_ms",
+            "gate": "exploratory",
+            "status": "report_only",
+            "reasons": [],
+            "n_pairs": 108,
+            "n_clusters": 6,
+            "n_excluded": 12,
+            "stats": {
+              "n_pairs": 108,
+              "n_clusters": 6,
+              "mean_a": 284.77407407407406,
+              "mean_b": 288.2648148148148,
+              "delta": 3.490740740740739,
+              "se_cluster": 3.780819490791363,
+              "se_iid": 5.508513744276622,
+              "design_effect": 0.47108905212130814,
+              "effective_n": 229.25601754843876,
+              "ci95": [
+                -2.8916666666666684,
+                10.515740740740737
+              ],
+              "p_two_sided": 0.46875,
+              "p_greater": 0.234375,
+              "p_less": 0.78125,
+              "p_method": "exact-sign-flip"
+            },
+            "power": {
+              "alpha": 0.05,
+              "power": 0.8,
+              "mde": 10.592288000529019,
+              "min_one_sided_discordant": null,
+              "note": "with 108 pairs in 6 clusters, a two-sided 0.05 test has 80% power for an absolute change of about 10.5923; the observed delta is below that size, so a null result here is not evidence of no effect"
+            },
+            "direction": "lower"
+          }
+        ]
+      }
+    },
+    {
+      "source": "n3-temporal-asof",
+      "verdict": "blocked",
+      "arms": {
+        "baseline": "0.60.48.0",
+        "candidate": "0.60.48.0"
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04:n3-temporal-asof",
+        "verdict": "blocked",
+        "reasons": [
+          "n3-pass: A: search_date_bounds:0:quarter 2025-04-01..2025-06-30 has no cluster id (+217 more)"
+        ],
+        "alpha": 0.05,
+        "holm_family": [
+          "n3-pass"
+        ],
+        "comparisons": [
+          {
+            "id": "n3-pass",
+            "metric": "pass",
+            "gate": "noninferiority",
+            "status": "blocked",
+            "reasons": [
+              "A: search_date_bounds:0:quarter 2025-04-01..2025-06-30 has no cluster id",
+              "A: search_date_bounds:1:quarter 2022-01-01..2022-03-31 has no cluster id",
+              "A: search_date_bounds:2:quarter 2025-10-01..2025-12-31 has no cluster id",
+              "A: search_date_bounds:3:quarter 2025-01-01..2025-03-31 has no cluster id",
+              "A: search_date_bounds:4:quarter 2022-10-01..2022-12-31 has no cluster id",
+              "A: search_date_bounds:5:quarter 2023-07-01..2023-09-30 has no cluster id",
+              "A: search_date_bounds:6:single day 2022-06-07 has no cluster id",
+              "A: search_date_bounds:7:single day 2022-01-17 has no cluster id",
+              "A: search_date_bounds:8:single day 2024-12-14 has no cluster id",
+              "A: search_date_bounds:9:single day 2023-12-22 has no cluster id",
+              "A: search_date_bounds:10:open-ended since has no cluster id",
+              "A: search_date_bounds:11:open-ended until has no cluster id",
+              "A: search_date_bounds:12:month has no cluster id",
+              "A: search_date_bounds:13:empty: before the world has no cluster id",
+              "A: search_date_bounds:14:empty: day with no note 2022-01-13 has no cluster id",
+              "A: effective_date_precedence:meetings/2023-07-29-prec-zdmxbjzv has no cluster id",
+              "A: effective_date_precedence:notes/2023-02-16-prec-zdgndfev has no cluster id",
+              "A: effective_date_precedence:notes/prec-zdthplio has no cluster id",
+              "A: effective_date_precedence:meetings/2023-11-04-prec-zdrdxbda has no cluster id",
+              "A: effective_date_precedence:notes/2023-04-28-prec-zdxvuvsa has no cluster id",
+              "A: effective_date_precedence:notes/prec-zdutkhwz has no cluster id",
+              "A: effective_date_precedence:meetings/2023-01-21-prec-zdhdvguy has no cluster id",
+              "A: effective_date_precedence:notes/2023-07-31-prec-zdxmbzot has no cluster id",
+              "A: effective_date_precedence:notes/prec-zddzvpsp has no cluster id",
+              "A: effective_date_precedence:meetings/2023-08-29-prec-zdzqvtqd has no cluster id",
+              "A: chronicle_day:meeting:2025-08-03 has no cluster id",
+              "A: chronicle_day:meeting:2022-01-21 has no cluster id",
+              "A: chronicle_day:meeting:2025-06-09 has no cluster id",
+              "A: chronicle_day:meeting:2023-05-03 has no cluster id",
+              "A: chronicle_day:meeting:2023-05-09 has no cluster id",
+              "A: chronicle_day:person:2025-01-28 has no cluster id",
+              "A: chronicle_day:person:2023-01-29 has no cluster id",
+              "A: chronicle_day:person:2024-04-29 has no cluster id",
+              "A: chronicle_day:person:2024-01-24 has no cluster id",
+              "A: chronicle_day:person:2023-10-29 has no cluster id",
+              "A: chronicle_day:date-only-event:2022-04-30 has no cluster id",
+              "A: chronicle_day:date-only-event:2024-11-30 has no cluster id",
+              "A: chronicle_day:empty:2023-01-01 has no cluster id",
+              "A: chronicle_day:empty:2023-04-08 has no cluster id",
+              "A: chronicle_day:empty:2023-07-14 has no cluster id",
+              "A: timezone_chronicle:local-day:2025-10-08 has no cluster id",
+              "A: timezone_chronicle:utc-day:2025-10-09 has no cluster id",
+              "A: timezone_chronicle:local-day:2022-11-27 has no cluster id",
+              "A: timezone_chronicle:utc-day:2022-11-28 has no cluster id",
+              "A: timezone_chronicle:local-day:2023-08-08 has no cluster id",
+              "A: timezone_chronicle:utc-day:2023-08-09 has no cluster id",
+              "A: chronicle_week:2023-02-27 has no cluster id",
+              "A: chronicle_week:2024-10-12 has no cluster id",
+              "A: chronicle_week:2023-07-10 has no cluster id",
+              "A: chronicle_week:2021-06-16 has no cluster id",
+              "A: chronicle_since:2025-09-01 has no cluster id",
+              "A: chronicle_since:2025-03-15 has no cluster id",
+              "A: chronicle_since:2024-12-01 has no cluster id",
+              "A: chronicle_since:2026-01-01 has no cluster id",
+              "A: chronicle_since_kind:commitment has no cluster id",
+              "A: chronicle_since_kind:meeting has no cluster id",
+              "A: chronicle_since_kind:travel(absent) has no cluster id",
+              "A: chronicle_on_this_day:2026-10-09 has no cluster id",
+              "A: chronicle_on_this_day:2026-03-22 has no cluster id",
+              "A: chronicle_on_this_day:2026-04-15 has no cluster id",
+              "A: chronicle_on_this_day:2026-07-11 has no cluster id",
+              "A: chronicle_on_this_day:2026-01-01(empty) has no cluster id",
+              "A: trajectory_range:companies/startup-0:2023-10-01..2024-01-01 has no cluster id",
+              "A: trajectory_range:companies/startup-0:2024-01-01..2025-04-11 has no cluster id",
+              "A: trajectory_range:companies/startup-0:2019(empty) has no cluster id",
+              "A: trajectory_asof:companies/startup-0@2023-05-06 has no cluster id",
+              "A: trajectory_asof:companies/startup-0@2021-12-31(before) has no cluster id",
+              "A: trajectory_range:companies/startup-1:2022-01-01..2022-07-01 has no cluster id",
+              "A: trajectory_range:companies/startup-1:2024-01-01..2025-07-01 has no cluster id",
+              "A: trajectory_range:companies/startup-1:2019(empty) has no cluster id",
+              "A: trajectory_asof:companies/startup-1@2026-02-09 has no cluster id",
+              "A: trajectory_asof:companies/startup-1@2021-12-31(before) has no cluster id",
+              "A: trajectory_range:companies/startup-2:2022-04-01..2023-01-01 has no cluster id",
+              "A: trajectory_range:companies/startup-2:2023-04-01..2024-10-01 has no cluster id",
+              "A: trajectory_range:companies/startup-2:2019(empty) has no cluster id",
+              "A: trajectory_asof:companies/startup-2@2023-04-05 has no cluster id",
+              "A: trajectory_asof:companies/startup-2@2021-12-31(before) has no cluster id",
+              "A: trajectory_range:companies/startup-3:2023-01-01..2025-07-01 has no cluster id",
+              "A: trajectory_range:companies/startup-3:2024-04-01..2025-07-11 has no cluster id",
+              "A: trajectory_range:companies/startup-3:2019(empty) has no cluster id",
+              "A: trajectory_asof:companies/startup-3@2023-09-17 has no cluster id",
+              "A: trajectory_asof:companies/startup-3@2021-12-31(before) has no cluster id",
+              "A: trajectory_range:companies/startup-4:2024-01-01..2025-04-11 has no cluster id",
+              "A: trajectory_range:companies/startup-4:2025-01-01..2025-10-11 has no cluster id",
+              "A: trajectory_range:companies/startup-4:2019(empty) has no cluster id",
+              "A: trajectory_asof:companies/startup-4@2024-07-04 has no cluster id",
+              "A: trajectory_asof:companies/startup-4@2021-12-31(before) has no cluster id",
+              "A: trajectory_range:companies/startup-5:no-facts has no cluster id",
+              "A: relative:since=7d has no cluster id",
+              "A: relative:since=2w has no cluster id",
+              "A: relative:since=1m has no cluster id",
+              "A: relative:since=1y has no cluster id",
+              "A: relative:since=3y has no cluster id",
+              "A: relative:since=1m,until=7d has no cluster id",
+              "A: relative:since=1d(empty) has no cluster id",
+              "A: input:yesterday has no cluster id",
+              "A: input:last week has no cluster id",
+              "A: input:3 days ago has no cluster id",
+              "A: input:May 5 (non-ISO) has no cluster id",
+              "A: input:2024-02-30 (not a calendar date) has no cluster id",
+              "A: recorded_time:fallback:notes/undated-zuxjtaue has no cluster id",
+              "A: recorded_time:stable-after-rewrite:notes/undated-zuxjtaue has no cluster id",
+              "A: recorded_time:fallback:notes/undated-zuenpitp has no cluster id",
+              "A: recorded_time:stable-after-rewrite:notes/undated-zuenpitp has no cluster id",
+              "A: recorded_time:fallback:notes/undated-zuihmlgn has no cluster id",
+              "A: recorded_time:stable-after-rewrite:notes/undated-zuihmlgn has no cluster id",
+              "A: recorded_time:stable-after-rewrite:meetings/2023-07-29-prec-zdmxbjzv has no cluster id",
+              "A: recorded_time:rewritten-dated-page-not-recent:meetings/2023-07-29-prec-zdmxbjzv has no cluster id",
+              "A: recorded_time:undated-pages-in-7d has no cluster id",
+              "B: search_date_bounds:0:quarter 2025-04-01..2025-06-30 has no cluster id",
+              "B: search_date_bounds:1:quarter 2022-01-01..2022-03-31 has no cluster id",
+              "B: search_date_bounds:2:quarter 2025-10-01..2025-12-31 has no cluster id",
+              "B: search_date_bounds:3:quarter 2025-01-01..2025-03-31 has no cluster id",
+              "B: search_date_bounds:4:quarter 2022-10-01..2022-12-31 has no cluster id",
+              "B: search_date_bounds:5:quarter 2023-07-01..2023-09-30 has no cluster id",
+              "B: search_date_bounds:6:single day 2022-06-07 has no cluster id",
+              "B: search_date_bounds:7:single day 2022-01-17 has no cluster id",
+              "B: search_date_bounds:8:single day 2024-12-14 has no cluster id",
+              "B: search_date_bounds:9:single day 2023-12-22 has no cluster id",
+              "B: search_date_bounds:10:open-ended since has no cluster id",
+              "B: search_date_bounds:11:open-ended until has no cluster id",
+              "B: search_date_bounds:12:month has no cluster id",
+              "B: search_date_bounds:13:empty: before the world has no cluster id",
+              "B: search_date_bounds:14:empty: day with no note 2022-01-13 has no cluster id",
+              "B: effective_date_precedence:meetings/2023-07-29-prec-zdmxbjzv has no cluster id",
+              "B: effective_date_precedence:notes/2023-02-16-prec-zdgndfev has no cluster id",
+              "B: effective_date_precedence:notes/prec-zdthplio has no cluster id",
+              "B: effective_date_precedence:meetings/2023-11-04-prec-zdrdxbda has no cluster id",
+              "B: effective_date_precedence:notes/2023-04-28-prec-zdxvuvsa has no cluster id",
+              "B: effective_date_precedence:notes/prec-zdutkhwz has no cluster id",
+              "B: effective_date_precedence:meetings/2023-01-21-prec-zdhdvguy has no cluster id",
+              "B: effective_date_precedence:notes/2023-07-31-prec-zdxmbzot has no cluster id",
+              "B: effective_date_precedence:notes/prec-zddzvpsp has no cluster id",
+              "B: effective_date_precedence:meetings/2023-08-29-prec-zdzqvtqd has no cluster id",
+              "B: chronicle_day:meeting:2025-08-03 has no cluster id",
+              "B: chronicle_day:meeting:2022-01-21 has no cluster id",
+              "B: chronicle_day:meeting:2025-06-09 has no cluster id",
+              "B: chronicle_day:meeting:2023-05-03 has no cluster id",
+              "B: chronicle_day:meeting:2023-05-09 has no cluster id",
+              "B: chronicle_day:person:2025-01-28 has no cluster id",
+              "B: chronicle_day:person:2023-01-29 has no cluster id",
+              "B: chronicle_day:person:2024-04-29 has no cluster id",
+              "B: chronicle_day:person:2024-01-24 has no cluster id",
+              "B: chronicle_day:person:2023-10-29 has no cluster id",
+              "B: chronicle_day:date-only-event:2022-04-30 has no cluster id",
+              "B: chronicle_day:date-only-event:2024-11-30 has no cluster id",
+              "B: chronicle_day:empty:2023-01-01 has no cluster id",
+              "B: chronicle_day:empty:2023-04-08 has no cluster id",
+              "B: chronicle_day:empty:2023-07-14 has no cluster id",
+              "B: timezone_chronicle:local-day:2025-10-08 has no cluster id",
+              "B: timezone_chronicle:utc-day:2025-10-09 has no cluster id",
+              "B: timezone_chronicle:local-day:2022-11-27 has no cluster id",
+              "B: timezone_chronicle:utc-day:2022-11-28 has no cluster id",
+              "B: timezone_chronicle:local-day:2023-08-08 has no cluster id",
+              "B: timezone_chronicle:utc-day:2023-08-09 has no cluster id",
+              "B: chronicle_week:2023-02-27 has no cluster id",
+              "B: chronicle_week:2024-10-12 has no cluster id",
+              "B: chronicle_week:2023-07-10 has no cluster id",
+              "B: chronicle_week:2021-06-16 has no cluster id",
+              "B: chronicle_since:2025-09-01 has no cluster id",
+              "B: chronicle_since:2025-03-15 has no cluster id",
+              "B: chronicle_since:2024-12-01 has no cluster id",
+              "B: chronicle_since:2026-01-01 has no cluster id",
+              "B: chronicle_since_kind:commitment has no cluster id",
+              "B: chronicle_since_kind:meeting has no cluster id",
+              "B: chronicle_since_kind:travel(absent) has no cluster id",
+              "B: chronicle_on_this_day:2026-10-09 has no cluster id",
+              "B: chronicle_on_this_day:2026-03-22 has no cluster id",
+              "B: chronicle_on_this_day:2026-04-15 has no cluster id",
+              "B: chronicle_on_this_day:2026-07-11 has no cluster id",
+              "B: chronicle_on_this_day:2026-01-01(empty) has no cluster id",
+              "B: trajectory_range:companies/startup-0:2023-10-01..2024-01-01 has no cluster id",
+              "B: trajectory_range:companies/startup-0:2024-01-01..2025-04-11 has no cluster id",
+              "B: trajectory_range:companies/startup-0:2019(empty) has no cluster id",
+              "B: trajectory_asof:companies/startup-0@2023-05-06 has no cluster id",
+              "B: trajectory_asof:companies/startup-0@2021-12-31(before) has no cluster id",
+              "B: trajectory_range:companies/startup-1:2022-01-01..2022-07-01 has no cluster id",
+              "B: trajectory_range:companies/startup-1:2024-01-01..2025-07-01 has no cluster id",
+              "B: trajectory_range:companies/startup-1:2019(empty) has no cluster id",
+              "B: trajectory_asof:companies/startup-1@2026-02-09 has no cluster id",
+              "B: trajectory_asof:companies/startup-1@2021-12-31(before) has no cluster id",
+              "B: trajectory_range:companies/startup-2:2022-04-01..2023-01-01 has no cluster id",
+              "B: trajectory_range:companies/startup-2:2023-04-01..2024-10-01 has no cluster id",
+              "B: trajectory_range:companies/startup-2:2019(empty) has no cluster id",
+              "B: trajectory_asof:companies/startup-2@2023-04-05 has no cluster id",
+              "B: trajectory_asof:companies/startup-2@2021-12-31(before) has no cluster id",
+              "B: trajectory_range:companies/startup-3:2023-01-01..2025-07-01 has no cluster id",
+              "B: trajectory_range:companies/startup-3:2024-04-01..2025-07-11 has no cluster id",
+              "B: trajectory_range:companies/startup-3:2019(empty) has no cluster id",
+              "B: trajectory_asof:companies/startup-3@2023-09-17 has no cluster id",
+              "B: trajectory_asof:companies/startup-3@2021-12-31(before) has no cluster id",
+              "B: trajectory_range:companies/startup-4:2024-01-01..2025-04-11 has no cluster id",
+              "B: trajectory_range:companies/startup-4:2025-01-01..2025-10-11 has no cluster id",
+              "B: trajectory_range:companies/startup-4:2019(empty) has no cluster id",
+              "B: trajectory_asof:companies/startup-4@2024-07-04 has no cluster id",
+              "B: trajectory_asof:companies/startup-4@2021-12-31(before) has no cluster id",
+              "B: trajectory_range:companies/startup-5:no-facts has no cluster id",
+              "B: relative:since=7d has no cluster id",
+              "B: relative:since=2w has no cluster id",
+              "B: relative:since=1m has no cluster id",
+              "B: relative:since=1y has no cluster id",
+              "B: relative:since=3y has no cluster id",
+              "B: relative:since=1m,until=7d has no cluster id",
+              "B: relative:since=1d(empty) has no cluster id",
+              "B: input:yesterday has no cluster id",
+              "B: input:last week has no cluster id",
+              "B: input:3 days ago has no cluster id",
+              "B: input:May 5 (non-ISO) has no cluster id",
+              "B: input:2024-02-30 (not a calendar date) has no cluster id",
+              "B: recorded_time:fallback:notes/undated-zuxjtaue has no cluster id",
+              "B: recorded_time:stable-after-rewrite:notes/undated-zuxjtaue has no cluster id",
+              "B: recorded_time:fallback:notes/undated-zuenpitp has no cluster id",
+              "B: recorded_time:stable-after-rewrite:notes/undated-zuenpitp has no cluster id",
+              "B: recorded_time:fallback:notes/undated-zuihmlgn has no cluster id",
+              "B: recorded_time:stable-after-rewrite:notes/undated-zuihmlgn has no cluster id",
+              "B: recorded_time:stable-after-rewrite:meetings/2023-07-29-prec-zdmxbjzv has no cluster id",
+              "B: recorded_time:rewritten-dated-page-not-recent:meetings/2023-07-29-prec-zdmxbjzv has no cluster id",
+              "B: recorded_time:undated-pages-in-7d has no cluster id"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "source": "n4-entity-resolution",
+      "verdict": "blocked",
+      "arms": {
+        "baseline": "0.60.48.0",
+        "candidate": "0.60.48.0"
+      },
+      "family": {
+        "family_id": "p1-dev-2026-10-04:n4-entity-resolution",
+        "verdict": "blocked",
+        "reasons": [
+          "n4-recall: no eligible pairs"
+        ],
+        "alpha": 0.05,
+        "holm_family": [
+          "n4-recall"
+        ],
+        "comparisons": [
+          {
+            "id": "n4-recall",
+            "metric": "recall",
+            "gate": "noninferiority",
+            "status": "blocked",
+            "reasons": [
+              "no eligible pairs"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "source": "n1-knowledge-update",
+      "verdict": "pass",
+      "arms": {
+        "baseline": "0.60.48.0",
+        "candidate": "0.60.48.0"
+      },
+      "contracts": [
+        {
+          "path": "verdict",
+          "op": "eq",
+          "value": "pass",
+          "candidate": "pass",
+          "baseline": "pass",
+          "ok": true
+        }
+      ]
+    }
+  ]
+}

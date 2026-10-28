@@ -1,0 +1,251 @@
+/**
+ * Notice dedupe, coaching budget and mute (agent operator contract v1, A6).
+ *
+ * - stdio / CLI: one process-wide ledger (dedupe per process).
+ * - HTTP is stateless: the ledger lives in ServeHttpContext and is keyed by
+ *   authenticated principal + transport-resolved session id (never a
+ *   `_meta.session_id` taken from tool arguments); with no session id, by
+ *   principal. Bounded: 10k keys, 24 h TTL.
+ * - `degraded` and `safety` notices are never deduped on HTTP (attached to
+ *   every affected call). At most 2 `coaching` notices per session.
+ * - A notice's unrendered `dedupe_key` replaces its code as the dedupe
+ *   identity, and turns a per-call code into a once-per-session one:
+ *   `degraded_recall` rides every affected call, except a notice made only of
+ *   configuration-persistent stages (a keyless brain's `embed_unavailable`),
+ *   which shows once per session per distinct key.
+ * - Mute applies to `coaching` and `info` only: globally for the local owner
+ *   (`gbrain notices mute <code>`), per client on remote transports
+ *   (`mute_notice`). Persisted under GBRAIN_HOME.
+ * - A notice carrying `escalation` (#7165 coverage notices: held_files and a
+ *   projection-only degraded_recall) shows once per session per key for
+ *   COVERAGE_NOTICE_WINDOW_MS, per-call code or not, and again at once when its
+ *   level rises materially (`coverageWorsened`). HTTP applies it only with a
+ *   transport-resolved session id. One-shot CLI calls share the window through
+ *   `admitAcrossCliCalls` (GBRAIN_HOME/notices/coverage.json).
+ */
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { gbrainPath } from './config.ts';
+import type { Notice, Transport } from './agent-output.ts';
+
+const MAX_KEYS = 10_000;
+const TTL_MS = 24 * 60 * 60 * 1000;
+export const COACHING_BUDGET_PER_SESSION = 2;
+/** The one muteable `ask`: an unanswered first-run bundle must stay dismissible. Every other ask always shows. */
+export const MUTEABLE_ASK_CODES: ReadonlySet<string> = new Set(['first_run_decisions']);
+/** Notices that describe THIS call's result (never deduped unless the notice carries a `dedupe_key`): the diagnosis must ride every affected call. */
+export const PER_CALL_NOTICE_CODES: ReadonlySet<string> = new Set(['degraded_recall', 'hidden_tool_content', 'empty_retrieval', 'unknown_param', 'listing_truncated', 'former_relationships_hidden', 'source_binding_narrowed', 'sources_not_readable', 'local_transcripts', 'held_files', 'relational_chain', 'mention_index', 'delta_incomplete', 'identity_siblings_capped', 'references_unavailable', 'record_types_undeclared', 'alias_fanout', 'facts_unembedded']);
+
+/** How long a shown coverage state (a notice's `escalation`) stays shown. */
+export const COVERAGE_NOTICE_WINDOW_MS = 30 * 60 * 1000;
+
+/** Material worsening over `floor`, the lowest level seen since the notice last showed: up by 10% and at least 1. */
+export function coverageWorsened(floor: number, level: number): boolean {
+  return level >= floor + Math.max(1, Math.ceil(floor * 0.1));
+}
+
+interface EscalationMark { floor: number; at: number }
+
+/** Show or suppress one escalating notice given its last mark; the returned mark replaces it. */
+function escalate(prev: EscalationMark | undefined, level: number, now: number): { show: boolean; mark: EscalationMark } {
+  if (prev && now - prev.at < COVERAGE_NOTICE_WINDOW_MS && !coverageWorsened(prev.floor, level)) {
+    return { show: false, mark: { floor: Math.min(prev.floor, level), at: prev.at } };
+  }
+  return { show: true, mark: { floor: level, at: now } };
+}
+
+/** Notices whose producer already deduped them with `claim` on its own key; admit applies mute only. */
+export const SELF_DEDUPED_NOTICE_CODES: ReadonlySet<string> = new Set(['grant_blocked_operations']);
+
+export interface NoticeAudience {
+  transport: Transport;
+  /** Authenticated principal (HTTP client id); undefined for the local owner. */
+  principal?: string;
+  /** Transport-resolved session id. */
+  sessionId?: string;
+}
+
+export class NoticeLedger {
+  private seen = new Map<string, number>();
+  private coaching = new Map<string, { count: number; at: number }>();
+  private tallies = new Map<string, { n: number; at: number }>();
+  private claimed = new Map<string, number>();
+  private memo = new Map<string, { value: unknown; at: number }>();
+  private escalations = new Map<string, EscalationMark>();
+
+  constructor(private readonly now: () => number = Date.now) {}
+
+  private session(a: NoticeAudience): string {
+    return `${a.principal ?? 'local'}|${a.sessionId ?? ''}`;
+  }
+
+  private prune<V>(map: Map<string, V>, at: (v: V) => number): void {
+    const cutoff = this.now() - TTL_MS;
+    for (const [k, v] of map) {
+      if (at(v) >= cutoff && map.size <= MAX_KEYS) break;
+      map.delete(k);
+    }
+  }
+
+  /** Count one more `key` event in this audience's session (e.g. a reranker-degraded call) and return the session total. */
+  tally(audience: NoticeAudience, key: string): number {
+    const k = `${this.session(audience)}|${key}`;
+    const n = (this.tallies.get(k)?.n ?? 0) + 1;
+    this.tallies.delete(k);
+    this.tallies.set(k, { n, at: this.now() });
+    this.prune(this.tallies, v => v.at);
+    return n;
+  }
+
+  /** First call for `key` returns true and records it; later calls (within the TTL) return false. */
+  claim(key: string): boolean {
+    if (this.claimed.has(key)) return false;
+    this.claimed.set(key, this.now());
+    this.prune(this.claimed, at => at);
+    return true;
+  }
+
+  /** `compute` once per `key` (within the TTL); later calls get the stored value. */
+  async memoize<T>(key: string, compute: () => Promise<T>): Promise<T> {
+    const hit = this.memo.get(key);
+    if (hit) return hit.value as T;
+    const value = await compute();
+    this.memo.set(key, { value, at: this.now() });
+    this.prune(this.memo, v => v.at);
+    return value;
+  }
+
+  /** Filter one call's notices: mute, dedupe and the coaching budget. Never throws. */
+  admit(notices: readonly Notice[], audience: NoticeAudience, muted: ReadonlySet<string> = new Set()): Notice[] {
+    const out: Notice[] = [];
+    const session = this.session(audience);
+    for (const n of notices) {
+      if ((n.kind === 'coaching' || n.kind === 'info' || MUTEABLE_ASK_CODES.has(n.code)) && muted.has(n.code)) continue;
+      if (n.escalation && (audience.transport !== 'http' || audience.sessionId)) {
+        const key = `${session}|${n.code}|${n.escalation.key}`;
+        const { show, mark } = escalate(this.escalations.get(key), n.escalation.level, this.now());
+        this.escalations.delete(key);
+        this.escalations.set(key, mark);
+        if (!show) continue;
+      }
+      const always = (PER_CALL_NOTICE_CODES.has(n.code) && n.dedupe_key === undefined) || SELF_DEDUPED_NOTICE_CODES.has(n.code)
+        || (audience.transport === 'http' && (n.kind === 'degraded' || n.kind === 'safety'));
+      const key = n.dedupe_key === undefined ? `${session}|${n.code}` : `${session}|${n.code}|${n.dedupe_key}`;
+      if (!always && this.seen.has(key)) continue;
+      if (n.kind === 'coaching') {
+        const used = this.coaching.get(session)?.count ?? 0;
+        if (used >= COACHING_BUDGET_PER_SESSION) continue;
+        this.coaching.delete(session);
+        this.coaching.set(session, { count: used + 1, at: this.now() });
+      }
+      if (!always) {
+        this.seen.delete(key);
+        this.seen.set(key, this.now());
+      }
+      out.push(n);
+    }
+    this.prune(this.seen, at => at);
+    this.prune(this.coaching, v => v.at);
+    this.prune(this.escalations, v => v.at);
+    return out;
+  }
+}
+
+let processLedger: NoticeLedger | null = null;
+/** The stdio / CLI ledger: one per process. */
+export function processNoticeLedger(): NoticeLedger {
+  processLedger ??= new NoticeLedger();
+  return processLedger;
+}
+export function __resetProcessNoticeLedgerForTests(): void { processLedger = null; }
+
+// ── coverage window for one-shot CLI calls ─────────────────────────────────
+
+const CLI_COVERAGE_MARKS_MAX = 200;
+
+export function coverageNoticePath(): string {
+  return gbrainPath('notices', 'coverage.json');
+}
+
+/**
+ * #7165: whether an escalating notice shows in this CLI call, given what earlier
+ * calls under this GBRAIN_HOME showed within COVERAGE_NOTICE_WINDOW_MS. `key`
+ * names the brain, the code and the escalation key. A store that cannot be
+ * written shows it. Never throws.
+ */
+export function admitAcrossCliCalls(key: string, level: number, now: number = Date.now()): boolean {
+  let marks: Record<string, EscalationMark> = {};
+  try {
+    const raw = JSON.parse(readFileSync(coverageNoticePath(), 'utf8')) as { marks?: Record<string, EscalationMark> };
+    if (raw.marks && typeof raw.marks === 'object') marks = raw.marks;
+  } catch { /* no marks yet */ }
+  const { show, mark } = escalate(marks[key], level, now);
+  const kept = Object.entries({ ...marks, [key]: mark })
+    .filter(([, m]) => typeof m?.at === 'number' && typeof m.floor === 'number' && now - m.at < COVERAGE_NOTICE_WINDOW_MS)
+    .sort((a, b) => b[1].at - a[1].at).slice(0, CLI_COVERAGE_MARKS_MAX);
+  try {
+    const path = coverageNoticePath();
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.tmp-${process.pid}`;
+    writeFileSync(tmp, `${JSON.stringify({ marks: Object.fromEntries(kept) })}\n`, { mode: 0o600 });
+    renameSync(tmp, path);
+  } catch {
+    return true;
+  }
+  return show;
+}
+
+// ── mute store ──────────────────────────────────────────────────────────────
+
+interface MuteFile { global: string[]; clients: Record<string, string[]> }
+
+export function noticeMutePath(): string {
+  return gbrainPath('notices', 'muted.json');
+}
+
+function readMuteFile(): MuteFile {
+  try {
+    const raw = JSON.parse(readFileSync(noticeMutePath(), 'utf8')) as Partial<MuteFile>;
+    return { global: Array.isArray(raw.global) ? raw.global : [], clients: raw.clients && typeof raw.clients === 'object' ? raw.clients : {} };
+  } catch {
+    return { global: [], clients: {} };
+  }
+}
+
+/** Muted codes for an audience: the owner's global list plus the client's own list on remote transports. */
+export function mutedNoticeCodes(principal?: string): Set<string> {
+  const f = readMuteFile();
+  return new Set([...f.global, ...(principal ? f.clients[principal] ?? [] : [])]);
+}
+
+/** Persist a (un)mute. `principal` scopes it to one remote client; omitted = the local owner (global). */
+export function setNoticeMuted(code: string, muted: boolean, principal?: string): string[] {
+  const f = readMuteFile();
+  const list = new Set(principal ? f.clients[principal] ?? [] : f.global);
+  if (muted) list.add(code); else list.delete(code);
+  const sorted = [...list].sort();
+  if (principal) f.clients[principal] = sorted; else f.global = sorted;
+  writeMuteFile(f);
+  return sorted;
+}
+
+/**
+ * The owner's unmute: clears the code from the global list and from the
+ * stdio MCP pipe's list (`mute_notice` over stdio stores under `stdio`).
+ * Returns the owner's remaining muted codes across both.
+ */
+export function unmuteNoticeForOwner(code: string): string[] {
+  const f = readMuteFile();
+  f.global = f.global.filter(c => c !== code);
+  if (f.clients.stdio) f.clients.stdio = f.clients.stdio.filter(c => c !== code);
+  writeMuteFile(f);
+  return [...new Set([...f.global, ...(f.clients.stdio ?? [])])].sort();
+}
+
+function writeMuteFile(f: MuteFile): void {
+  const path = noticeMutePath();
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify(f, null, 2)}\n`, { mode: 0o600 });
+  renameSync(tmp, path);
+}

@@ -1,0 +1,245 @@
+/**
+ * #4888 — `gbrain sync --json` must keep stdout pure JSON. Every human line
+ * performSync emits through slog() used to land on stdout AHEAD of the
+ * envelope, so the documented `--json | jq` contract failed on the success
+ * path. Under --json those lines route to stderr; the final envelope is the
+ * ONLY stdout document (#4684: the cost-gate status object rides inside it as
+ * `cost_gate`, never as a second top-level JSON value).
+ *
+ * Real PGLite + a real git repo through the CLI entry (`runSync`): the leak
+ * is a property of the whole command path, not of one helper.
+ */
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { execSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
+import { withEnv } from './helpers/with-env.ts';
+import { claimWorktree } from '../src/core/persistence/ownership.ts';
+import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
+import { _resetCliExitVerdictForTests, currentExitCode } from '../src/core/cli-force-exit.ts';
+
+let engine: PGLiteEngine;
+let repoPath: string;
+let home: string;
+
+const FOO = (body: string) => `---\ntype: concept\ntitle: Foo\n---\n\n${body}\n`;
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+  home = mkdtempSync(join(tmpdir(), 'gbrain-4888-home-'));
+  repoPath = mkdtempSync(join(tmpdir(), 'gbrain-4888-repo-'));
+  execSync('git init', { cwd: repoPath, stdio: 'pipe' });
+  execSync('git config user.email "t@t.com"', { cwd: repoPath, stdio: 'pipe' });
+  execSync('git config user.name "T"', { cwd: repoPath, stdio: 'pipe' });
+  mkdirSync(join(repoPath, 'topics'), { recursive: true });
+  writeFileSync(join(repoPath, 'topics/foo.md'), FOO('baseline.'));
+  execSync('git add -A && git commit -q -m initial', { cwd: repoPath, stdio: 'pipe' });
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name, local_path) VALUES ('default', 'default', $1)
+     ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path`,
+    [repoPath],
+  );
+}, 60_000);
+
+afterAll(async () => {
+  await engine.disconnect();
+  rmSync(repoPath, { recursive: true, force: true });
+  rmSync(home, { recursive: true, force: true });
+});
+
+/** runSync with stdout and stderr split-captured (console.* AND the raw streams). */
+async function run(args: string[], expectedExit?: number): Promise<{ stdout: string[]; stderr: string[] }> {
+  const { runSync } = await import('../src/commands/sync.ts');
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const str = (c: unknown) => (typeof c === 'string' ? c : JSON.stringify(c));
+  const origLog = console.log;
+  const origErr = console.error;
+  const origOut = process.stdout.write.bind(process.stdout);
+  const origErrWrite = process.stderr.write.bind(process.stderr);
+  const origExit = process.exit;
+  let exitCode: number | undefined;
+  console.log = (...a: unknown[]) => { stdout.push(a.map(str).join(' ') + '\n'); };
+  console.error = (...a: unknown[]) => { stderr.push(a.map(str).join(' ') + '\n'); };
+  process.stdout.write = ((c: unknown) => { stdout.push(String(c)); return true; }) as typeof process.stdout.write;
+  process.stderr.write = ((c: unknown) => { stderr.push(String(c)); return true; }) as typeof process.stderr.write;
+  process.exit = ((code?: number) => { exitCode = code; throw new Error(`__exit__${code}`); }) as typeof process.exit;
+  try {
+    await withEnv(
+      { GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home, GBRAIN_SOURCE: undefined, GBRAIN_ALLOW_DEFAULT_WRITE: undefined },
+      () => runSync(engine, args),
+    );
+  } catch (error) {
+    if (expectedExit === undefined || exitCode !== expectedExit || !(error instanceof Error) || error.message !== `__exit__${expectedExit}`) throw error;
+  } finally {
+    process.exit = origExit;
+    console.log = origLog;
+    console.error = origErr;
+    process.stdout.write = origOut;
+    process.stderr.write = origErrWrite;
+  }
+  if (expectedExit !== undefined) expect(exitCode).toBe(expectedExit);
+  return { stdout, stderr };
+}
+
+const lines = (chunks: string[]) => chunks.join('').split('\n').filter((l) => l.trim().length > 0);
+const parsedAll = (out: string[]) => out.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+describe('#4888: sync --json keeps stdout pure JSON', () => {
+  test('first-sync dry run: every stdout line parses; the preview prose lands on stderr', async () => {
+    const { stdout, stderr } = await run(['--dry-run', '--no-pull', '--no-embed', '--json']);
+    const out = lines(stdout);
+    for (const l of out) expect(() => JSON.parse(l)).not.toThrow();
+    const env = parsedAll(out).find((o) => o.schema_version === 1);
+    expect(env?.sync_status).toBe('dry_run');
+    expect(env?.added).toBe(1);
+    expect(stderr.join('')).toContain('Full-sync dry run');
+  }, 60_000);
+
+  test('first sync (real import): runImport human summary lands on stderr, every stdout line parses', async () => {
+    // performFullSync delegates to runImport, whose "Found N markdown files" /
+    // "Import complete" lines are its own sinks — the --json wrap must cover
+    // them too, or the very first `sync --json | jq` an agent scripts breaks.
+    const { stdout, stderr } = await run(['--no-pull', '--no-embed', '--json']);
+    const out = lines(stdout);
+    for (const l of out) expect(() => JSON.parse(l)).not.toThrow();
+    const env = parsedAll(out).find((o) => o.schema_version === 1);
+    expect(env?.sync_status).toBe('first_sync');
+    const err = stderr.join('');
+    expect(err).toContain('Found 1 markdown files');
+    expect(err).toContain('Import complete');
+  }, 60_000);
+
+  test('incremental dry run: the "Sync dry run" / "Modified:" prose lands on stderr, not stdout', async () => {
+    // A real run sets last_commit; then one committed change to preview.
+    await run(['--no-pull', '--no-embed']);
+    writeFileSync(join(repoPath, 'topics/foo.md'), FOO('changed.'));
+    execSync('git add -A && git commit -q -m change', { cwd: repoPath, stdio: 'pipe' });
+
+    const { stdout, stderr } = await run(['--dry-run', '--no-pull', '--no-embed', '--json']);
+    const out = lines(stdout);
+    for (const l of out) expect(() => JSON.parse(l)).not.toThrow();
+    const env = parsedAll(out).find((o) => o.schema_version === 1);
+    expect(env?.sync_status).toBe('dry_run');
+    expect(env?.modified).toBe(1);
+    const err = stderr.join('');
+    expect(err).toContain('Sync dry run:');
+    expect(err).toContain('Modified: topics/foo.md');
+  }, 60_000);
+
+  test('without --json the preview prose still reaches stdout (interactive output unchanged)', async () => {
+    const { stdout } = await run(['--dry-run', '--no-pull', '--no-embed']);
+    expect(stdout.join('')).toContain('Sync dry run:');
+  }, 60_000);
+
+  // Wave review: the remaining human lines on the --json path.
+  test('--retry-failed --json with no pending failures: the "nothing to retry" line is stderr, stdout parses', async () => {
+    rmSync(join(home, 'sync-failures.jsonl'), { force: true });
+    const { stdout, stderr } = await run(['--retry-failed', '--dry-run', '--no-pull', '--no-embed', '--json']);
+    for (const l of lines(stdout)) expect(() => JSON.parse(l)).not.toThrow();
+    expect(stderr.join('')).toContain('No local ledger entries; checking the durable sync cursor');
+    expect(stderr.join('')).not.toContain('No unacknowledged sync failures to retry.');
+  }, 60_000);
+
+  test('--retry-failed --json with a pending failure: the "Retrying N" line is stderr, stdout parses', async () => {
+    seedFailure();
+    const { stdout, stderr } = await run(['--retry-failed', '--dry-run', '--no-pull', '--no-embed', '--json']);
+    for (const l of lines(stdout)) expect(() => JSON.parse(l)).not.toThrow();
+    expect(stderr.join('')).toContain('Retrying 1 previously-failed file(s)');
+  }, 60_000);
+
+  test('--skip-failed --json: the "Acknowledged N" line is stderr, stdout parses', async () => {
+    seedFailure();
+    const { stdout, stderr } = await run(['--skip-failed', '--dry-run', '--no-pull', '--no-embed', '--json']);
+    for (const l of lines(stdout)) expect(() => JSON.parse(l)).not.toThrow();
+    expect(stderr.join('')).toContain('Acknowledged 1 pre-existing failure(s).');
+  }, 60_000);
+
+  test('#4684: a --json run that reaches the cost gate emits exactly ONE document, gate nested as cost_gate', async () => {
+    // The issue's repro: Git-backed source, nothing new to embed -> the gate
+    // takes below_floor, then the envelope. Pre-fix stdout was two documents.
+    // A dummy key satisfies the pre-gate credential preflight; the up_to_date
+    // path never reaches an embed call, so nothing networks.
+    await run(['--no-pull', '--no-embed']);
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'sk-test-4684' },
+    });
+    let stdout: string[];
+    try {
+      ({ stdout } = await run(['--no-pull', '--json']));
+    } finally {
+      resetGateway();
+    }
+    const out = lines(stdout);
+    expect(out).toHaveLength(1);
+    const env = JSON.parse(out[0]) as Record<string, unknown>;
+    expect(env.schema_version).toBe(1);
+    expect(env.sync_status).toBe('up_to_date');
+    expect(env.cost_gate).toMatchObject({ gate: 'below_floor', mode: 'inline' });
+  }, 60_000);
+
+  test('sync trigger --source <id> --json prints one JSON line with job_id on stdout', async () => {
+    const { stdout } = await run(['trigger', '--source', 'default', '--json']);
+    const out = lines(stdout);
+    expect(out).toHaveLength(1);
+    expect(typeof JSON.parse(out[0]).job_id).toBe('number');
+  }, 60_000);
+
+  test('managed failures keep one clean JSON receipt with scoped diagnostics even without a ledger', async () => {
+    await run(['--no-pull', '--no-embed']);
+    await withEnv({ GBRAIN_HOME: home }, () => claimWorktree(engine, 'default', repoPath));
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    try {
+      writeFileSync(join(repoPath, 'topics/foo.md'), FOO('A new committed source observation.'));
+      execSync('git add -A && git commit -q -m diagnostic-fixture', { cwd: repoPath, stdio: 'pipe' });
+      writeFileSync(join(repoPath, 'topics/foo.md'), FOO('PRIVATE_DIAGNOSTIC_CONTENT_CANARY'));
+      rmSync(join(home, 'sync-failures.jsonl'), { force: true });
+      // #6340 holds this refusal when holds are on; `sync.holds=fail` keeps the failure receipt whose JSON this test is about.
+      await engine.setConfig('sync.holds', 'fail');
+      const { stdout, stderr } = await run(['--retry-failed', '--no-pull', '--no-embed', '--json']);
+      const out = lines(stdout);
+      expect(out).toHaveLength(1);
+      const body = JSON.parse(out[0]);
+      expect(body).toMatchObject({ sync_status: 'blocked_by_failures', managed_write: {
+        source_id: 'default', slug: 'topics/foo', path: 'topics/foo.md', write_error: 'source_changed',
+        reason: 'pinned_git_worktree_conflict', write_request: { state: 'conflict' },
+      } });
+      expect(body.managed_write.write_request.request_id).toMatch(/^[0-9a-f-]{36}$/);
+      expect(stderr.join('')).toContain(body.managed_write.write_request.request_id);
+      expect(stderr.join('')).toContain('No local ledger entries; checking the durable sync cursor');
+      expect(stderr.join('')).not.toContain('No unacknowledged sync failures');
+      expect([...stdout, ...stderr].join('')).not.toContain('PRIVATE_DIAGNOSTIC_CONTENT_CANARY');
+      expect(out[0]).not.toContain(repoPath);
+      expect(currentExitCode()).toBe(1);
+      const all = await run(['--all', '--serial', '--no-pull', '--no-embed', '--json'], 1);
+      const aggregate = JSON.parse(all.stdout.join(''));
+      expect(aggregate).toMatchObject({ ok_count: 0, error_count: 1, sources: [{ source_id: 'default', status: 'error',
+        managed_write: { write_request: { request_id: body.managed_write.write_request.request_id } } }] });
+      expect(all.stderr.join('')).toContain(body.managed_write.write_request.request_id);
+    } finally {
+      _resetCliExitVerdictForTests(); process.exitCode = 0;
+      await withEnv({ GBRAIN_HOME: home }, () => disposePersistenceConsumer(engine));
+      await engine.executeRaw("DELETE FROM config WHERE key='sync.holds'");
+      await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    }
+  }, 60_000);
+});
+
+/** One open ledger row for the default source (the shape sync-failure-ledger writes). */
+function seedFailure(): void {
+  const now = new Date().toISOString();
+  writeFileSync(
+    join(home, 'sync-failures.jsonl'),
+    JSON.stringify({
+      source_id: 'default', path: 'topics/broken.md', error: 'boom', code: 'UNKNOWN', commit: 'abc',
+      first_seen: now, ts: now, attempts: 1, state: 'open', acknowledged: false, acknowledged_at: null,
+    }) + '\n',
+  );
+}

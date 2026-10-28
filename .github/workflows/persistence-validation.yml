@@ -1,0 +1,549 @@
+name: Durable persistence validation
+
+on:
+  workflow_call:
+    inputs:
+      # test.yml `changes` (scripts/ci-convergence-scope.sh): `skip` only for a
+      # pull request whose diff cannot change managed-sync convergence.
+      convergence:
+        type: string
+        default: run
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only; a
+  # pull request (cheap tier) runs only the crash robot and convergence here. The
+  # full-ci dispatch on its head, every push and the nightly run this lane.
+  read-performance:
+    name: Read latency / ${{ matrix.engine }} / Bun ${{ matrix.bun }}
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pglite, postgres]
+        bun: ['1.4.4']
+        # Event parity: every event, pull requests and merge-queue runs
+        # included, runs every supported Bun version (docs/TESTING.md#event-parity).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      - name: Require valid workloads; report the p99 ratio as advisory
+        env:
+          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+        run: >-
+          bun --no-env-file scripts/persistence/performance.ts --engine=${{ matrix.engine }}
+          --informational --manifest=.context/persistence-read-latency.json
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: persistence-read-${{ matrix.engine }}-bun-${{ matrix.bun }}
+          path: .context/persistence-read-latency.json
+          if-no-files-found: error
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only; a
+  # pull request (cheap tier) runs only the crash robot and convergence here. The
+  # full-ci dispatch on its head, every push and the nightly run this lane.
+  deployment-matrix:
+    name: PgBouncer, RLS and pool capacity / Bun ${{ matrix.bun }}
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubicloud-standard-8-ubuntu-2404
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        bun: ['1.4.4']
+        # Event parity: every event, pull requests and merge-queue runs
+        # included, runs every supported Bun version (docs/TESTING.md#event-parity).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      pgbouncer:
+        image: edoburu/pgbouncer:latest
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_USER: gbrain_test
+          DB_PASSWORD: gbrain_test
+          POOL_MODE: transaction
+          AUTH_TYPE: plain
+          MAX_CLIENT_CONN: '200'
+          DEFAULT_POOL_SIZE: '10'
+          IGNORE_STARTUP_PARAMETERS: extra_float_digits,statement_timeout,idle_in_transaction_session_timeout,search_path
+        ports: ['55433:5432']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      - name: Execute all 24 deployment cases and owner transfer fencing
+        env:
+          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_PGBOUNCER_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:55433/gbrain_test
+        run: bun --no-env-file scripts/persistence/matrix.ts
+      - name: Require PostgreSQL lifecycle, projection and recovery contracts
+        timeout-minutes: 10
+        env:
+          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+        run: |
+          : "${DATABASE_URL:?PostgreSQL contract tests require the explicit test database}"
+          bun --no-env-file test --timeout=120000 \
+            test/persistence-admission-observer.test.ts \
+            test/persistence-read-diagnostics.test.ts \
+            test/persistence-journal.test.ts \
+            test/persistence-publication-refusal-5974.test.ts \
+            test/persistence-staging.test.ts \
+            test/persistence-effect-recovery-fairness.test.ts \
+            test/import-publication-guards.test.ts \
+            test/persistence-withdrawal-retry.test.ts \
+            test/persistence-tombstone-noop.test.ts \
+            test/persistence-version-deletion.test.ts \
+            test/version-history-privacy.test.ts \
+            test/get-versions-response-bounds.test.ts \
+            test/persistence-take-receipt-authority.test.ts \
+            test/import-revision-revival.test.ts \
+            test/persistence-source-lifecycle.test.ts \
+            test/persistence-physical-root.test.ts \
+            test/persistence-topology-capacity.test.ts \
+            test/persistence-topology-quotas.test.ts \
+            test/persistence-contextual-embedding.test.ts \
+            test/page-projection-concurrency.test.ts \
+            test/persistence-migration-preservation.test.ts \
+            test/persistence-recovery-capacity.test.ts \
+            test/audit/pool-recovery-audit.test.ts \
+            test/persistence-recovery-fairness.test.ts
+      - name: Require data-safety on PostgreSQL
+        timeout-minutes: 10
+        env:
+          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          GBRAIN_CI_DISABLE_TEST_ENV_FILE: '1'
+        run: |
+          : "${DATABASE_URL:?Data-safety tests require the explicit test database}"
+          bun --no-env-file test --timeout=180000 test/persistence-publication-native.serial.test.ts
+          bun --no-env-file test --timeout=180000 test/persistence-sync-origin-native.test.ts
+          bun --no-env-file test --timeout=180000 test/persistence-sync-options.serial.test.ts
+          bun --no-env-file test --timeout=180000 test/persistence-sync-company.serial.test.ts
+      - name: Require canonical reconciliation through direct and pooled PostgreSQL
+        timeout-minutes: 5
+        env:
+          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          GBRAIN_PGBOUNCER_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:55433/gbrain_test
+          GBRAIN_PGBOUNCER_DIRECT_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_CI_REQUIRE_PGBOUNCER: '1'
+        run: >-
+          bun --no-env-file test --timeout=120000
+          test/persistence-reconcile.test.ts
+          test/persistence-reconcile-additive-5974.test.ts
+          test/e2e/reconcile-pgbouncer.test.ts
+          test/e2e/publication-deadline-pgbouncer.test.ts
+          test/e2e/transaction-cancel-held-lock.test.ts
+          test/e2e/pgbouncer-pipelined-read-pool.test.ts
+          test/e2e/pgbouncer-transaction-pipeline-6930.test.ts
+          test/e2e/extract-atoms-page-state.test.ts
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: persistence-deployment-bun-${{ matrix.bun }}
+          path: .context/persistence-runtime-matrix.json
+          if-no-files-found: error
+
+  # Unit-lane suites whose PostgreSQL arm is gated on DATABASE_URL: the unit,
+  # serial and slow lanes unset it, so these arms run only here, in
+  # ci:ubicloud's pg-arms lane and in the scheduled race hunt (both arms per
+  # file; the PGLite arm also runs in the unit lane). The list is test/postgres-unit-arms.txt;
+  # scripts/check-postgres-lane-coverage.ts fails a new DATABASE_URL-gated arm
+  # until it is listed there or wrapped in a test/e2e registerPostgresTests
+  # file. The twelve shards (ARM_SHARDS in scripts/postgres-unit-arms.ts) are
+  # balanced by measured runtime (scripts/postgres-arm-weights.json, mined
+  # from this job's ARM_FILE lines). Each job runs two files at a time, each
+  # worker against its own PostgreSQL service; a shard's two-worker makespan,
+  # doubled for a slow runner, must end a minute inside the step's 20 minutes
+  # (ARM_SHARD_BUDGET_MS). The job runs both arms of every listed file: the
+  # unit shards skip *.slow.test.ts, so this lane is the only GitHub lane that
+  # runs the PGLite side of the listed slow testBackends() suites.
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only; a
+  # pull request (cheap tier) runs only the crash robot and convergence here. The
+  # full-ci dispatch on its head, every push and the nightly run this lane.
+  unit-postgres-arms:
+    name: Unit-lane PostgreSQL arms ${{ matrix.shard }}/12 / Bun ${{ matrix.bun }}
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        bun: ['1.4.4']
+        # Event parity: every event, pull requests and merge-queue runs
+        # included, runs every supported Bun version (docs/TESTING.md#event-parity).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      postgres2:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      # One Bun process per file (*.serial.test.ts files require their own
+      # process, and a test that fails while its body keeps running would
+      # otherwise leak process.env into later files), two at a time, each worker
+      # against its own service. Each file writes its own executed-test receipt
+      # (JUnit included) for the executed-receipts ledger and nightly-watch's
+      # failure manifest, and its output prints whole inside one ::group:: block.
+      - name: Require PostgreSQL arms of unit-lane suites
+        timeout-minutes: 20
+        env:
+          GBRAIN_ARM_DATABASE_URLS: >-
+            postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+            postgres://gbrain_test:gbrain_test@127.0.0.1:5433/gbrain_test
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          GBRAIN_TEST_RECEIPT_DIR: ${{ runner.temp }}/receipts
+          GBRAIN_TEST_RECEIPT_LANE: pg-arms-bun-${{ matrix.bun }}
+        run: bun scripts/postgres-unit-arms.ts run ${{ matrix.shard }} 12
+      - name: Upload receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: receipts-pg-arms-${{ matrix.shard }}-bun-${{ matrix.bun }}
+          path: ${{ runner.temp }}/receipts
+          retention-days: 14
+          if-no-files-found: warn
+          overwrite: true
+
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only; a
+  # pull request (cheap tier) runs only the crash robot and convergence here. The
+  # full-ci dispatch on its head, every push and the nightly run this lane.
+  invariants:
+    name: ${{ matrix.engine }} / Bun ${{ matrix.bun }}
+    if: ${{ github.event_name != 'pull_request' }}
+    # The soak uses 1.3-1.8 busy cores: the 2,500-write PGLite soak took 523s on
+    # 4 vCPUs, 539s on 8 and 500s on 16.
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pglite, postgres]
+        bun: ['1.4.4']
+        # Event parity: every event, pull requests and merge-queue runs
+        # included, runs every supported Bun version (docs/TESTING.md#event-parity).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      # Named exception (docs/TESTING.md#event-parity): pull requests and merge-queue
+      # runs soak 2,500 writes; pushes to master, the nightly Test schedule and manual
+      # runs cover the full 10,000-write gate, whose PGLite run alone takes 15-28 minutes.
+      - name: Execute 1000 schedules, eight SIGKILL boundaries and the process-separated write soak
+        env:
+          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          SOAK_OPERATIONS: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '2500' || '10000' }}
+        run: >-
+          bun --no-env-file scripts/persistence/validate.ts --engine=${{ matrix.engine }}
+          --operations="$SOAK_OPERATIONS" --robot-seconds=0
+          --manifest=.context/persistence-manifest.json
+      - name: Upload executed-case and latency manifest
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: persistence-${{ matrix.engine }}-bun-${{ matrix.bun }}
+          path: .context/persistence-manifest.json
+          if-no-files-found: error
+
+  # The crash robot runs beside the soak: generated sequences of real operations,
+  # SIGKILL at every crash seam they reach, and process faults, checked by the
+  # reference model. Postgres connects through a transaction-mode PgBouncer.
+  # Pull requests run a 150 s budget (Postgres skips the seams and the pooler
+  # disconnect fault that can wait out a dead owner's claim lease, listed in the
+  # manifest); pushes, schedules and manual runs crash every seam.
+  crash-robot:
+    name: Crash robot / ${{ matrix.engine }} / Bun ${{ matrix.bun }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pglite, postgres]
+        bun: ['1.4.4']
+        # Event parity: every event, pull requests and merge-queue runs
+        # included, runs every supported Bun version (docs/TESTING.md#event-parity).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      pgbouncer:
+        image: edoburu/pgbouncer:latest
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_USER: gbrain_test
+          DB_PASSWORD: gbrain_test
+          POOL_MODE: transaction
+          AUTH_TYPE: plain
+          MAX_CLIENT_CONN: '200'
+          DEFAULT_POOL_SIZE: '10'
+          IGNORE_STARTUP_PARAMETERS: extra_float_digits,statement_timeout,idle_in_transaction_session_timeout,search_path
+        ports: ['55433:5432']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      # The service password reaches every client through PGPASSWORD, so the URLs carry none.
+      # Every run executes a fixed schedule list (scripts/persistence/robot-driver.ts
+      # ROBOT_RANDOM_SEEDS), so a passed run of a tree stands for any run of it and a
+      # master push may reuse it. ROBOT_SECONDS is the ceiling a run fails past, sized
+      # from ubicloud-standard-4 measurements (docs/ci-event-parity.md#crash-robot-ceilings):
+      # 820 s PGLite and 620 s Postgres on pull requests and merge-queue runs (named exception,
+      # docs/TESTING.md#event-parity: scope pr skips the Postgres lease-bound seams),
+      # 1200 s PGLite and 880 s Postgres elsewhere. The nightly Test schedule adds that
+      # day's exploration seeds. Each cell writes its share of the ceiling to the job summary.
+      - name: Crash every reachable seam of the generated sequences
+        env:
+          PGPASSWORD: gbrain_test
+          DATABASE_URL: postgres://gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_PGBOUNCER_URL: postgres://gbrain_test@127.0.0.1:55433/gbrain_test
+          ROBOT_SCOPE: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && 'pr' || 'full' }}
+          ROBOT_SECONDS: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && (matrix.engine == 'postgres' && '620' || '820') || (matrix.engine == 'postgres' && '880' || '1200') }}
+          ROBOT_EXPLORE: ${{ github.event_name == 'schedule' && 'nightly' || '' }}
+        run: >-
+          bun --no-env-file scripts/persistence/validate.ts --engine=${{ matrix.engine }}
+          --schedules=0 --operations=0 --no-crashes --robot-scope="$ROBOT_SCOPE" --robot-seconds="$ROBOT_SECONDS"
+          ${ROBOT_EXPLORE:+--explore-day=$(( $(date -u +%s) / 86400 ))}
+          --manifest=.context/persistence-robot.json
+      - name: Replay every shrunk crash-robot failure and the history fixture
+        timeout-minutes: 10
+        env:
+          PGPASSWORD: gbrain_test
+          DATABASE_URL: postgres://gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+        run: |
+          if [ '${{ matrix.engine }}' = 'postgres' ]; then
+            GBRAIN_TEST_BACKEND=postgres bun --no-env-file test --timeout=300000 test/persistence-history-fixture.test.ts
+          else
+            env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun --no-env-file test --timeout=300000 test/persistence-crash-robot.slow.test.ts test/persistence-history-fixture.test.ts
+          fi
+      - name: Upload the crash-robot manifest
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: persistence-robot-${{ matrix.engine }}-bun-${{ matrix.bun }}
+          path: .context/persistence-robot.json
+          if-no-files-found: error
+
+  # The reconciliation crash suites run beside the soak instead of after it, so
+  # neither holds the other's runner: each is about four minutes on PGLite.
+  # Event parity (docs/ci-event-parity.md#full-ci-on-pull-requests): full profile only; a
+  # pull request (cheap tier) runs only the crash robot and convergence here. The
+  # full-ci dispatch on its head, every push and the nightly run this lane.
+  reconciliation:
+    name: Reconciliation crashes / ${{ matrix.engine }} / Bun ${{ matrix.bun }}
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pglite, postgres]
+        bun: ['1.4.4']
+        # Event parity: every event, pull requests and merge-queue runs
+        # included, runs every supported Bun version (docs/TESTING.md#event-parity).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      - name: Require all reconciliation crash boundaries before and after activation
+        timeout-minutes: 12
+        env:
+          DATABASE_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_TEST_ALLOW_DATABASE_URL: '1'
+          GBRAIN_TEST_RECONCILE_CRASH_MANIFEST_DIR: .context/reconcile-crashes
+        run: |
+          if [ '${{ matrix.engine }}' = 'postgres' ]; then
+            bun --no-env-file test --timeout=180000 test/e2e/reconcile-crash.test.ts test/e2e/reconcile-crash-unactivated.test.ts
+          else
+            env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun --no-env-file test --timeout=180000 test/reconcile-crash-*.slow.test.ts
+          fi
+      - name: Upload reconciliation crash manifests
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: reconciliation-${{ matrix.engine }}-bun-${{ matrix.bun }}
+          path: .context/reconcile-crashes/*.json
+          if-no-files-found: error
+
+  # Managed-sync convergence gate, PR cell (#6712 PR 0, test/sync-convergence.serial.test.ts,
+  # scripts/persistence/README.md#managed-sync-convergence-gate): real serve and
+  # sync processes against Postgres behind transaction-mode PgBouncer, through
+  # the harness's latency proxy, a seeded kill -9 loop at sync fault points under
+  # concurrent writers, then at most two plain syncs and the convergence oracle.
+  # 200 notes at 10 ms, 6 kills, fixed seed 6650 on every event. The nightly
+  # cell (2,000 notes, 50 ms, 20 kills, rotating seed) is convergence-nightly.yml,
+  # outside test-status.
+  # Named exception (docs/TESTING.md#event-parity): a pull request runs it only
+  # when scripts/ci-convergence-scope.sh selects its diff (test.yml `changes`);
+  # every merge-queue run, every push to master and the nightly Test schedule
+  # run it.
+  convergence:
+    name: Managed-sync convergence / Bun ${{ matrix.bun }}
+    if: ${{ inputs.convergence != 'skip' }}
+    runs-on: ubicloud-standard-4-ubuntu-2404
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        bun: ['1.4.4']
+        # Event parity: every event, pull requests and merge-queue runs
+        # included, runs every supported Bun version (docs/TESTING.md#event-parity).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: gbrain_test
+          POSTGRES_PASSWORD: gbrain_test
+          POSTGRES_DB: gbrain_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gbrain_test -d gbrain_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      pgbouncer:
+        image: edoburu/pgbouncer:latest
+        env:
+          DB_HOST: postgres
+          DB_PORT: '5432'
+          DB_USER: gbrain_test
+          DB_PASSWORD: gbrain_test
+          POOL_MODE: transaction
+          AUTH_TYPE: plain
+          MAX_CLIENT_CONN: '200'
+          DEFAULT_POOL_SIZE: '10'
+          IGNORE_STARTUP_PARAMETERS: extra_float_digits,statement_timeout,idle_in_transaction_session_timeout,search_path
+        ports: ['55433:5432']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: ${{ matrix.bun }}
+      - name: Install dependencies (bounded, retried once)
+        timeout-minutes: 8
+        run: bun scripts/ci-bun-install.ts --frozen-lockfile --ignore-scripts
+      # The step timeout sits inside the job's, so the evidence and cleanup steps below still run after it.
+      - name: Converge a managed sync after the seeded kill loop under concurrent writers
+        timeout-minutes: 30
+        env:
+          GBRAIN_TEST_CONVERGENCE: '1'
+          GBRAIN_PGBOUNCER_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:55433/gbrain_test
+          GBRAIN_PGBOUNCER_DIRECT_URL: postgres://gbrain_test:gbrain_test@127.0.0.1:5432/gbrain_test
+          GBRAIN_TEST_CONVERGENCE_NOTES: '200'
+          GBRAIN_TEST_CONVERGENCE_LATENCY_MS: '10'
+          GBRAIN_TEST_CONVERGENCE_KILLS: '6'
+          GBRAIN_TEST_CONVERGENCE_SEED: '6650'
+          GBRAIN_TEST_CONVERGENCE_SYNC_TIMEOUT_MS: '900000'
+          GBRAIN_TEST_CONVERGENCE_SCENARIO_TIMEOUT_MS: '1620000'
+          GBRAIN_TEST_CONVERGENCE_LOG_DIR: ${{ runner.temp }}/convergence
+        run: bun --no-env-file test --timeout="$GBRAIN_TEST_CONVERGENCE_SCENARIO_TIMEOUT_MS" test/sync-convergence.serial.test.ts
+      - name: Stop harness processes a timed-out run left behind
+        if: always()
+        run: pkill -9 -f 'src/cli\.ts (serve|sync|put|call|extract)' || true
+      - name: Upload the convergence fault evidence (plan, fired faults, every client, serve and writer log)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: convergence-bun-${{ matrix.bun }}
+          path: ${{ runner.temp }}/convergence
+          if-no-files-found: warn

@@ -1,0 +1,7 @@
+{
+  "name": "fixture",
+  "version": "0.0.0",
+  "skills": [
+    { "name": "lookup", "path": "lookup/SKILL.md", "description": "Look a person up." }
+  ]
+}

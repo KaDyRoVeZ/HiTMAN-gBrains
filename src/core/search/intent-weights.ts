@@ -1,0 +1,245 @@
+/**
+ * Zero-LLM Intent → Weight Adjustment (v0.32.x — search-lite)
+ *
+ * Sits on top of the existing query-intent classifier. The classifier
+ * (src/core/search/query-intent.ts) already produces an `intent` field
+ * with 4 values: entity / temporal / event / general. This module maps
+ * that intent onto concrete weight adjustments applied during the hybrid
+ * search pipeline:
+ *
+ *   - entity   → boost exact slug/title matches (keyword pre-filter favored)
+ *   - temporal → increase recency scoring weight (recency = 'on' when caller
+ *                left it undefined)
+ *   - event    → increase keyword weight in hybrid fusion (event queries
+ *                tend to have rare named entities that keyword search nails
+ *                while vector search smears across paraphrases)
+ *   - general  → default semantic (no adjustment)
+ *
+ * All adjustments are SUBTLE — they nudge weights, they don't override
+ * caller-explicit options. If the caller passed `recency: 'off'`, intent
+ * weighting will NOT silently re-enable it. The classifier is a default,
+ * not a mandate.
+ *
+ * The original v0.20.0 LLM query expansion path (expandQuery in
+ * expansion.ts) still exists and is opt-in via `opts.expansion = true`.
+ * Intent weighting is the new DEFAULT, and replaces the expansion call
+ * for the common case (simple queries, no API key, fast loop).
+ *
+ * Pure module. No DB, no LLM. The one async helper (`applyAliasMentionBoost`)
+ * takes its alias resolver as a parameter. Tested in
+ * test/intent-weights.test.ts.
+ */
+
+import type { QueryIntent } from './query-intent.ts';
+import type { SearchResult } from '../types.ts';
+import { containsTokenRun, isTitleMentionedInQuery, titleAsQuerySubject, tokenizeTitle } from './title-match.ts';
+
+/**
+ * Weight adjustments to apply for a classified intent. All factors are
+ * multiplicative on the existing pipeline weights; the defaults map to
+ * 1.0 (no-op) for the `general` intent. A factor > 1.0 increases the
+ * weight of that signal; < 1.0 decreases it.
+ *
+ * Magnitudes were tuned conservatively (max 1.25x boost) so the existing
+ * search behavior on ambiguous queries stays close to v0.31.x. The point
+ * of the classifier isn't to flip rankings — it's to break ties in
+ * favor of the user's plausible intent.
+ */
+export interface IntentWeights {
+  /** Multiplier on the keyword-list rank in RRF fusion. Higher = keyword wins more ties. */
+  keywordWeight: number;
+  /** Multiplier on the vector-list rank in RRF fusion. Higher = semantic wins more ties. */
+  vectorWeight: number;
+  /** Recency tilt to suggest when caller hasn't specified one. */
+  suggestedRecency: 'off' | 'on' | 'strong' | null;
+  /** Score multiplier for results whose slug/title exactly matches the (lowercased) query. */
+  exactMatchBoost: number;
+}
+
+const DEFAULT_WEIGHTS: IntentWeights = {
+  keywordWeight: 1.0,
+  vectorWeight: 1.0,
+  suggestedRecency: null,
+  exactMatchBoost: 1.0,
+};
+
+const INTENT_WEIGHTS: Record<QueryIntent, IntentWeights> = {
+  entity: {
+    // Entity queries: "who is X", "tell me about Y". The user knows the
+    // name. Reward exact slug/title matches; lean into keyword.
+    keywordWeight: 1.15,
+    vectorWeight: 1.0,
+    suggestedRecency: null,
+    exactMatchBoost: 1.25,
+  },
+  temporal: {
+    // Temporal queries: "what happened last week", "meeting prep". Recency
+    // tilt is the whole game; keyword and vector stay balanced.
+    keywordWeight: 1.0,
+    vectorWeight: 1.0,
+    suggestedRecency: 'on',
+    exactMatchBoost: 1.0,
+  },
+  event: {
+    // Event queries: "announcement", "launched", "raised $". Named events
+    // have rare entity surface forms that keyword search nails (think
+    // company names, dollar amounts). Recency gets a soft tilt too.
+    keywordWeight: 1.20,
+    vectorWeight: 0.95,
+    suggestedRecency: 'on',
+    exactMatchBoost: 1.10,
+  },
+  concept: {
+    // v0.46.15 (Cat 13): definitional/landscape paraphrases — the user asks
+    // what an IDEA means, in their own words. The vector arm wins here; the
+    // entity keyword tilt made hybrid LOSE to its own vector component
+    // (47.0 vs 49.1 nDCG@5 on 500 paraphrase probes). Inverse of the
+    // entity tilt; no exact-match boost (paraphrases don't exact-match).
+    keywordWeight: 0.9,
+    vectorWeight: 1.2,
+    suggestedRecency: null,
+    exactMatchBoost: 1.0,
+  },
+  general: DEFAULT_WEIGHTS,
+};
+
+/** Lookup the weights for a classified intent. */
+export function weightsForIntent(intent: QueryIntent): IntentWeights {
+  return INTENT_WEIGHTS[intent] ?? DEFAULT_WEIGHTS;
+}
+
+/**
+ * Apply the per-list rank weighting before RRF. Caller passes the list
+ * source ('keyword' | 'vector') and the weights; we return the effective
+ * RRF k constant to use for THAT list. Lower k = stronger boost on top
+ * ranks; higher k = flatter contribution. So a higher weight maps to a
+ * LOWER k.
+ *
+ * Default RRF_K is 60. With keywordWeight=1.20, the effective k for the
+ * keyword list becomes 60 / 1.20 = 50, which gives top-keyword results
+ * a meaningfully stronger contribution to the fused score.
+ */
+export function effectiveRrfK(baseK: number, weight: number): number {
+  if (weight <= 0) return baseK;
+  return baseK / weight;
+}
+
+/**
+ * Apply exact-match boost in place. Mutates each result's score by
+ * `weights.exactMatchBoost` when the result's slug or title (lowercased,
+ * trimmed) matches the lowercased query exactly, OR when the title or the
+ * slug's last segment is mentioned inside the query as a token run
+ * (`isTitleMentionedInQuery`: "who is Alice Example" → "Alice Example").
+ * Entity intent is defined by framing words, so without the mention form the
+ * boost could never fire. No-op when the boost is 1.0. Caller re-sorts after.
+ *
+ * Normalization: slug is matched as-is (slugs are already canonicalized
+ * lowercase-kebab); title is lowercased + trimmed. The query is
+ * lowercased + trimmed once before the loop.
+ */
+export function applyExactMatchBoost(
+  results: SearchResult[],
+  query: string,
+  weights: IntentWeights,
+): void {
+  if (weights.exactMatchBoost === 1.0) return;
+  const q = query.toLowerCase().trim();
+  if (!q) return;
+  // Pre-compute the kebab form for slug-style matches like "garry tan" → "garry-tan".
+  const qKebab = q.replace(/\s+/g, '-');
+  for (const r of results) {
+    const slug = (r.slug ?? '').toLowerCase();
+    const title = (r.title ?? '').toLowerCase().trim();
+    const exact = slug === q || slug === qKebab || slug.endsWith(`/${qKebab}`) || title === q;
+    const mentioned = isTitleMentionedInQuery(q, title) || isTitleMentionedInQuery(q, slug.slice(slug.lastIndexOf('/') + 1));
+    if (exact || mentioned) {
+      r.score *= weights.exactMatchBoost;
+      // v0.40.4 attribution stamp (D12=A) — formatter reads this for
+      // --explain output. Only stamped when boost actually fires.
+      r.exact_match_boost = weights.exactMatchBoost;
+    }
+  }
+}
+
+/**
+ * #4694 — score multiplier under general and temporal intent (no
+ * exact-match boost; concept intent is excluded, see hybrid.ts) for a result whose multi-token title or slug
+ * tail is the query's subject (`titleAsQuerySubject`: "Which document is
+ * <title>?" classifies as general, so the entity-intent boost never reached
+ * it).
+ */
+export const TITLE_MENTION_BOOST = 1.18;
+
+/**
+ * Apply TITLE_MENTION_BOOST in place. When several qualifying titles are
+ * mentioned and one is a sub-run of another ("Budget Review" inside
+ * "Offsite Budget Review"), only the longest is boosted. Stamps
+ * `exact_match_boost` for --explain. Caller re-sorts.
+ */
+export function applyTitleMentionBoost(results: SearchResult[], query: string): void {
+  const subjects = new Map<SearchResult, string[]>();
+  for (const r of results) {
+    const slug = r.slug ?? '';
+    const tokens = titleAsQuerySubject(query, r.title ?? '')
+      ?? titleAsQuerySubject(query, slug.slice(slug.lastIndexOf('/') + 1));
+    if (tokens) subjects.set(r, tokens);
+  }
+  const all = [...subjects.values()];
+  for (const [r, tokens] of subjects) {
+    if (all.some((other) => other.length > tokens.length && containsTokenRun(other, tokens))) continue;
+    r.score *= TITLE_MENTION_BOOST;
+    r.exact_match_boost = TITLE_MENTION_BOOST;
+  }
+}
+
+/** Longest alias n-gram looked up for a query mention (tokens). */
+const MAX_ALIAS_MENTION_TOKENS = 5;
+
+/**
+ * Query n-grams (1..MAX_ALIAS_MENTION_TOKENS tokens, normalized like
+ * `page_aliases` rows) that could be a declared alias mentioned in the query.
+ * Single tokens need at least 4 characters so "who"/"is" never probe.
+ */
+export function aliasMentionCandidates(query: string): string[] {
+  const tokens = tokenizeTitle(query);
+  const out = new Set<string>();
+  for (let n = 1; n <= MAX_ALIAS_MENTION_TOKENS; n++) {
+    for (let i = 0; i + n <= tokens.length; i++) {
+      if (n === 1 && tokens[i].length < 4) continue;
+      out.add(tokens.slice(i, i + n).join(' '));
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Alias half of the mention boost: a result whose page declares an alias that
+ * occurs inside the query gets the same `exactMatchBoost` (once — a row the
+ * title/slug path already boosted is skipped). Present rows only; injection
+ * stays the alias hop's job. Fail-open: a resolver error changes nothing.
+ */
+export async function applyAliasMentionBoost(
+  results: SearchResult[],
+  query: string,
+  weights: IntentWeights,
+  resolveAliases: (aliasNorms: string[]) => Promise<Map<string, Array<{ slug: string; source_id: string }>>>,
+): Promise<void> {
+  if (weights.exactMatchBoost === 1.0 || results.length === 0) return;
+  const candidates = aliasMentionCandidates(query);
+  if (candidates.length === 0) return;
+  let refs: Map<string, Array<{ slug: string; source_id: string }>>;
+  try {
+    refs = await resolveAliases(candidates);
+  } catch {
+    return;
+  }
+  const pages = new Set<string>();
+  for (const list of refs.values()) for (const ref of list) pages.add(`${ref.source_id}:${ref.slug}`);
+  if (pages.size === 0) return;
+  for (const r of results) {
+    if (r.exact_match_boost !== undefined) continue;
+    if (!pages.has(`${r.source_id ?? 'default'}:${r.slug}`)) continue;
+    r.score *= weights.exactMatchBoost;
+    r.exact_match_boost = weights.exactMatchBoost;
+  }
+}
